@@ -1,0 +1,22 @@
+# Checkpoints and model files
+checkpoints/
+models/
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs
+logs/
+*.log
+
+# Data files
+*.pkl
+
+# IDE
+.idea/
