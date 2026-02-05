@@ -1,657 +1,1547 @@
-import gradio as gr
-import pyspiel
-import torch
-import numpy as np
+"""
+Nine Men's Morris - Model Testing Web UI
+Interactive interface for testing trained models against various opponents.
+"""
+
 import os
-import glob
-import random
 import sys
+import json
+import random
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Tuple, Any
 
-# Add claude folder to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'claude'))
+import numpy as np
+import torch
+from flask import Flask, render_template_string, jsonify, request
 
-# Import gemini model (simple architecture)
-from gemini import ActorCritic as GeminiActorCritic, legal_action_mask, masked_categorical
+# Add claude directory to path
+sys.path.insert(0, str(Path(__file__).parent / "claude"))
 
-# Import claude model (complex architecture with config)
+from model import ActorCritic
+from config import Config
+from utils import get_legal_mask
+from minimax import MinimaxBot
+import pyspiel
+from game_wrapper import load_game as load_game_fixed
+
+# Import random_train model with alias to avoid conflicts
+sys.path.insert(0, str(Path(__file__).parent / "random_train"))
 try:
-    from claude.model import ActorCritic as ClaudeActorCritic
-    from claude.config import Config as ClaudeConfig
-    CLAUDE_AVAILABLE = True
+    from random_train.model import ActorCritic as RandomTrainActorCritic
+    from random_train.config import Config as RandomTrainConfig
+    RANDOM_TRAIN_AVAILABLE = True
 except ImportError:
-    CLAUDE_AVAILABLE = False
-    print("Warning: Claude model not available")
+    RANDOM_TRAIN_AVAILABLE = False
+    print("Warning: Random train model not available")
 
-# Initialize Game
-GAME_NAME = "nine_mens_morris"
-game = pyspiel.load_game(GAME_NAME)
-obs_size = game.observation_tensor_size()
-num_actions = game.num_distinct_actions()
-device = torch.device("cpu")
+app = Flask(__name__)
 
-# Board Mapping - position ID to (row, col)
+# Game constants - using pyspiel with position 0 bug fix
+GAME = load_game_fixed("nine_mens_morris")
+NUM_ACTIONS = GAME.num_distinct_actions()  # 600
+OBS_SIZE = GAME.observation_tensor_size()  # 104
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Shared minimax bot with transposition table for better performance
+# This allows the TT to persist across moves
+_minimax_bot = None
+
+# Board position coordinates for SVG rendering (row, col format)
+# Row-by-row numbering: top-to-bottom, left-to-right within each row
+#     0-----------1-----------2
+#     |           |           |
+#     |     3-----4-----5     |
+#     |     |     |     |     |
+#     |     |  6--7--8  |     |
+#     |     |  |     |  |     |
+#     9----10-11    12-13----14
+#     |     |  |     |  |     |
+#     |     | 15-16-17  |     |
+#     |     |     |     |     |
+#     |    18----19----20     |
+#     |           |           |
+#    21----------22----------23
 POINT_TO_COORD = {
-    0: (0,0), 1: (0,3), 2: (0,6),
-    3: (1,1), 4: (1,3), 5: (1,5),
-    6: (2,2), 7: (2,3), 8: (2,4),
-    9: (3,0), 10: (3,1), 11: (3,2),
-    12: (3,4), 13: (3,5), 14: (3,6),
-    15: (4,2), 16: (4,3), 17: (4,4),
-    18: (5,1), 19: (5,3), 20: (5,5),
-    21: (6,0), 22: (6,3), 23: (6,6)
+    0: (0, 0), 1: (0, 3), 2: (0, 6),
+    3: (1, 1), 4: (1, 3), 5: (1, 5),
+    6: (2, 2), 7: (2, 3), 8: (2, 4),
+    9: (3, 0), 10: (3, 1), 11: (3, 2),
+    12: (3, 4), 13: (3, 5), 14: (3, 6),
+    15: (4, 2), 16: (4, 3), 17: (4, 4),
+    18: (5, 1), 19: (5, 3), 20: (5, 5),
+    21: (6, 0), 22: (6, 3), 23: (6, 6),
 }
 
 COORD_TO_POINT = {v: k for k, v in POINT_TO_COORD.items()}
 
-# Action encoding for Nine Men's Morris:
-# Phase 1 (placement): action = position (0-23)
-# Phase 2 (movement): action = from_pos * 24 + to_pos (24-599)
-# Capture: action = capture_pos (0-23) - same as placement but in different state
-
-def decode_action(action, is_capture=False):
-    """Decode action into (type, from_pos, to_pos, capture_pos)"""
-    if action < 24:
-        if is_capture:
-            return ('capture', None, None, action)
-        else:
-            return ('place', None, action, None)
-    else:
-        action_offset = action - 24
-        from_pos = action_offset // 24
-        to_pos = action_offset % 24
-        return ('move', from_pos, to_pos, None)
-
-def encode_place_action(pos):
-    return pos
-
-def encode_move_action(from_pos, to_pos):
-    return 24 + from_pos * 24 + to_pos
-
-def encode_capture_action(capture_pos):
-    return capture_pos
+# Adjacent positions for each point (row-by-row numbering)
+# Cross connections: 1<->4<->7, 9<->10<->11, 12<->13<->14, 16<->19<->22
+ADJACENCY = {
+    # Top rows
+    0: [1, 9], 1: [0, 2, 4], 2: [1, 14],
+    3: [4, 10], 4: [1, 3, 5, 7], 5: [4, 13],
+    6: [7, 11], 7: [4, 6, 8, 16], 8: [7, 12],
+    # Middle row
+    9: [0, 10, 21], 10: [3, 9, 11, 18], 11: [6, 10, 15],
+    12: [8, 13, 17], 13: [5, 12, 14, 20], 14: [2, 13, 23],
+    # Bottom rows
+    15: [11, 16], 16: [7, 15, 17, 19], 17: [12, 16],
+    18: [10, 19], 19: [16, 18, 20, 22], 20: [13, 19],
+    21: [9, 22], 22: [19, 21, 23], 23: [14, 22],
+}
 
 
-def generate_board_svg(state, selected_pos=None, legal_targets=None, legal_captures=None):
-    """Generate interactive SVG board"""
-    tensor = np.array(state.observation_tensor(0)).reshape(game.observation_tensor_shape())
+@dataclass
+class GameState:
+    """Holds the current game state and configuration."""
+    state: Any = None
+    player_types: Dict[int, str] = None  # 0: player0 type, 1: player1 type
+    player_models: Dict[int, Any] = None  # Loaded AI models
+    player_minimax_depth: Dict[int, int] = None  # Minimax depth per player
+    selected_position: Optional[int] = None  # For human moves
+    last_move_probs: Optional[Dict[int, float]] = None  # AI move probabilities
+    game_phase: str = "placement"  # placement, movement, capture
+    waiting_for_capture: bool = False
 
-    svg_width = 700
-    svg_height = 700
-    grid_step = 100
-    offset = 50
-
-    # Define Lines
-    lines_svg = ""
-    squares = [
-        [(0,0), (0,6), (6,6), (6,0)],
-        [(1,1), (1,5), (5,5), (5,1)],
-        [(2,2), (2,4), (4,4), (4,2)]
-    ]
-
-    for sq in squares:
-        points_str = ""
-        for r, c in sq:
-            x = c * grid_step + offset
-            y = r * grid_step + offset
-            points_str += f"{x},{y} "
-        r, c = sq[0]
-        x = c * grid_step + offset
-        y = r * grid_step + offset
-        points_str += f"{x},{y}"
-        lines_svg += f'<polyline points="{points_str}" fill="none" stroke="#5a3825" stroke-width="4" />\n'
-
-    # Cross connections
-    connections = [
-        ((0,3), (2,3)), ((6,3), (4,3)),
-        ((3,0), (3,2)), ((3,6), (3,4))
-    ]
-    for start, end in connections:
-        x1 = start[1] * grid_step + offset
-        y1 = start[0] * grid_step + offset
-        x2 = end[1] * grid_step + offset
-        y2 = end[0] * grid_step + offset
-        lines_svg += f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#5a3825" stroke-width="4" />\n'
-
-    # Draw Points/Pieces with click handlers
-    pieces_svg = ""
-    legal_targets = legal_targets or set()
-    legal_captures = legal_captures or set()
-
-    for pid, (r, c) in POINT_TO_COORD.items():
-        cx = c * grid_step + offset
-        cy = r * grid_step + offset
-
-        is_white = tensor[0, r, c] == 1
-        is_black = tensor[1, r, c] == 1
-
-        # Determine styling based on state
-        is_selected = (selected_pos == pid)
-        is_target = pid in legal_targets
-        is_capture = pid in legal_captures
-
-        if is_white:
-            fill = "#f5f5dc" if not is_selected else "#90EE90"
-            stroke = "#228B22" if is_selected else ("#ff4444" if is_capture else "#333")
-            stroke_width = 4 if is_selected or is_capture else 2
-            pieces_svg += f'<circle cx="{cx}" cy="{cy}" r="30" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}" style="cursor:pointer" data-pos="{pid}" class="piece white-piece" />\n'
-        elif is_black:
-            fill = "#222" if not is_selected else "#4a7c4a"
-            stroke = "#228B22" if is_selected else ("#ff4444" if is_capture else "#888")
-            stroke_width = 4 if is_selected or is_capture else 2
-            pieces_svg += f'<circle cx="{cx}" cy="{cy}" r="30" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}" style="cursor:pointer" data-pos="{pid}" class="piece black-piece" />\n'
-        else:
-            # Empty spot
-            if is_target:
-                # Highlight as valid move target
-                pieces_svg += f'<circle cx="{cx}" cy="{cy}" r="20" fill="#90EE90" stroke="#228B22" stroke-width="3" style="cursor:pointer" data-pos="{pid}" class="empty-spot target" />\n'
-            else:
-                pieces_svg += f'<circle cx="{cx}" cy="{cy}" r="10" fill="#5a3825" style="cursor:pointer" data-pos="{pid}" class="empty-spot" />\n'
-
-    svg = f"""
-    <svg width="100%" height="100%" viewBox="0 0 {svg_width} {svg_height}" version="1.1" xmlns="http://www.w3.org/2000/svg" id="game-board">
-        <rect width="100%" height="100%" fill="#deb887" />
-        {lines_svg}
-        {pieces_svg}
-    </svg>
-    """
-    return svg
+    def __post_init__(self):
+        if self.player_types is None:
+            self.player_types = {0: "human", 1: "random"}
+        if self.player_models is None:
+            self.player_models = {0: None, 1: None}
+        if self.player_minimax_depth is None:
+            self.player_minimax_depth = {0: 3, 1: 3}
 
 
-def get_models():
-    """Get all available models from both gemini and claude directories"""
-    models = ["Human", "Random"]
+# Global game state
+game_state = GameState()
 
-    # Get script directory for absolute paths
-    script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Gemini models (models/*.pt in script directory)
-    gemini_models_dir = os.path.join(script_dir, "models")
-    if os.path.exists(gemini_models_dir):
-        files = glob.glob(os.path.join(gemini_models_dir, "*.pt"))
-        for f in files:
-            models.append(f"gemini:{os.path.basename(f)}")
+def get_available_models() -> List[Dict[str, str]]:
+    """Scan for available trained models."""
+    models = []
 
-    # Claude models (claude/models/*.pt and claude/checkpoints/*.pt)
-    if CLAUDE_AVAILABLE:
-        claude_models_dir = os.path.join(script_dir, "claude", "models")
-        if os.path.exists(claude_models_dir):
-            files = glob.glob(os.path.join(claude_models_dir, "*.pt"))
-            for f in files:
-                models.append(f"claude:{os.path.basename(f)}")
+    # Check claude/models directory
+    claude_models_dir = Path(__file__).parent / "claude" / "models"
+    if claude_models_dir.exists():
+        for pt_file in sorted(claude_models_dir.glob("*.pt"), reverse=True):
+            models.append({
+                "name": f"claude/{pt_file.name}",
+                "path": str(pt_file),
+                "type": "claude"
+            })
 
-        claude_checkpoints_dir = os.path.join(script_dir, "claude", "checkpoints")
-        if os.path.exists(claude_checkpoints_dir):
-            files = glob.glob(os.path.join(claude_checkpoints_dir, "*.pt"))
-            for f in files:
-                models.append(f"claude:checkpoints/{os.path.basename(f)}")
+    # Check claude/checkpoints directory
+    claude_checkpoints_dir = Path(__file__).parent / "claude" / "checkpoints"
+    if claude_checkpoints_dir.exists():
+        for pt_file in sorted(claude_checkpoints_dir.glob("*.pt"), reverse=True):
+            models.append({
+                "name": f"claude/checkpoints/{pt_file.name}",
+                "path": str(pt_file),
+                "type": "claude"
+            })
+
+    # Check random_train/models directory
+    random_train_models_dir = Path(__file__).parent / "random_train" / "models"
+    if random_train_models_dir.exists():
+        for pt_file in sorted(random_train_models_dir.glob("*.pt"), reverse=True):
+            models.append({
+                "name": f"random_train/{pt_file.name}",
+                "path": str(pt_file),
+                "type": "random_train"
+            })
+
+    # Check random_train/checkpoints directory
+    random_train_checkpoints_dir = Path(__file__).parent / "random_train" / "checkpoints"
+    if random_train_checkpoints_dir.exists():
+        for pt_file in sorted(random_train_checkpoints_dir.glob("*.pt"), reverse=True):
+            models.append({
+                "name": f"random_train/checkpoints/{pt_file.name}",
+                "path": str(pt_file),
+                "type": "random_train"
+            })
+
+    # Check models directory
+    models_dir = Path(__file__).parent / "models"
+    if models_dir.exists():
+        for pt_file in sorted(models_dir.glob("*.pt"), reverse=True):
+            # Skip very large files (likely incomplete or corrupted)
+            if pt_file.stat().st_size < 100_000_000:  # 100MB limit
+                models.append({
+                    "name": f"models/{pt_file.name}",
+                    "path": str(pt_file),
+                    "type": "gemini"
+                })
 
     return models
 
 
-def load_agent(model_name):
-    """Load model based on prefix (gemini: or claude:)"""
-    if model_name == "Human" or model_name == "Random":
-        return None, None
+def load_model(model_info: Dict[str, str]) -> Tuple[Any, str]:
+    """Load a model from disk."""
+    model_type = model_info["type"]
 
-    # Get script directory for absolute paths
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if model_type == "random_train":
+        if not RANDOM_TRAIN_AVAILABLE:
+            raise ImportError("Random train model not available")
+        config = RandomTrainConfig()
+        model = RandomTrainActorCritic(OBS_SIZE, NUM_ACTIONS, config).to(DEVICE)
+    else:
+        # Default to claude model for 'claude' and other types
+        config = Config()
+        model = ActorCritic(OBS_SIZE, NUM_ACTIONS, config).to(DEVICE)
 
-    if model_name.startswith("gemini:"):
-        # Load gemini model
-        filename = model_name[7:]  # Remove "gemini:" prefix
-        path = os.path.join(script_dir, "models", filename)
-        model = GeminiActorCritic(obs_size, num_actions, hidden=512, dropout=0.1).to(device)
+    checkpoint = torch.load(model_info["path"], map_location=DEVICE, weights_only=False)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
 
-        try:
-            state_dict = torch.load(path, map_location=device)
-            model.load_state_dict(state_dict)
-            model.eval()
-            return model, "gemini"
-        except Exception as e:
-            print(f"Error loading gemini model {model_name}: {e}")
-            return None, None
+    model.eval()
+    return model, model_info["type"]
 
-    elif model_name.startswith("claude:"):
-        if not CLAUDE_AVAILABLE:
-            print("Claude models not available")
-            return None, None
 
-        # Load claude model
-        filename = model_name[7:]  # Remove "claude:" prefix
-        if filename.startswith("checkpoints/"):
-            path = os.path.join(script_dir, "claude", filename)
+def decode_action(action: int, is_capture_phase: bool = False) -> Dict[str, Any]:
+    """Decode action ID into human-readable format.
+
+    Note: In nine_mens_morris, captures use the same 0-23 range as placements.
+    The is_capture_phase flag determines interpretation.
+    """
+    if action < 24:
+        if is_capture_phase:
+            return {"type": "capture", "position": action}
         else:
-            path = os.path.join(script_dir, "claude", "models", filename)
-
-        config = ClaudeConfig()
-        model = ClaudeActorCritic(obs_size, num_actions, config).to(device)
-
-        try:
-            checkpoint = torch.load(path, map_location=device)
-            # Handle both direct state_dict and checkpoint dict
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                model.load_state_dict(checkpoint)
-            model.eval()
-            return model, "claude"
-        except Exception as e:
-            print(f"Error loading claude model {model_name}: {e}")
-            return None, None
-
-    return None, None
+            return {"type": "place", "position": action}
+    else:
+        action_offset = action - 24
+        from_pos = action_offset // 24
+        to_pos = action_offset % 24
+        return {"type": "move", "from": from_pos, "to": to_pos}
 
 
-def get_ai_action(model, model_type, state, pid):
-    """Get action from AI model"""
-    obs = torch.tensor(state.observation_tensor(pid), dtype=torch.float32, device=device).unsqueeze(0)
-    mask = torch.from_numpy(legal_action_mask(state, num_actions)).to(device).unsqueeze(0)
-
-    with torch.no_grad():
-        logits, _ = model(obs)
-
-        if model_type == "claude":
-            # Claude model uses different masking
-            masked_logits = logits.float()
-            masked_logits[mask == 0] = -1e9
-            probs = torch.softmax(masked_logits, dim=-1)
-            dist = torch.distributions.Categorical(probs)
-        else:
-            # Gemini model
-            dist = masked_categorical(logits.squeeze(0), mask.squeeze(0))
-
-        action = int(dist.sample().item())
-
-    return action
+def encode_action(action_info: Dict[str, Any]) -> int:
+    """Encode action info into action ID."""
+    if action_info["type"] == "place":
+        return action_info["position"]
+    elif action_info["type"] == "move":
+        return 24 + action_info["from"] * 24 + action_info["to"]
+    else:  # capture - same encoding as place
+        return action_info["position"]
 
 
-def get_legal_action_info(state):
-    """Parse legal actions into categories for UI"""
-    legal_actions = state.legal_actions()
-    
+def get_board_state() -> Dict[str, Any]:
+    """Get current board state for rendering."""
+    if game_state.state is None:
+        return {"positions": {}, "current_player": 0, "phase": "not_started"}
+
+    state = game_state.state
     state_str = str(state)
-    is_capture = "Capture time" in state_str or "capture" in state_str.lower()
 
-    place_positions = set()
-    move_sources = set()
-    move_targets = {}  # from_pos -> set of to_pos
-    capture_positions = set()
+    # Get legal actions to understand board state
+    legal = state.legal_actions()
 
-    for action in legal_actions:
-        action_type, from_pos, to_pos, capture_pos = decode_action(action, is_capture=is_capture)
+    # Count pieces - W for player 0, B for player 1
+    p0_pieces = state_str.count('W')
+    p1_pieces = state_str.count('B')
 
-        if action_type == 'place':
-            place_positions.add(to_pos)
-        elif action_type == 'move':
-            move_sources.add(from_pos)
-            if from_pos not in move_targets:
-                move_targets[from_pos] = set()
-            move_targets[from_pos].add(to_pos)
-        elif action_type == 'capture':
-            capture_positions.add(capture_pos)
+    # Determine phase by checking the state string for capture indicator
+    # and by analyzing legal actions
+    phase = "placement"
+    if "Capture time" in state_str or "capture" in state_str.lower():
+        phase = "capture"
+    elif legal and all(a >= 24 for a in legal):
+        phase = "movement"
+
+    if state.is_terminal():
+        phase = "terminal"
 
     return {
-        'place': place_positions,
-        'move_sources': move_sources,
-        'move_targets': move_targets,
-        'capture': capture_positions,
-        'raw': set(legal_actions)
+        "state_str": state_str,
+        "current_player": int(state.current_player()) if not state.is_terminal() else -1,
+        "phase": phase,
+        "is_terminal": state.is_terminal(),
+        "legal_actions": [int(a) for a in legal],
+        "p0_pieces": p0_pieces,
+        "p1_pieces": p1_pieces,
+        "returns": [float(r) for r in state.returns()] if state.is_terminal() else None
     }
 
 
-def format_board(state, selected_pos=None, legal_info=None):
-    """Format board with optional selection highlighting"""
-    legal_targets = set()
-    legal_captures = set()
+def parse_board_positions(state) -> Dict[int, int]:
+    """Parse board to get piece positions: {position: player}."""
+    positions = {}
 
-    if legal_info:
-        if selected_pos is not None and selected_pos in legal_info.get('move_targets', {}):
-            legal_targets = legal_info['move_targets'][selected_pos]
-        elif legal_info.get('place'):
-            legal_targets = legal_info['place']
+    # Use observation tensor from player 0's perspective
+    # Observation shape is (channels, rows, cols) - e.g. (5, 7, 7)
+    # Channel 0: Player 0's pieces (white)
+    # Channel 1: Player 1's pieces (black)
+    obs = np.array(state.observation_tensor(0)).reshape(GAME.observation_tensor_shape())
 
-        if legal_info.get('capture'):
-            legal_captures = legal_info['capture']
+    # Iterate through board positions using POINT_TO_COORD mapping
+    for pos, (row, col) in POINT_TO_COORD.items():
+        if obs[0, row, col] == 1:
+            # Player 0's piece (white)
+            positions[pos] = 0
+        elif obs[1, row, col] == 1:
+            # Player 1's piece (black)
+            positions[pos] = 1
 
-    return generate_board_svg(state, selected_pos, legal_targets, legal_captures)
-
-
-def reconstruct_state(history):
-    """Reconstruct game state from action history"""
-    state = game.new_initial_state()
-    for action in history:
-        state.apply_action(action)
-    return state
+    return positions
 
 
-def process_click(history, selected_pos, white_agent, black_agent, click_pos):
-    """Process a board click"""
-    state = reconstruct_state(history)
+def get_ai_move_with_probs(model, state, player: int, temperature: float = 0.4) -> Tuple[int, Dict[int, float]]:
+    """Get AI move and probability distribution.
 
-    if state.is_terminal():
-        return history, selected_pos, format_board(state), get_status(state, white_agent, black_agent), ""
+    Args:
+        model: The neural network model
+        state: Current game state
+        player: Player ID
+        temperature: Sampling temperature for action selection
+            - 0.0 = always pick best action (deterministic, good vs minimax)
+            - 0.3-0.5 = balanced play (less predictable but still strong, good vs humans)
+            - 1.0 = sample from full policy distribution
 
-    pid = state.current_player()
-    agent_name = white_agent if pid == 0 else black_agent
+        The overfitting problem occurs when training only against deterministic
+        minimax and then using argmax during play. The AI learns ONE specific line
+        that beats minimax, but fails when humans play unpredictably.
 
-    # Only process clicks for human players
-    if agent_name != "Human":
-        return history, selected_pos, format_board(state), get_status(state, white_agent, black_agent), "It's not your turn!"
+        Using temperature=0.4 introduces controlled randomness, making the AI
+        less exploitable by humans who notice its patterns.
+    """
+    obs = torch.tensor(
+        state.observation_tensor(player),
+        dtype=torch.float32
+    ).unsqueeze(0).to(DEVICE)
 
-    legal_info = get_legal_action_info(state)
-    click_pos = int(click_pos)
+    mask = torch.tensor(
+        get_legal_mask(state, NUM_ACTIONS),
+        dtype=torch.float32
+    ).unsqueeze(0).to(DEVICE)
 
-    action_taken = None
-    new_selected = selected_pos
-    message = ""
+    with torch.no_grad():
+        logits, value = model(obs)
+        masked_logits = logits.float()
+        masked_logits[mask == 0] = -1e9
 
-    # Check what phase we're in based on legal actions
-    if legal_info['capture']:
-        # Must capture - click on enemy piece
-        if click_pos in legal_info['capture']:
-            action_taken = encode_capture_action(click_pos)
-            new_selected = None
-            message = f"Captured piece at position {click_pos}"
+        # Apply temperature scaling for controlled randomness
+        # Lower temperature = sharper distribution (more deterministic)
+        # Higher temperature = flatter distribution (more random)
+        if temperature < 0.01:
+            # Deterministic mode (argmax)
+            action = int(masked_logits.argmax(dim=-1).item())
+            probs = torch.softmax(masked_logits, dim=-1)
         else:
-            message = "You must capture an opponent's piece (highlighted in red)"
+            scaled_logits = masked_logits / temperature
+            probs = torch.softmax(scaled_logits, dim=-1)
+            dist = torch.distributions.Categorical(probs)
+            action = int(dist.sample().item())
 
-    elif legal_info['place']:
-        # Placement phase - click on empty spot
-        if click_pos in legal_info['place']:
-            action_taken = encode_place_action(click_pos)
-            new_selected = None
-            message = f"Placed piece at position {click_pos}"
-        else:
-            message = "Click on a highlighted empty position to place your piece"
-
-    elif legal_info['move_sources']:
-        # Movement phase
-        if selected_pos is None:
-            # Select a piece to move
-            if click_pos in legal_info['move_sources']:
-                new_selected = click_pos
-                message = f"Selected piece at {click_pos}. Click a highlighted position to move."
-            else:
-                message = "Click on one of your pieces that can move"
-        else:
-            # A piece is selected - either move or reselect
-            if click_pos in legal_info['move_targets'].get(selected_pos, set()):
-                action_taken = encode_move_action(selected_pos, click_pos)
-                new_selected = None
-                message = f"Moved from {selected_pos} to {click_pos}"
-            elif click_pos in legal_info['move_sources']:
-                # Reselect different piece
-                new_selected = click_pos
-                message = f"Selected piece at {click_pos}. Click a highlighted position to move."
-            elif click_pos == selected_pos:
-                # Deselect
-                new_selected = None
-                message = "Deselected piece"
-            else:
-                message = "Invalid move. Click a highlighted position or select a different piece."
-
-    # Apply action if one was made
-    if action_taken is not None:
-        state.apply_action(action_taken)
-        history = history + [action_taken]
-        new_selected = None
-
-    # Update legal info after action
-    if not state.is_terminal():
-        legal_info = get_legal_action_info(state)
-    else:
-        legal_info = None
-
-    board_html = format_board(state, new_selected, legal_info)
-    status = get_status(state, white_agent, black_agent)
-
-    return history, new_selected, board_html, status, message
-
-
-def get_status(state, white_agent, black_agent):
-    """Get current game status"""
-    if state.is_terminal():
-        returns = state.returns()
-        if returns[0] > returns[1]:
-            return f"Game Over! White ({white_agent}) wins!"
-        elif returns[1] > returns[0]:
-            return f"Game Over! Black ({black_agent}) wins!"
-        else:
-            return "Game Over! Draw!"
-    else:
-        pid = state.current_player()
-        agent = white_agent if pid == 0 else black_agent
-        color = "White" if pid == 0 else "Black"
-
-        legal_info = get_legal_action_info(state)
-        if legal_info['capture']:
-            phase = "Capture"
-        elif legal_info['place']:
-            phase = "Place"
-        else:
-            phase = "Move"
-
-        return f"{color}'s turn ({agent}) - {phase} phase"
-
-
-def ai_step(history, selected_pos, white_agent, black_agent):
-    """Execute AI move"""
-    state = reconstruct_state(history)
-
-    if state.is_terminal():
-        return history, selected_pos, format_board(state), get_status(state, white_agent, black_agent), "Game is over"
-
-    pid = state.current_player()
-    agent_name = white_agent if pid == 0 else black_agent
-
-    if agent_name == "Human":
-        legal_info = get_legal_action_info(state)
-        return history, selected_pos, format_board(state, selected_pos, legal_info), get_status(state, white_agent, black_agent), "It's your turn! Click on the board."
-
-    action_taken = None
-    message = ""
-
-    if agent_name == "Random":
+        # Get probability distribution for display (use original probs)
+        display_probs = torch.softmax(masked_logits, dim=-1)
         legal_actions = state.legal_actions()
-        if legal_actions:
-            action_taken = random.choice(legal_actions)
-            message = f"Random played action {action_taken}"
-    else:
-        model, model_type = load_agent(agent_name)
-        if model:
-            action_taken = get_ai_action(model, model_type, state, pid)
-            message = f"{agent_name} played action {action_taken}"
-        else:
-            return history, selected_pos, format_board(state), f"Failed to load {agent_name}", "Error loading model"
+        move_probs = {}
+        for act in legal_actions:
+            move_probs[int(act)] = float(display_probs[0, act].item())
 
-    if action_taken is not None:
-        state.apply_action(action_taken)
-        history = history + [action_taken]
-
-    # Check if next player is also AI
-    if not state.is_terminal():
-        legal_info = get_legal_action_info(state)
-    else:
-        legal_info = None
-
-    return history, None, format_board(state, None, legal_info), get_status(state, white_agent, black_agent), message
+    return action, move_probs
 
 
-def reset_game(white_agent, black_agent):
-    """Reset the game"""
-    state = game.new_initial_state()
-    history = []
-    legal_info = get_legal_action_info(state)
-    return history, None, format_board(state, None, legal_info), get_status(state, white_agent, black_agent), "Game started! White moves first."
+def get_random_move(state) -> int:
+    """Get a random legal move."""
+    legal = state.legal_actions()
+    return random.choice(legal) if legal else -1
 
 
-def auto_play_ai(history, selected_pos, white_agent, black_agent):
-    """Automatically play AI moves until it's a human's turn or game over"""
-    state = reconstruct_state(history)
-    moves_made = 0
-    max_moves = 200  # Safety limit
+def get_minimax_move(state, depth: int) -> int:
+    """Get minimax move with specified depth using optimized minimax.
 
-    while not state.is_terminal() and moves_made < max_moves:
-        pid = state.current_player()
-        agent_name = white_agent if pid == 0 else black_agent
+    Uses a shared bot instance to benefit from transposition table
+    persistence across moves in the same game.
+    """
+    global _minimax_bot
 
-        if agent_name == "Human":
-            break
-
-        if agent_name == "Random":
-            legal_actions = state.legal_actions()
-            if legal_actions:
-                action = random.choice(legal_actions)
-                state.apply_action(action)
-                history = history + [action]
-                moves_made += 1
-        else:
-            model, model_type = load_agent(agent_name)
-            if model:
-                action = get_ai_action(model, model_type, state, pid)
-                state.apply_action(action)
-                history = history + [action]
-                moves_made += 1
-            else:
-                break
-
-    if not state.is_terminal():
-        legal_info = get_legal_action_info(state)
-    else:
-        legal_info = None
-
-    message = f"AI made {moves_made} moves" if moves_made > 0 else "Your turn"
-    return history, None, format_board(state, None, legal_info), get_status(state, white_agent, black_agent), message
-
-
-# Build the UI
-with gr.Blocks(title="Nine Men's Morris AI") as demo:
-
-    gr.Markdown("# Nine Men's Morris")
-    gr.Markdown("Select positions using the buttons below the board. Green = valid targets, Red = capturable pieces.")
-
-    # Hidden state
-    game_history = gr.State([])
-    selected_position = gr.State(None)
-
-    with gr.Row():
-        with gr.Column(scale=1):
-            white_dd = gr.Dropdown(choices=get_models(), label="White Player", value="Human")
-            black_dd = gr.Dropdown(choices=get_models(), label="Black Player", value="Random")
-
-            with gr.Row():
-                start_btn = gr.Button("New Game", variant="primary")
-                ai_btn = gr.Button("AI Move / Next Step", variant="secondary")
-
-            status_text = gr.Textbox(label="Status", value="Click 'New Game' to start", interactive=False)
-            message_text = gr.Textbox(label="Message", value="", interactive=False)
-
-        with gr.Column(scale=2):
-            board_display = gr.HTML(
-                label="Game Board",
-                value=generate_board_svg(game.new_initial_state())
-            )
-
-    # Position buttons grid - matches board layout
-    gr.Markdown("### Click a position:")
-
-    # Row 0: positions 0, 1, 2
-    with gr.Row():
-        pos_btns = {}
-        pos_btns[0] = gr.Button("0", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[1] = gr.Button("1", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[2] = gr.Button("2", size="sm", min_width=60)
-
-    # Row 1: positions 3, 4, 5
-    with gr.Row():
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[3] = gr.Button("3", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[4] = gr.Button("4", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[5] = gr.Button("5", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-
-    # Row 2: positions 6, 7, 8
-    with gr.Row():
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[6] = gr.Button("6", size="sm", min_width=60)
-        pos_btns[7] = gr.Button("7", size="sm", min_width=60)
-        pos_btns[8] = gr.Button("8", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-
-    # Row 3: positions 9, 10, 11, -, 12, 13, 14
-    with gr.Row():
-        pos_btns[9] = gr.Button("9", size="sm", min_width=60)
-        pos_btns[10] = gr.Button("10", size="sm", min_width=60)
-        pos_btns[11] = gr.Button("11", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[12] = gr.Button("12", size="sm", min_width=60)
-        pos_btns[13] = gr.Button("13", size="sm", min_width=60)
-        pos_btns[14] = gr.Button("14", size="sm", min_width=60)
-
-    # Row 4: positions 15, 16, 17
-    with gr.Row():
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[15] = gr.Button("15", size="sm", min_width=60)
-        pos_btns[16] = gr.Button("16", size="sm", min_width=60)
-        pos_btns[17] = gr.Button("17", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-
-    # Row 5: positions 18, 19, 20
-    with gr.Row():
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[18] = gr.Button("18", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[19] = gr.Button("19", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[20] = gr.Button("20", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-
-    # Row 6: positions 21, 22, 23
-    with gr.Row():
-        pos_btns[21] = gr.Button("21", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[22] = gr.Button("22", size="sm", min_width=60)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        gr.Button("", size="sm", min_width=60, interactive=False, visible=True)
-        pos_btns[23] = gr.Button("23", size="sm", min_width=60)
-
-    # Event handlers
-    start_btn.click(
-        reset_game,
-        inputs=[white_dd, black_dd],
-        outputs=[game_history, selected_position, board_display, status_text, message_text]
-    )
-
-    ai_btn.click(
-        ai_step,
-        inputs=[game_history, selected_position, white_dd, black_dd],
-        outputs=[game_history, selected_position, board_display, status_text, message_text]
-    )
-
-    # Create click handlers for each position button
-    def make_click_handler(pos):
-        def handler(history, selected, white_agent, black_agent):
-            return process_click(history, selected, white_agent, black_agent, str(pos))
-        return handler
-
-    for pos_id, btn in pos_btns.items():
-        btn.click(
-            make_click_handler(pos_id),
-            inputs=[game_history, selected_position, white_dd, black_dd],
-            outputs=[game_history, selected_position, board_display, status_text, message_text]
+    if _minimax_bot is None or _minimax_bot.max_depth != depth:
+        # Create new bot with the requested depth
+        # Using moderate TT size for webui (512MB)
+        _minimax_bot = MinimaxBot(
+            max_depth=depth
         )
+    else:
+        # Update depth if needed
+        _minimax_bot.max_depth = depth
+
+    # Use iterative deepening for best move quality
+    return _minimax_bot.get_action(state, use_iterative=True)
 
 
-if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+# HTML Template with embedded CSS and JavaScript
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nine Men's Morris - Model Tester</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 300px 1fr 350px;
+            gap: 20px;
+        }
+
+        .panel {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 20px;
+            color: #64b5f6;
+            grid-column: 1 / -1;
+        }
+
+        h2 {
+            color: #81c784;
+            margin-bottom: 15px;
+            font-size: 1.2em;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 10px;
+        }
+
+        h3 {
+            color: #ffb74d;
+            margin: 15px 0 10px 0;
+            font-size: 1em;
+        }
+
+        .player-config {
+            margin-bottom: 20px;
+        }
+
+        .player-config.player-0 {
+            border-left: 4px solid #fff;
+            padding-left: 15px;
+        }
+
+        .player-config.player-1 {
+            border-left: 4px solid #333;
+            padding-left: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #b0bec5;
+            font-size: 0.9em;
+        }
+
+        select, input[type="number"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.3);
+            color: #e0e0e0;
+            font-size: 0.9em;
+            margin-bottom: 10px;
+        }
+
+        select:focus, input:focus {
+            outline: none;
+            border-color: #64b5f6;
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1em;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-bottom: 10px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #4caf50, #45a049);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: linear-gradient(135deg, #45a049, #3d8b40);
+            transform: translateY(-2px);
+        }
+
+        .btn-secondary {
+            background: linear-gradient(135deg, #2196f3, #1976d2);
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: linear-gradient(135deg, #1976d2, #1565c0);
+        }
+
+        .btn-warning {
+            background: linear-gradient(135deg, #ff9800, #f57c00);
+            color: white;
+        }
+
+        /* Board Styles */
+        .board-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 500px;
+        }
+
+        #board-svg {
+            max-width: 100%;
+            height: auto;
+        }
+
+        .board-point {
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .board-point:hover {
+            filter: brightness(1.3);
+        }
+
+        .board-point.legal {
+            animation: pulse 1s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        .piece {
+            pointer-events: none;
+        }
+
+        /* Status Panel */
+        .status {
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            margin-bottom: 15px;
+        }
+
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+
+        .status-label {
+            color: #90a4ae;
+        }
+
+        .status-value {
+            font-weight: bold;
+        }
+
+        .current-turn {
+            text-align: center;
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            font-weight: bold;
+        }
+
+        .turn-0 {
+            background: rgba(255, 255, 255, 0.2);
+            color: #fff;
+        }
+
+        .turn-1 {
+            background: rgba(50, 50, 50, 0.8);
+            color: #aaa;
+        }
+
+        /* Probability Display */
+        .prob-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .prob-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+            padding: 8px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 6px;
+        }
+
+        .prob-bar-container {
+            flex: 1;
+            height: 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 0 10px;
+        }
+
+        .prob-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #4caf50, #8bc34a);
+            transition: width 0.3s;
+        }
+
+        .prob-action {
+            width: 120px;
+            font-size: 0.85em;
+            color: #b0bec5;
+        }
+
+        .prob-value {
+            width: 60px;
+            text-align: right;
+            font-weight: bold;
+            color: #81c784;
+        }
+
+        /* Game Log */
+        .game-log {
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 0.85em;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 10px;
+            border-radius: 8px;
+        }
+
+        .log-entry {
+            padding: 3px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .log-player-0 {
+            color: #e0e0e0;
+        }
+
+        .log-player-1 {
+            color: #888;
+        }
+
+        /* Terminal State */
+        .game-over {
+            text-align: center;
+            padding: 20px;
+            background: rgba(76, 175, 80, 0.2);
+            border-radius: 10px;
+            margin-bottom: 15px;
+        }
+
+        .game-over.winner-0 {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .game-over.winner-1 {
+            background: rgba(100, 100, 100, 0.3);
+        }
+
+        .winner-text {
+            font-size: 1.5em;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        /* Instructions */
+        .instructions {
+            font-size: 0.85em;
+            color: #90a4ae;
+            margin-top: 15px;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        /* Minimax depth */
+        .minimax-options {
+            margin-top: 10px;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+        }
+
+        /* Model options */
+        .model-options {
+            margin-top: 10px;
+        }
+
+        /* Loading indicator */
+        .loading {
+            text-align: center;
+            padding: 20px;
+        }
+
+        .spinner {
+            border: 3px solid rgba(255, 255, 255, 0.1);
+            border-top: 3px solid #64b5f6;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Nine Men's Morris - Model Tester</h1>
+
+        <!-- Left Panel: Configuration -->
+        <div class="panel config-panel">
+            <h2>Game Configuration</h2>
+
+            <div class="player-config player-0">
+                <h3>Player 1 (White)</h3>
+                <label for="player0-type">Player Type</label>
+                <select id="player0-type" onchange="updatePlayerOptions(0)">
+                    <option value="human">Human</option>
+                    <option value="ai">AI Model</option>
+                    <option value="minimax">Minimax</option>
+                    <option value="random">Random</option>
+                </select>
+
+                <div id="player0-model-options" class="model-options hidden">
+                    <label for="player0-model">Select Model</label>
+                    <select id="player0-model"></select>
+                </div>
+
+                <div id="player0-minimax-options" class="minimax-options hidden">
+                    <label for="player0-depth">Minimax Depth</label>
+                    <input type="number" id="player0-depth" min="1" max="8" value="3">
+                </div>
+            </div>
+
+            <div class="player-config player-1">
+                <h3>Player 2 (Black)</h3>
+                <label for="player1-type">Player Type</label>
+                <select id="player1-type" onchange="updatePlayerOptions(1)">
+                    <option value="human">Human</option>
+                    <option value="ai" selected>AI Model</option>
+                    <option value="minimax">Minimax</option>
+                    <option value="random">Random</option>
+                </select>
+
+                <div id="player1-model-options" class="model-options">
+                    <label for="player1-model">Select Model</label>
+                    <select id="player1-model"></select>
+                </div>
+
+                <div id="player1-minimax-options" class="minimax-options hidden">
+                    <label for="player1-depth">Minimax Depth</label>
+                    <input type="number" id="player1-depth" min="1" max="8" value="3">
+                </div>
+            </div>
+
+            <button class="btn-primary" onclick="newGame()">New Game</button>
+            <button class="btn-secondary" onclick="makeAIMove()">AI Move / Next Step</button>
+
+            <div class="instructions">
+                <strong>How to play:</strong><br>
+                • Click on empty positions to place/move pieces<br>
+                • When moving, click your piece first, then destination<br>
+                • After forming a mill (3 in a row), click opponent's piece to capture<br>
+                • AI probabilities show on the right panel
+            </div>
+        </div>
+
+        <!-- Center: Game Board -->
+        <div class="panel board-panel">
+            <div class="board-container">
+                <svg id="board-svg" viewBox="-30 -30 560 560" width="500" height="500">
+                    <!-- Board background -->
+                    <rect x="-30" y="-30" width="560" height="560" fill="#2d3748"/>
+
+                    <!-- Board lines (row-by-row numbering) -->
+                    <g stroke="#4a5568" stroke-width="4" fill="none">
+                        <!-- Outer square (positions: 0,1,2,9,14,21,22,23) -->
+                        <rect x="0" y="0" width="500" height="500"/>
+                        <!-- Middle square (positions: 3,4,5,10,13,18,19,20) -->
+                        <rect x="83.33" y="83.33" width="333.33" height="333.33"/>
+                        <!-- Inner square (positions: 6,7,8,11,12,15,16,17) -->
+                        <rect x="166.66" y="166.66" width="166.66" height="166.66"/>
+                        <!-- Cross connections: 1-4-7 (top), 22-19-16 (bottom), 9-10-11 (left), 14-13-12 (right) -->
+                        <line x1="250" y1="0" x2="250" y2="166.66"/>
+                        <line x1="250" y1="333.33" x2="250" y2="500"/>
+                        <line x1="0" y1="250" x2="166.66" y2="250"/>
+                        <line x1="333.33" y1="250" x2="500" y2="250"/>
+                    </g>
+
+                    <!-- Board points (clickable) -->
+                    <g id="board-points"></g>
+
+                    <!-- Highlights for legal moves -->
+                    <g id="highlights"></g>
+
+                    <!-- Pieces -->
+                    <g id="pieces"></g>
+                </svg>
+            </div>
+        </div>
+
+        <!-- Right Panel: Status and Probabilities -->
+        <div class="panel info-panel">
+            <h2>Game Status</h2>
+
+            <div id="game-over-display" class="game-over hidden">
+                <div class="winner-text" id="winner-text"></div>
+            </div>
+
+            <div id="current-turn" class="current-turn turn-0">
+                Player 1's Turn (White)
+            </div>
+
+            <div class="status">
+                <div class="status-item">
+                    <span class="status-label">Phase:</span>
+                    <span class="status-value" id="phase-display">Placement</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">White Pieces:</span>
+                    <span class="status-value" id="p0-pieces">0</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Black Pieces:</span>
+                    <span class="status-value" id="p1-pieces">0</span>
+                </div>
+            </div>
+
+            <h2>AI Move Probabilities</h2>
+            <div id="prob-container" class="prob-list">
+                <p style="color: #90a4ae; text-align: center;">
+                    Probabilities will appear when AI makes a move
+                </p>
+            </div>
+
+            <h2>Game Log</h2>
+            <div id="game-log" class="game-log"></div>
+        </div>
+    </div>
+
+    <script>
+        // Game state
+        let selectedPosition = null;
+        let legalActions = [];
+        let boardPositions = {};
+        let currentPlayer = 0;
+        let gamePhase = 'placement';
+        let isTerminal = false;
+
+        // Board coordinates (matching Python POINT_TO_COORD) - (row, col) format
+        // Row-by-row numbering: top-to-bottom, left-to-right
+        const POINT_TO_COORD = {
+            0: [0, 0], 1: [0, 3], 2: [0, 6],
+            3: [1, 1], 4: [1, 3], 5: [1, 5],
+            6: [2, 2], 7: [2, 3], 8: [2, 4],
+            9: [3, 0], 10: [3, 1], 11: [3, 2],
+            12: [3, 4], 13: [3, 5], 14: [3, 6],
+            15: [4, 2], 16: [4, 3], 17: [4, 4],
+            18: [5, 1], 19: [5, 3], 20: [5, 5],
+            21: [6, 0], 22: [6, 3], 23: [6, 6],
+        };
+
+        // Convert grid coords (row, col) to SVG coords
+        function gridToSvg(row, col) {
+            return [col * 83.33, row * 83.33];
+        }
+
+        // Initialize the board
+        function initBoard() {
+            const pointsGroup = document.getElementById('board-points');
+            pointsGroup.innerHTML = '';
+
+            for (let pos = 0; pos < 24; pos++) {
+                const [row, col] = POINT_TO_COORD[pos];
+                const [sx, sy] = gridToSvg(row, col);
+
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('cx', sx);
+                circle.setAttribute('cy', sy);
+                circle.setAttribute('r', 15);
+                circle.setAttribute('fill', '#2d3748');
+                circle.setAttribute('stroke', '#4a5568');
+                circle.setAttribute('stroke-width', 2);
+                circle.setAttribute('class', 'board-point');
+                circle.setAttribute('data-pos', pos);
+                circle.onclick = () => handleClick(pos);
+
+                pointsGroup.appendChild(circle);
+            }
+        }
+
+        // Update board display
+        function updateBoard(state) {
+            if (!state) return;
+
+            legalActions = state.legal_actions || [];
+            currentPlayer = state.current_player;
+            gamePhase = state.phase;
+            isTerminal = state.is_terminal;
+
+            // Update status
+            document.getElementById('phase-display').textContent =
+                gamePhase.charAt(0).toUpperCase() + gamePhase.slice(1);
+            document.getElementById('p0-pieces').textContent = state.p0_pieces || 0;
+            document.getElementById('p1-pieces').textContent = state.p1_pieces || 0;
+
+            // Update turn indicator
+            const turnDiv = document.getElementById('current-turn');
+            if (isTerminal) {
+                turnDiv.textContent = 'Game Over';
+                turnDiv.className = 'current-turn';
+
+                // Show winner
+                const gameOverDiv = document.getElementById('game-over-display');
+                const winnerText = document.getElementById('winner-text');
+                gameOverDiv.classList.remove('hidden');
+
+                if (state.returns) {
+                    if (state.returns[0] > state.returns[1]) {
+                        winnerText.textContent = 'Player 1 (White) Wins!';
+                        gameOverDiv.className = 'game-over winner-0';
+                    } else if (state.returns[1] > state.returns[0]) {
+                        winnerText.textContent = 'Player 2 (Black) Wins!';
+                        gameOverDiv.className = 'game-over winner-1';
+                    } else {
+                        winnerText.textContent = 'Draw!';
+                        gameOverDiv.className = 'game-over';
+                    }
+                }
+            } else {
+                document.getElementById('game-over-display').classList.add('hidden');
+                if (currentPlayer === 0) {
+                    turnDiv.textContent = "Player 1's Turn (White)";
+                    turnDiv.className = 'current-turn turn-0';
+                } else {
+                    turnDiv.textContent = "Player 2's Turn (Black)";
+                    turnDiv.className = 'current-turn turn-1';
+                }
+            }
+
+            // Clear and redraw pieces
+            updatePieces(state.positions || {});
+
+            // Highlight legal moves
+            updateHighlights();
+        }
+
+        // Update pieces on board
+        function updatePieces(positions) {
+            boardPositions = positions;
+            const piecesGroup = document.getElementById('pieces');
+            piecesGroup.innerHTML = '';
+
+            for (const [pos, player] of Object.entries(positions)) {
+                const [row, col] = POINT_TO_COORD[pos];
+                const [sx, sy] = gridToSvg(row, col);
+
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('cx', sx);
+                circle.setAttribute('cy', sy);
+                circle.setAttribute('r', 25);
+                circle.setAttribute('class', 'piece');
+
+                if (player === 0) {
+                    circle.setAttribute('fill', '#ffffff');
+                    circle.setAttribute('stroke', '#cccccc');
+                } else {
+                    circle.setAttribute('fill', '#333333');
+                    circle.setAttribute('stroke', '#555555');
+                }
+                circle.setAttribute('stroke-width', 3);
+
+                piecesGroup.appendChild(circle);
+            }
+        }
+
+        // Update highlights for legal moves
+        function updateHighlights() {
+            const highlightsGroup = document.getElementById('highlights');
+            highlightsGroup.innerHTML = '';
+
+            if (isTerminal) return;
+
+            // Get player type for current player
+            const playerType = document.getElementById(`player${currentPlayer}-type`).value;
+            if (playerType !== 'human') return;  // Only highlight for human players
+
+            // Determine what to highlight based on phase and selection
+            let positionsToHighlight = [];
+
+            if (gamePhase === 'placement') {
+                // Highlight all positions where we can place
+                for (const action of legalActions) {
+                    if (action < 24) {
+                        positionsToHighlight.push({pos: action, color: '#4caf50'});
+                    }
+                }
+            } else if (gamePhase === 'movement') {
+                if (selectedPosition === null) {
+                    // Highlight pieces that can move
+                    for (const action of legalActions) {
+                        if (action >= 24 && action < 600) {
+                            const fromPos = Math.floor((action - 24) / 24);
+                            positionsToHighlight.push({pos: fromPos, color: '#2196f3'});
+                        }
+                    }
+                } else {
+                    // Highlight valid destinations
+                    for (const action of legalActions) {
+                        if (action >= 24 && action < 600) {
+                            const fromPos = Math.floor((action - 24) / 24);
+                            const toPos = (action - 24) % 24;
+                            if (fromPos === selectedPosition) {
+                                positionsToHighlight.push({pos: toPos, color: '#4caf50'});
+                            }
+                        }
+                    }
+                    // Also highlight selected piece
+                    positionsToHighlight.push({pos: selectedPosition, color: '#ffeb3b'});
+                }
+            } else if (gamePhase === 'capture') {
+                // Highlight capturable pieces
+                for (const action of legalActions) {
+                    if (action < 24) {
+                        positionsToHighlight.push({pos: action, color: '#f44336'});
+                    }
+                }
+            }
+
+            // Remove duplicates
+            const seen = new Set();
+            positionsToHighlight = positionsToHighlight.filter(item => {
+                if (seen.has(item.pos)) return false;
+                seen.add(item.pos);
+                return true;
+            });
+
+            // Draw highlights
+            for (const {pos, color} of positionsToHighlight) {
+                const [row, col] = POINT_TO_COORD[pos];
+                const [sx, sy] = gridToSvg(row, col);
+
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('cx', sx);
+                circle.setAttribute('cy', sy);
+                circle.setAttribute('r', 30);
+                circle.setAttribute('fill', 'none');
+                circle.setAttribute('stroke', color);
+                circle.setAttribute('stroke-width', 4);
+                circle.setAttribute('opacity', 0.7);
+                circle.setAttribute('class', 'legal');
+
+                highlightsGroup.appendChild(circle);
+            }
+        }
+
+        // Handle click on board position
+        async function handleClick(pos) {
+            if (isTerminal) return;
+
+            const playerType = document.getElementById(`player${currentPlayer}-type`).value;
+            if (playerType !== 'human') {
+                console.log('Not human turn');
+                return;
+            }
+
+            let action = null;
+
+            if (gamePhase === 'placement') {
+                // Check if this is a valid placement
+                if (legalActions.includes(pos)) {
+                    action = pos;
+                }
+            } else if (gamePhase === 'movement') {
+                if (selectedPosition === null) {
+                    // Select a piece to move
+                    const canMoveFrom = legalActions.some(a => {
+                        if (a >= 24 && a < 600) {
+                            return Math.floor((a - 24) / 24) === pos;
+                        }
+                        return false;
+                    });
+                    if (canMoveFrom) {
+                        selectedPosition = pos;
+                        updateHighlights();
+                    }
+                } else {
+                    // Try to move to this position
+                    const moveAction = 24 + selectedPosition * 24 + pos;
+                    if (legalActions.includes(moveAction)) {
+                        action = moveAction;
+                    }
+                    selectedPosition = null;
+                }
+            } else if (gamePhase === 'capture') {
+                if (legalActions.includes(pos)) {
+                    action = pos;
+                }
+            }
+
+            if (action !== null) {
+                await makeMove(action);
+            } else {
+                updateHighlights();
+            }
+        }
+
+        // Make a move
+        async function makeMove(action) {
+            try {
+                const response = await fetch('/api/move', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({action: action})
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    updateBoard(data.state);
+                    addLogEntry(data.move_description, data.player);
+                    selectedPosition = null;
+
+                    // Check if next player is AI
+                    if (!data.state.is_terminal) {
+                        const nextPlayer = data.state.current_player;
+                        const nextType = document.getElementById(`player${nextPlayer}-type`).value;
+                        if (nextType !== 'human') {
+                            // Small delay then make AI move
+                            setTimeout(() => makeAIMove(), 500);
+                        }
+                    }
+                } else {
+                    console.error('Move failed:', data.error);
+                }
+            } catch (err) {
+                console.error('Error making move:', err);
+            }
+        }
+
+        // Make AI move
+        async function makeAIMove() {
+            if (isTerminal) return;
+
+            const playerType = document.getElementById(`player${currentPlayer}-type`).value;
+            if (playerType === 'human') {
+                console.log('Human turn - not making AI move');
+                return;
+            }
+
+            try {
+                const depth = document.getElementById(`player${currentPlayer}-depth`)?.value || 3;
+                const modelSelect = document.getElementById(`player${currentPlayer}-model`);
+                const modelPath = modelSelect?.value || '';
+
+                const response = await fetch('/api/ai_move', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        player_type: playerType,
+                        model_path: modelPath,
+                        minimax_depth: parseInt(depth)
+                    })
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    updateBoard(data.state);
+                    addLogEntry(data.move_description, data.player);
+
+                    // Update probabilities display
+                    if (data.probabilities) {
+                        displayProbabilities(data.probabilities);
+                    }
+
+                    // Check if next player is also AI
+                    if (!data.state.is_terminal) {
+                        const nextPlayer = data.state.current_player;
+                        const nextType = document.getElementById(`player${nextPlayer}-type`).value;
+                        if (nextType !== 'human') {
+                            setTimeout(() => makeAIMove(), 500);
+                        }
+                    }
+                } else {
+                    console.error('AI move failed:', data.error);
+                }
+            } catch (err) {
+                console.error('Error making AI move:', err);
+            }
+        }
+
+        // Display move probabilities
+        function displayProbabilities(probs) {
+            const container = document.getElementById('prob-container');
+
+            if (!probs || Object.keys(probs).length === 0) {
+                container.innerHTML = '<p style="color: #90a4ae; text-align: center;">No probabilities available</p>';
+                return;
+            }
+
+            // Sort by probability
+            const sorted = Object.entries(probs)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 10);  // Top 10
+
+            container.innerHTML = sorted.map(([action, prob]) => {
+                const actionInfo = decodeAction(parseInt(action));
+                const percentage = (prob * 100).toFixed(1);
+                return `
+                    <div class="prob-item">
+                        <span class="prob-action">${actionInfo}</span>
+                        <div class="prob-bar-container">
+                            <div class="prob-bar" style="width: ${percentage}%"></div>
+                        </div>
+                        <span class="prob-value">${percentage}%</span>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // Decode action to human readable
+        // Note: captures use the same 0-23 range as placements, depends on game phase
+        function decodeAction(action) {
+            if (action < 24) {
+                // Could be place or capture depending on phase
+                if (gamePhase === 'capture') {
+                    return `Capture @ ${action}`;
+                } else {
+                    return `Place @ ${action}`;
+                }
+            } else {
+                const from = Math.floor((action - 24) / 24);
+                const to = (action - 24) % 24;
+                return `Move ${from} → ${to}`;
+            }
+        }
+
+        // Add log entry
+        function addLogEntry(description, player) {
+            const log = document.getElementById('game-log');
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-player-${player}`;
+            entry.textContent = `P${player + 1}: ${description}`;
+            log.insertBefore(entry, log.firstChild);
+        }
+
+        // Update player options visibility
+        function updatePlayerOptions(player) {
+            const type = document.getElementById(`player${player}-type`).value;
+            const modelOptions = document.getElementById(`player${player}-model-options`);
+            const minimaxOptions = document.getElementById(`player${player}-minimax-options`);
+
+            modelOptions.classList.add('hidden');
+            minimaxOptions.classList.add('hidden');
+
+            if (type === 'ai') {
+                modelOptions.classList.remove('hidden');
+            } else if (type === 'minimax') {
+                minimaxOptions.classList.remove('hidden');
+            }
+        }
+
+        // Load available models
+        async function loadModels() {
+            try {
+                const response = await fetch('/api/models');
+                const models = await response.json();
+
+                for (let player = 0; player < 2; player++) {
+                    const select = document.getElementById(`player${player}-model`);
+                    select.innerHTML = models.map(m =>
+                        `<option value="${m.path}">${m.name}</option>`
+                    ).join('');
+                }
+            } catch (err) {
+                console.error('Error loading models:', err);
+            }
+        }
+
+        // Start new game
+        async function newGame() {
+            try {
+                // Get player configurations
+                const config = {
+                    player0_type: document.getElementById('player0-type').value,
+                    player0_model: document.getElementById('player0-model').value,
+                    player0_depth: parseInt(document.getElementById('player0-depth').value),
+                    player1_type: document.getElementById('player1-type').value,
+                    player1_model: document.getElementById('player1-model').value,
+                    player1_depth: parseInt(document.getElementById('player1-depth').value)
+                };
+
+                const response = await fetch('/api/new_game', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(config)
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    updateBoard(data.state);
+                    document.getElementById('game-log').innerHTML = '';
+                    document.getElementById('prob-container').innerHTML =
+                        '<p style="color: #90a4ae; text-align: center;">Probabilities will appear when AI makes a move</p>';
+                    selectedPosition = null;
+
+                    // If first player is AI, make their move
+                    if (config.player0_type !== 'human') {
+                        setTimeout(() => makeAIMove(), 500);
+                    }
+                }
+            } catch (err) {
+                console.error('Error starting new game:', err);
+            }
+        }
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', async () => {
+            initBoard();
+            await loadModels();
+            updatePlayerOptions(0);
+            updatePlayerOptions(1);
+            await newGame();
+        });
+    </script>
+</body>
+</html>
+'''
+
+
+# API Routes
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+
+@app.route('/api/models')
+def api_models():
+    return jsonify(get_available_models())
+
+
+@app.route('/api/new_game', methods=['POST'])
+def api_new_game():
+    global game_state, _minimax_bot
+
+    config = request.json or {}
+
+    # Clear minimax transposition table for new game
+    if _minimax_bot is not None:
+        _minimax_bot.tt.clear()
+        _minimax_bot.move_orderer.clear()
+
+    # Initialize new game
+    game_state = GameState()
+    game_state.state = GAME.new_initial_state()
+
+    # Configure players
+    game_state.player_types[0] = config.get('player0_type', 'human')
+    game_state.player_types[1] = config.get('player1_type', 'ai')
+    game_state.player_minimax_depth[0] = config.get('player0_depth', 3)
+    game_state.player_minimax_depth[1] = config.get('player1_depth', 3)
+
+    # Load AI models if needed
+    models = get_available_models()
+    for player in [0, 1]:
+        if game_state.player_types[player] == 'ai':
+            model_path = config.get(f'player{player}_model', '')
+            if model_path:
+                # Find matching model
+                for m in models:
+                    if m['path'] == model_path:
+                        try:
+                            game_state.player_models[player] = load_model(m)
+                        except Exception as e:
+                            print(f"Error loading model: {e}")
+                        break
+
+    # Get board state
+    state_info = get_board_state()
+    state_info['positions'] = parse_board_positions(game_state.state)
+
+    return jsonify({
+        'success': True,
+        'state': state_info
+    })
+
+
+@app.route('/api/move', methods=['POST'])
+def api_move():
+    global game_state
+
+    if game_state.state is None or game_state.state.is_terminal():
+        return jsonify({'success': False, 'error': 'Game not active'})
+
+    data = request.json or {}
+    action = data.get('action')
+
+    if action is None:
+        return jsonify({'success': False, 'error': 'No action provided'})
+
+    # Check if action is legal
+    if action not in game_state.state.legal_actions():
+        return jsonify({'success': False, 'error': 'Illegal action'})
+
+    # Get current player and determine phase before move
+    player = game_state.state.current_player()
+    state_before = get_board_state()
+    is_capture = state_before['phase'] == 'capture'
+
+    # Apply action
+    game_state.state.apply_action(action)
+
+    # Get updated state
+    state_info = get_board_state()
+    state_info['positions'] = parse_board_positions(game_state.state)
+
+    # Describe move based on phase before action
+    action_info = decode_action(action, is_capture_phase=is_capture)
+    if action_info['type'] == 'place':
+        desc = f"Placed piece at position {action_info['position']}"
+    elif action_info['type'] == 'move':
+        desc = f"Moved piece from {action_info['from']} to {action_info['to']}"
+    else:
+        desc = f"Captured piece at position {action_info['position']}"
+
+    return jsonify({
+        'success': True,
+        'state': state_info,
+        'player': int(player),
+        'move_description': desc
+    })
+
+
+@app.route('/api/ai_move', methods=['POST'])
+def api_ai_move():
+    global game_state
+
+    if game_state.state is None or game_state.state.is_terminal():
+        return jsonify({'success': False, 'error': 'Game not active'})
+
+    data = request.json or {}
+    player_type = data.get('player_type', 'random')
+
+    current_player = game_state.state.current_player()
+    action = None
+    probabilities = None
+
+    if player_type == 'ai':
+        model_path = data.get('model_path', '')
+
+        # Check if we have a loaded model
+        model_data = game_state.player_models.get(current_player)
+
+        if model_data is None and model_path:
+            # Try to load model
+            models = get_available_models()
+            for m in models:
+                if m['path'] == model_path:
+                    try:
+                        model_data = load_model(m)
+                        game_state.player_models[current_player] = model_data
+                    except Exception as e:
+                        print(f"Error loading model: {e}")
+                    break
+
+        if model_data:
+            model, model_type = model_data
+            action, probabilities = get_ai_move_with_probs(model, game_state.state, current_player)
+        else:
+            # Fallback to random
+            action = get_random_move(game_state.state)
+
+    elif player_type == 'minimax':
+        depth = data.get('minimax_depth', game_state.player_minimax_depth.get(current_player, 3))
+        action = get_minimax_move(game_state.state, depth)
+
+    else:  # random
+        action = get_random_move(game_state.state)
+
+    if action is None or action not in game_state.state.legal_actions():
+        return jsonify({'success': False, 'error': 'Could not determine valid action'})
+
+    # Check phase before action
+    state_before = get_board_state()
+    is_capture = state_before['phase'] == 'capture'
+
+    # Apply action
+    game_state.state.apply_action(action)
+
+    # Get updated state
+    state_info = get_board_state()
+    state_info['positions'] = parse_board_positions(game_state.state)
+
+    # Describe move based on phase before action
+    action_info = decode_action(action, is_capture_phase=is_capture)
+    if action_info['type'] == 'place':
+        desc = f"Placed piece at position {action_info['position']}"
+    elif action_info['type'] == 'move':
+        desc = f"Moved piece from {action_info['from']} to {action_info['to']}"
+    else:
+        desc = f"Captured piece at position {action_info['position']}"
+
+    return jsonify({
+        'success': True,
+        'state': state_info,
+        'player': int(current_player),
+        'move_description': desc,
+        'probabilities': probabilities
+    })
+
+
+@app.route('/api/state')
+def api_state():
+    if game_state.state is None:
+        return jsonify({'error': 'No game in progress'})
+
+    state_info = get_board_state()
+    state_info['positions'] = parse_board_positions(game_state.state)
+    return jsonify(state_info)
+
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("Nine Men's Morris - Model Testing Web UI")
+    print("=" * 60)
+    print(f"Device: {DEVICE}")
+    print(f"Available models: {len(get_available_models())}")
+    print()
+    print("Open http://192.168.178.23:7860 in your browser")
+    print("=" * 60)
+
+    app.run(host='0.0.0.0', port=7860, debug=True)

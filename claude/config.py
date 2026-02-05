@@ -19,14 +19,14 @@ class Config:
     """Training configuration - curriculum-aware."""
     
     # Training scale
-    total_episodes: int = 10_000_000  # Max episodes (curriculum may finish earlier)
-    episodes_per_update: int = 2048
+    total_episodes: int = 50_000_000  # Max episodes (curriculum may finish earlier)
+    episodes_per_update: int = 4096
     ppo_epochs: int = 3
-    mini_batch_size: int = 512
+    mini_batch_size: int = 1024
     
-    # Parallelism
-    num_workers: int = 16
-    envs_per_worker: int = 32
+    # Parallelism (optimized for Threadripper 3960X + RTX 3090)
+    num_workers: int = 22
+    envs_per_worker: int = 48
     
     # Model architecture
     hidden_dim: int = 128
@@ -55,7 +55,11 @@ class Config:
     
     # Game settings
     max_game_steps: int = 300
-    
+
+    # Note: Using pyspiel's nine_mens_morris game
+    # Random moves are used to prepare board positions for training
+    # The number of random moves is managed by curriculum per phase
+
     # Mixed precision
     use_mixed_precision: bool = True
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'

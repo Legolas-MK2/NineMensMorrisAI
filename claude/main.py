@@ -13,6 +13,9 @@ import random
 import multiprocessing as mp
 
 import torch
+
+# Import pyspiel with bug fix wrapper
+from game_wrapper import load_game as load_game_fixed
 import pyspiel
 
 from config import Config
@@ -23,35 +26,65 @@ from utils import get_legal_mask
 from curriculum import CurriculumManager, Phase, PHASE_CONFIGS
 
 
-def play_interactive():
+def get_game():
+    """Get game instance using pyspiel with position 0 bug fix."""
+    return load_game_fixed("nine_mens_morris")
+
+
+def prepare_game_state(state, random_moves: int):
+    """Play random moves to prepare the board state (not recorded)."""
+    moves_made = 0
+    while moves_made < random_moves and not state.is_terminal():
+        # Check if either player has only 3 stones - stop early
+        try:
+            obs = state.observation_tensor(0)
+            p0_pieces = sum(1 for i in range(24) if obs[i] == 1)
+            p1_pieces = sum(1 for i in range(24) if obs[i + 24] == 1)
+            if p0_pieces <= 3 or p1_pieces <= 3:
+                break
+        except:
+            pass
+
+        legal_actions = state.legal_actions()
+        if not legal_actions:
+            break
+
+        action = random.choice(legal_actions)
+        state.apply_action(action)
+        moves_made += 1
+
+
+def play_interactive(config: Config = None):
     """Interactive play mode."""
+    if config is None:
+        config = Config()
+
     # Find available models
     files = []
     for d in ["models", "checkpoints"]:
         if os.path.exists(d):
             files.extend(glob.glob(f"{d}/*.pt"))
-    
+
     if not files:
         print("No models found!")
         return
-    
+
     files.sort(key=os.path.getmtime, reverse=True)
     print("\nAvailable models:")
     for i, f in enumerate(files[:10], 1):
         print(f"  {i}. {os.path.basename(f)}")
-    
+
     try:
         idx = int(input("\nSelect model (number): ")) - 1
         path = files[idx]
     except (ValueError, IndexError):
         print("Invalid selection")
         return
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    game = pyspiel.load_game("nine_mens_morris")
-    
+    game = get_game()
+
     # Load model
-    config = Config()
     model = ActorCritic(
         game.observation_tensor_size(),
         game.num_distinct_actions(),
@@ -75,11 +108,13 @@ def play_interactive():
     if mode == "3":
         # Progressive minimax test
         print("\nTesting AI against Minimax depths 1-6...")
+        random_moves = int(input("Number of random moves to prepare board (0-150): ") or "75")
         max_beaten, results = evaluate_vs_minimax(
             model, device, game.num_distinct_actions(),
-            max_depth=6, games_per_depth=20, max_steps=200
+            max_depth=6, games_per_depth=20, max_steps=200,
+            random_moves=random_moves
         )
-        
+
         print(f"\n{'=' * 50}")
         print(f"Results: AI beats Minimax up to depth {max_beaten}")
         print(f"{'=' * 50}")
@@ -93,16 +128,22 @@ def play_interactive():
         try:
             depth = int(input("Minimax depth (1-6): "))
             ai_player = int(input("AI plays as (0/1): "))
+            random_moves = int(input("Random moves to prepare board (0-150): ") or "75")
         except ValueError:
             print("Invalid input")
             return
-        
+
         bot = MinimaxBot(max_depth=depth)
         state = game.new_initial_state()
+
+        # Prepare board with random moves
+        prepare_game_state(state, random_moves)
+
         move_num = 0
-        
+
         print(f"\n{'=' * 50}")
         print(f"AI (Player {ai_player}) vs Minimax Depth {depth}")
+        print(f"Board prepared with {random_moves} random moves")
         print(f"{'=' * 50}")
         
         while not state.is_terminal():
@@ -150,13 +191,19 @@ def play_interactive():
     # Mode 1: Human vs AI
     try:
         human = int(input("Play as (0/1): "))
+        random_moves = int(input("Random moves to prepare board (0-150): ") or "75")
     except ValueError:
         human = 0
-    
+        random_moves = 75
+
     state = game.new_initial_state()
-    
+
+    # Prepare board with random moves
+    prepare_game_state(state, random_moves)
+
     print(f"\n{'=' * 50}")
     print(f"You are Player {human}")
+    print(f"Board prepared with {random_moves} random moves")
     print(f"{'=' * 50}")
     
     while not state.is_terminal():
@@ -209,22 +256,30 @@ def show_curriculum_info():
     print("\n" + "=" * 70)
     print("CURRICULUM TRAINING PHASES")
     print("=" * 70)
-    
+    print("\nNote: pyspiel Nine Men's Morris starts with full game.")
+    print("Random moves are used to prepare board positions for training.\n")
+
+    # Random moves per phase
+    random_moves_info = {
+        1: "150", 2: "150",
+        3: "~129", 4: "~107", 5: "~86", 6: "~64", 7: "~43", 8: "~21",
+        9: "0",
+        10: "0-150 (random)"
+    }
+
     for phase, cfg in PHASE_CONFIGS.items():
-        print(f"\nPhase {int(phase)}: {cfg.description}")
+        phase_num = int(phase)
+        print(f"\nPhase {phase_num}: {cfg.description}")
         print("-" * 50)
+        print(f"  Random Prep:     {random_moves_info.get(phase_num, 'N/A')} moves")
         print(f"  Opponent:        {cfg.opponent_type}")
-        if cfg.opponent_type == 'minimax':
-            print(f"  Minimax Depth:   {cfg.minimax_start_depth} → {cfg.minimax_max_depth}")
         print(f"  Learning Rate:   {cfg.lr_start:.0e} → {cfg.lr_end:.0e}")
         print(f"  Shaping Mult:    {cfg.shaping_multiplier:.1f}x")
         print(f"  Win Threshold:   {cfg.win_rate_threshold:.0%}")
         print(f"  Min Games:       {cfg.min_games_for_graduation}")
-        if cfg.minimax_depth_to_beat > 0:
-            print(f"  Must Beat Depth: {cfg.minimax_depth_to_beat}")
         if cfg.max_episodes > 0:
             print(f"  Max Episodes:    {cfg.max_episodes:,}")
-    
+
     print("\n" + "=" * 70)
 
 
@@ -273,10 +328,10 @@ Examples:
         help='Environments per worker (default: 32)'
     )
     parser.add_argument(
-        '--phase', type=int, choices=[1, 2, 3, 4, 5],
-        help='Start from specific phase (1-5)'
+        '--phase', type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        help='Start from specific phase (1-10)'
     )
-    
+
     args = parser.parse_args()
     
     # Set multiprocessing start method
@@ -292,17 +347,16 @@ Examples:
             config.total_episodes = args.episodes
         config.num_workers = args.workers
         config.envs_per_worker = args.envs
-        
+
         trainer = PPOTrainer(config)
-        
+
         # Start from specific phase if requested
         if args.phase:
             trainer.curriculum.current_phase = Phase(args.phase)
             trainer.curriculum.stats.phase = Phase(args.phase)
             phase_cfg = PHASE_CONFIGS[Phase(args.phase)]
-            trainer.curriculum.stats.current_minimax_depth = phase_cfg.minimax_start_depth
             print(f"Starting from Phase {args.phase}: {phase_cfg.description}")
-        
+
         trainer.train()
         
     elif args.mode == 'resume':
@@ -311,9 +365,9 @@ Examples:
             config.total_episodes = args.episodes
         config.num_workers = args.workers
         config.envs_per_worker = args.envs
-        
+
         trainer = PPOTrainer(config)
-        
+
         if args.checkpoint:
             trainer.load_checkpoint(args.checkpoint)
         else:
@@ -325,26 +379,29 @@ Examples:
             else:
                 print("No checkpoints found! Use 'train' mode to start fresh.")
                 return
-        
+
         trainer.train()
-        
+
     elif args.mode == 'play':
-        play_interactive()
+        config = Config()
+        play_interactive(config)
 
 
 if __name__ == "__main__":
     if len(sys.argv) == 1:
         print("=" * 70)
-        print("Nine Men's Morris - Curriculum PPO Training")
+        print("Nine Men's Morris - Curriculum PPO Training (pyspiel)")
         print("=" * 70)
         print()
-        print("This training system uses a 5-phase curriculum:")
+        print("This training system uses a 10-phase curriculum with random board prep:")
         print()
-        print("  Phase 1: Learn basics vs RANDOM opponent (95% WR to pass)")
-        print("  Phase 2: Beat MINIMAX D1-D2 (85% WR to pass)")
-        print("  Phase 3: Reduced rewards vs MINIMAX D2-D3 (75% WR to pass)")
-        print("  Phase 4: Sparse rewards vs MINIMAX D3-D4 (70% WR to pass)")
-        print("  Phase 5: SELF-PLAY refinement (1M episodes)")
+        print("  Phase 1-2:  150 random moves prep, vs RANDOM (warmup)")
+        print("  Phase 3-8:  Linear decrease (129->21 moves), mixed opponents")
+        print("  Phase 9:    No prep moves, full game, mixed opponents")
+        print("  Phase 10:   0-150 random prep, final phase with D1-D6 minimax")
+        print()
+        print("Random moves prepare diverse board positions without custom engine.")
+        print("Training starts after board prep - prep moves aren't learned.")
         print()
         print("Usage:")
         print("  python main.py train [options]    # Start training")
@@ -353,13 +410,17 @@ if __name__ == "__main__":
         print("  python main.py info               # Show phase details")
         print()
         print("Options:")
-        print("  --workers N      Number of worker processes (default: 16)")
-        print("  --envs N         Environments per worker (default: 32)")
-        print("  --episodes N     Maximum total episodes")
-        print("  --phase N        Start from phase N (1-5)")
+        print("  --workers N         Number of worker processes (default: 16)")
+        print("  --envs N            Environments per worker (default: 32)")
+        print("  --episodes N        Maximum total episodes")
+        print("  --phase N           Start from curriculum phase N (1-10)")
         print()
-        print("Quick start:")
+        print("Examples:")
+        print("  # Standard training")
         print("  python main.py train --workers 16 --envs 32")
+        print()
+        print("  # Start from phase 5")
+        print("  python main.py train --phase 5")
         print()
     else:
         main()

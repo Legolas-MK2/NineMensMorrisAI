@@ -190,16 +190,29 @@ class BoardAnalyzer:
     """
     
     # Mill positions on the board (groups of 3 that form mills)
-    # These are the indices in the standard board representation
+    # Row-by-row numbering:
+    #     0-----------1-----------2
+    #     |           |           |
+    #     |     3-----4-----5     |
+    #     |     |     |     |     |
+    #     |     |  6--7--8  |     |
+    #     |     |  |     |  |     |
+    #     9----10-11    12-13----14
+    #     |     |  |     |  |     |
+    #     |     | 15-16-17  |     |
+    #     |     |     |     |     |
+    #     |    18----19----20     |
+    #     |           |           |
+    #    21----------22----------23
     MILL_POSITIONS = [
-        # Outer square
-        [0, 1, 2], [2, 3, 4], [4, 5, 6], [6, 7, 0],
-        # Middle square  
-        [8, 9, 10], [10, 11, 12], [12, 13, 14], [14, 15, 8],
-        # Inner square
-        [16, 17, 18], [18, 19, 20], [20, 21, 22], [22, 23, 16],
-        # Connections
-        [1, 9, 17], [3, 11, 19], [5, 13, 21], [7, 15, 23],
+        # Outer square sides
+        [0, 1, 2], [0, 9, 21], [2, 14, 23], [21, 22, 23],
+        # Middle square sides
+        [3, 4, 5], [3, 10, 18], [5, 13, 20], [18, 19, 20],
+        # Inner square sides
+        [6, 7, 8], [6, 11, 15], [8, 12, 17], [15, 16, 17],
+        # Cross connections
+        [1, 4, 7], [9, 10, 11], [12, 13, 14], [16, 19, 22],
     ]
     
     @staticmethod
