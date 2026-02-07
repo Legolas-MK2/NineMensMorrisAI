@@ -1,0 +1,41 @@
+{
+  "current_phase": 2,
+  "total_episodes": 414107,
+  "stats": {
+    "phase": 2,
+    "episodes_in_phase": 212994,
+    "total_games": 212994,
+    "wins": 89193,
+    "losses": 102092,
+    "draws": 21709,
+    "best_win_rate": 0.967741935483871
+  },
+  "phase_history": [
+    {
+      "phase": 1,
+      "episodes": 201113,
+      "total_games": 201113,
+      "wins": 152189,
+      "losses": 27051,
+      "draws": 21873,
+      "best_win_rate": 0.966,
+      "clone_generations": 0,
+      "duration_seconds": 990.2981922626495
+    }
+  ],
+  "mixed_state": {
+    "total_episodes": 212994,
+    "clone_generation": 2,
+    "games_vs_random": 11924,
+    "games_vs_minimax": 63541,
+    "games_vs_self": 137529,
+    "minimax_wins_by_depth": {
+      "1": 7511,
+      "2": 9330,
+      "3": 7156,
+      "4": 8171,
+      "5": 0,
+      "6": 0
+    }
+  }
+}

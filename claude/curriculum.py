@@ -5,10 +5,10 @@ Handles phased training with automatic progression
 Phase Structure:
 - Phase 1: Random stones (3-9), jumping phase, vs random only (warmup)
           Min 200k episodes, shaping_multiplier=1.0
-- Phase 2-9: 3-9 stones, mixed opponents (0% minimax, 95% self-play, 5% random)
+- Phase 2-9: 3-9 stones, mixed opponents (30% minimax D1-D2, 65% self-play, 5% random)
              Shaping multiplier: 1.0 -> 0.0 over first 3/4 of phase, then 0.0 for last 1/4
              Resets to 1.0 at start of each new phase
-- Phase 10: Full game, no shaping (multiplier=0.0), 1M episodes, minimax D1-D6
+- Phase 10: Full game, no shaping (multiplier=0.0), 1M episodes, minimax D1-D6 (30% minimax, 65% self-play, 5% random)
 """
 
 import os
@@ -84,8 +84,8 @@ class PhaseConfig:
 MIXED_CONFIG = {
     # Opponent distribution
     'opponent_mix': {
-        'minimax': 0.00,   # 0% minimax
-        'self': 0.95,      # 95% self-play (vs clone)
+        'minimax': 0.30,   # 30% minimax
+        'self': 0.65,      # 65% self-play (vs clone)
         'random': 0.05,    # 5% random
     },
 
@@ -103,10 +103,9 @@ MIXED_CONFIG = {
 
 # Special config for Phase 10 (final phase with harder minimax)
 PHASE_10_CONFIG = {
-    'minimax': 0.00,   # 0% minimax
-    'self': 0.95,      # 95% self-play (vs clone)
-    'random': 0.05 
-    ,
+    'minimax': 0.30,   # 30% minimax
+    'self': 0.65,      # 65% self-play (vs clone)
+    'random': 0.05,    # 5% random
     'selfplay_winrate_threshold': 0.80,
     'selfplay_winrate_games': 500,
     'minimax_min_depth': 1,

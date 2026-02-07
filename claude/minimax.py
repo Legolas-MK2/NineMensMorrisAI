@@ -659,7 +659,6 @@ class OptimizedMinimaxBot:
         'win': 1_000_000,
         'loss': -1_000_000,
         'draw': -50_000,
-        'piece': 10_000,
         'mill': 5_000,
         'potential_mill': 1_500,
         'double_mill': 8_000,
@@ -667,7 +666,6 @@ class OptimizedMinimaxBot:
         'unblocked_threat': 3_000,    # Penalty for leaving opponent threats open
         'mobility': 100,
         'position': 50,
-        'endgame_piece_bonus': 2_000,
     }
     
     # Search constants
@@ -859,16 +857,49 @@ class OptimizedMinimaxBot:
         return count
     
     def _count_double_mills(self, board: Tuple[Optional[int], ...], player: int) -> int:
-        """Count positions with multiple complete mills."""
+        """
+        Count windmill (double mill / see-saw) configurations.
+
+        A windmill exists when a piece at X can move to adjacent empty position N,
+        breaking its own complete mill A while simultaneously completing mill B,
+        then move back next turn to re-complete mill A (capturing each turn).
+
+        Requires:
+        - Piece at X is part of a complete mill A
+        - Adjacent empty position N would complete a different mill B (has 2/3 player pieces)
+        - X is not in mill B (otherwise moving X out breaks B too)
+        """
         count = 0
-        for pos in range(24):
-            if board[pos] != player:
+        for x in range(24):
+            if board[x] != player:
                 continue
-            mills_count = sum(
-                1 for mill in POSITION_TO_MILLS[pos]
-                if all(board[p] == player for p in mill)
-            )
-            if mills_count >= 2:
+
+            # X must be in at least one complete mill
+            if not any(
+                all(board[p] == player for p in mill)
+                for mill in POSITION_TO_MILLS[x]
+            ):
+                continue
+
+            # Check if moving X to any adjacent empty spot would complete another mill
+            found = False
+            for n in ADJACENCY[x]:
+                if board[n] is not None:
+                    continue
+
+                for mill_b in POSITION_TO_MILLS[n]:
+                    if x in mill_b:
+                        continue  # X must not be in mill B
+
+                    # The other 2 positions in mill B must have player's pieces
+                    if all(board[p] == player for p in mill_b if p != n):
+                        found = True
+                        break
+
+                if found:
+                    break
+
+            if found:
                 count += 1
         return count
     
@@ -927,17 +958,7 @@ class OptimizedMinimaxBot:
         mover = current_mover
         opponent = 1 - mover
 
-        # Piece counts
-        my_pieces = self._count_pieces(board, mover)
-        opp_pieces = self._count_pieces(board, opponent)
-
         score = 0.0
-
-        # Piece difference (fundamental)
-        piece_weight = self.WEIGHTS['piece']
-        if my_pieces <= 4 or opp_pieces <= 4:
-            piece_weight += self.WEIGHTS['endgame_piece_bonus']
-        score += (my_pieces - opp_pieces) * piece_weight
 
         # Mills
         my_mills = self._count_mills(board, mover)
