@@ -60,7 +60,7 @@ class PhaseConfig:
     draw_penalty: float = -0.5
 
     # Shaping reward multiplier (0.0 = no shaping, 1.0 = full shaping)
-    shaping_multiplier: float = 1.0
+    shaping_multiplier: float = 0.0  # TEMPORARILY DISABLED - set back to 1.0 to re-enable
 
     # Base shaping rewards
     mill_reward: float = 0.3
@@ -82,35 +82,45 @@ class PhaseConfig:
 
 # Mixed opponent configuration for Phase 2+
 MIXED_CONFIG = {
-    # Opponent distribution
+    # Opponent distribution - increased minimax to reduce self-play overfitting
     'opponent_mix': {
-        'minimax': 0.30,   # 30% minimax
-        'self': 0.65,      # 65% self-play (vs clone)
-        'random': 0.05,    # 5% random
+        'minimax': 0.30,   # 30% minimax (was 15%)
+        'self': 0.60,      # 60% self-play (was 80%)
+        'random': 0.10,    # 10% random (was 5%)
     },
 
-    # Self-play: clone update when 80% win rate over last 500 games
-    'selfplay_winrate_threshold': 0.80,
-    'selfplay_winrate_games': 500,
+
+
+
+    # Self-play: clone update at 85% win rate (was 90%, less aggressive)
+    'selfplay_winrate_threshold': 0.85,
+    'selfplay_winrate_games': 1000,  # Increased from 500 for stability
 
     # Minimax depth range (random selection, no progressive)
     'minimax_min_depth': 1,
     'minimax_max_depth': 2,  # D1-D2 for phases 2-9
 
-    # Graduation: 2M episodes per phase
-    'graduation_episodes': 2_000_000,
+    # Graduation: 5M episodes per phase
+    'graduation_episodes': 5_000_000,
+
+    # Stagnation detection: graduate early if model stops improving
+    'stagnation_min_episodes': 1_000_000,    # Don't trigger before 1M episodes in phase
+    'stagnation_clone_window': 1_500_000,    # Episodes without a clone update = stuck
+    'stagnation_snapshot_interval': 100_000, # Take minimax WR snapshot every 100k episodes
+    'stagnation_snapshot_window': 5,         # Compare last 5 snapshots (= 500k episodes)
+    'stagnation_threshold': 0.03,            # Must improve combined d1+d2 WR by 3%
 }
 
 # Special config for Phase 10 (final phase with harder minimax)
 PHASE_10_CONFIG = {
-    'minimax': 0.30,   # 30% minimax
-    'self': 0.65,      # 65% self-play (vs clone)
-    'random': 0.05,    # 5% random
-    'selfplay_winrate_threshold': 0.80,
-    'selfplay_winrate_games': 500,
+    'minimax': 0.35,   # 35% minimax (harder opponents for final phase)
+    'self': 0.55,      # 55% self-play
+    'random': 0.10,    # 10% random
+    'selfplay_winrate_threshold': 0.85,
+    'selfplay_winrate_games': 1000,
     'minimax_min_depth': 1,
-    'minimax_max_depth': 6,  # D1-D6 for final phase
-    'graduation_episodes': 1_000_000,
+    'minimax_max_depth': 4,  # D1-D4 for final phase
+    'graduation_episodes': 5_000_000,
 }
 
 
@@ -305,9 +315,13 @@ class MixedTrainingState:
     """State for mixed opponent training (Phase 2+)."""
     total_episodes: int = 0
 
-    # Self-play tracking (maxlen matches selfplay_winrate_games)
-    selfplay_results: deque = field(default_factory=lambda: deque(maxlen=500))
+    # Self-play tracking (maxlen matches selfplay_winrate_games = 1000)
+    selfplay_results: deque = field(default_factory=lambda: deque(maxlen=1000))
     clone_generation: int = 0
+    last_clone_episode: int = 0  # total_episodes when clone was last updated
+
+    # Minimax win rate snapshots for stagnation detection: list of (total_episodes, win_rate)
+    minimax_winrate_snapshots: List = field(default_factory=list)
 
     # Minimax tracking (simplified - no progressive rounds)
     minimax_wins_by_depth: Dict[int, int] = field(default_factory=lambda: {d: 0 for d in range(1, 7)})
@@ -340,11 +354,20 @@ class MixedTrainingState:
         """Called when clone is updated."""
         self.selfplay_results.clear()
         self.clone_generation += 1
+        self.last_clone_episode = self.total_episodes
 
     def record_minimax_result(self, depth: int, won: bool):
         """Record a minimax game result."""
         if won:
             self.minimax_wins_by_depth[depth] = self.minimax_wins_by_depth.get(depth, 0) + 1
+
+    def get_combined_minimax_win_rate(self) -> float:
+        """Get combined win rate vs minimax d1 and d2 (last 500 games each)."""
+        combined = list(self.results_vs_minimax_d1) + list(self.results_vs_minimax_d2)
+        if len(combined) < 20:
+            return 0.0
+        wins = sum(1 for r in combined if r == 'win')
+        return wins / len(combined)
 
     def get_win_rate_vs_opponent(self, opponent_type: str, depth: int = 0) -> float:
         """Get win rate vs specific opponent type from last 500 games."""
@@ -514,6 +537,9 @@ class CurriculumManager:
                      then stays at 0 for the last 1/4. Resets each phase.
         - Phase 10: Always 0.0 (no shaping)
         """
+        # TEMPORARILY DISABLED - remove this early return to re-enable shaping
+        return 0.0
+
         if self.current_phase == Phase.COMPLETED:
             return 0.0
 
@@ -551,6 +577,8 @@ class CurriculumManager:
             'double_mill_reward': config.double_mill_reward * mult,
             'double_mill_extra_reward': config.double_mill_extra_reward * mult,
             'setup_capture_reward': config.setup_capture_reward * mult,
+            'step_penalty': -0.003,
+            'piece_advantage_reward': 0.02,
         }
 
     def select_opponent_for_game(self) -> Tuple[str, int]:
@@ -631,6 +659,19 @@ class CurriculumManager:
             self.mixed_state.games_vs_minimax += 1
             self._handle_minimax_result(result_str, minimax_depth)
 
+        # Take periodic minimax win rate snapshot for stagnation detection
+        interval = MIXED_CONFIG['stagnation_snapshot_interval']
+        if self.mixed_state.total_episodes % interval == 0:
+            wr = self.mixed_state.get_combined_minimax_win_rate()
+            self.mixed_state.minimax_winrate_snapshots.append(
+                (self.mixed_state.total_episodes, wr)
+            )
+            max_keep = MIXED_CONFIG['stagnation_snapshot_window'] + 1
+            if len(self.mixed_state.minimax_winrate_snapshots) > max_keep:
+                self.mixed_state.minimax_winrate_snapshots = (
+                    self.mixed_state.minimax_winrate_snapshots[-max_keep:]
+                )
+
     def _handle_minimax_result(self, result_str: str, depth: int):
         """Handle minimax game result (simplified - no progressive rounds)."""
         won = (result_str == 'win')
@@ -654,6 +695,38 @@ class CurriculumManager:
 
         self.save_state()
 
+    def is_stagnating(self) -> bool:
+        """
+        Check if the model has stopped improving enough to warrant moving to next phase.
+        Triggers when BOTH conditions hold:
+          1. No new clone in the last 1.5M episodes (model can't beat its own old self)
+          2. Combined minimax d1+d2 win rate has not improved by 3%+ over last 500k episodes
+        Only activates after 1M episodes in the phase.
+        """
+        config = self.get_config()
+        if config.opponent_type != 'mixed':
+            return False
+
+        ms = self.mixed_state
+        if ms.total_episodes < MIXED_CONFIG['stagnation_min_episodes']:
+            return False
+
+        # Condition 1: stuck on same clone for too long
+        episodes_since_clone = ms.total_episodes - ms.last_clone_episode
+        clone_stuck = episodes_since_clone >= MIXED_CONFIG['stagnation_clone_window']
+
+        # Condition 2: minimax win rate not improving
+        window = MIXED_CONFIG['stagnation_snapshot_window']
+        snapshots = ms.minimax_winrate_snapshots
+        if len(snapshots) < window:
+            minimax_flat = False
+        else:
+            oldest_wr = snapshots[-window][1]
+            newest_wr = snapshots[-1][1]
+            minimax_flat = (newest_wr - oldest_wr) < MIXED_CONFIG['stagnation_threshold']
+
+        return clone_stuck and minimax_flat
+
     def should_graduate(self) -> bool:
         """Check if ready to move to next phase."""
         if self.current_phase == Phase.COMPLETED:
@@ -674,12 +747,16 @@ class CurriculumManager:
         if config.opponent_type == 'random':
             return stats.get_win_rate() >= config.win_rate_threshold
 
-        # Phase 10: Fixed 1M episodes
+        # Phase 10: 5M episodes or stagnation
         if self.current_phase == Phase.PHASE_10:
-            return self.mixed_state.total_episodes >= PHASE_10_CONFIG['graduation_episodes']
+            if self.mixed_state.total_episodes >= PHASE_10_CONFIG['graduation_episodes']:
+                return True
+            return self.is_stagnating()
 
-        # Phase 2-9: Episode limit based graduation
+        # Phase 2-9: 5M episodes or stagnation
         if self.mixed_state.total_episodes >= MIXED_CONFIG['graduation_episodes']:
+            return True
+        if self.is_stagnating():
             return True
 
         return False
@@ -688,6 +765,10 @@ class CurriculumManager:
         """Move to next phase. Returns True if graduated."""
         if self.current_phase == Phase.COMPLETED:
             return False
+
+        # Determine graduation reason for logging
+        stagnated = self.is_stagnating()
+        graduation_reason = 'stagnation' if stagnated else 'episodes'
 
         # Save phase history
         self.phase_history.append({
@@ -699,6 +780,7 @@ class CurriculumManager:
             'draws': self.stats.draws,
             'best_win_rate': self.stats.best_win_rate,
             'clone_generations': self.mixed_state.clone_generation,
+            'graduation_reason': graduation_reason,
             'duration_seconds': time.time() - self.stats.phase_start_time,
         })
 
@@ -722,7 +804,7 @@ class CurriculumManager:
 
         new_config = PHASE_CONFIGS.get(self.current_phase)
         print(f"\n{'='*60}")
-        print(f"  GRADUATED from Phase {int(old_phase)} to Phase {int(self.current_phase)}!")
+        print(f"  GRADUATED from Phase {int(old_phase)} to Phase {int(self.current_phase)}! (reason: {graduation_reason})")
         if new_config:
             print(f"  {new_config.description}")
             print(f"  Stones: {new_config.stones_per_player}, Start: {new_config.start_phase}")
@@ -794,10 +876,12 @@ class CurriculumManager:
             'mixed_state': {
                 'total_episodes': self.mixed_state.total_episodes,
                 'clone_generation': self.mixed_state.clone_generation,
+                'last_clone_episode': self.mixed_state.last_clone_episode,
                 'games_vs_random': self.mixed_state.games_vs_random,
                 'games_vs_minimax': self.mixed_state.games_vs_minimax,
                 'games_vs_self': self.mixed_state.games_vs_self,
                 'minimax_wins_by_depth': dict(self.mixed_state.minimax_wins_by_depth),
+                'minimax_winrate_snapshots': self.mixed_state.minimax_winrate_snapshots,
             },
         }
 
@@ -836,6 +920,7 @@ class CurriculumManager:
                 self.mixed_state = MixedTrainingState(
                     total_episodes=ms.get('total_episodes', 0),
                     clone_generation=ms.get('clone_generation', 0),
+                    last_clone_episode=ms.get('last_clone_episode', 0),
                     games_vs_random=ms.get('games_vs_random', 0),
                     games_vs_minimax=ms.get('games_vs_minimax', 0),
                     games_vs_self=ms.get('games_vs_self', 0),
@@ -844,6 +929,7 @@ class CurriculumManager:
                     self.mixed_state.minimax_wins_by_depth = {
                         int(k): v for k, v in ms['minimax_wins_by_depth'].items()
                     }
+                self.mixed_state.minimax_winrate_snapshots = ms.get('minimax_winrate_snapshots', [])
 
             config = self.get_config()
             print(f"  Loaded curriculum: Phase {int(self.current_phase)}, {self.total_episodes:,} episodes")
@@ -871,6 +957,8 @@ class CurriculumManager:
             print(f"  Best WR: {phase_data['best_win_rate']:.1%}")
             if phase_data.get('clone_generations', 0) > 0:
                 print(f"  Clone Generations: {phase_data['clone_generations']}")
+            if 'graduation_reason' in phase_data:
+                print(f"  Graduated by: {phase_data['graduation_reason']}")
             print(f"  Duration: {hours:.1f}h")
 
         if self.current_phase != Phase.COMPLETED:

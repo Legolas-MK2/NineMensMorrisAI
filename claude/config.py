@@ -32,7 +32,7 @@ class Config:
     hidden_dim: int = 128
     num_res_blocks: int = 8
     num_attention_heads: int = 8
-    dropout: float = 0.05
+    dropout: float = 0.15  # Increased from 0.05 to reduce overfitting
     
     # Base learning rate (curriculum manager will override)
     lr_policy: float = 3e-4
@@ -44,9 +44,9 @@ class Config:
     clip_epsilon: float = 0.2
     max_grad_norm: float = 0.5
     
-    # Entropy - gradual decay like random_train for consistent exploration
+    # Entropy - gradual decay with floor to prevent policy collapse
     entropy_coef_start: float = 0.1
-    entropy_coef_end: float = 0.01
+    entropy_coef_end: float = 0.02  # Increased floor from 0.01 to prevent overfitting
     entropy_decay_episodes: int = 5_000_000  # Match random_train (was 2M, too fast)
     
     # Value function

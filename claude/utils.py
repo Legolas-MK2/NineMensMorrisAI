@@ -102,32 +102,37 @@ class RewardCalculator:
         player: int
     ) -> float:
         """
-        Calculate reward shaping for piece captures.
-        Simplified to focus on what matters: capturing opponent pieces.
-        
+        Calculate reward shaping for piece captures and game progress.
+
         state_info should contain:
         - my_pieces: int
         - opp_pieces: int
         """
         reward = 0.0
-        
+
+        # Small per-step cost to discourage stalling and draws
+        reward += self.config.get('step_penalty', -0.003)
+
         # Piece changes
         prev_opp = prev_state_info.get('opp_pieces', 0)
         new_opp = new_state_info.get('opp_pieces', 0)
-        
+
         # Did we capture? (opponent lost a piece = we formed a mill)
         pieces_captured = prev_opp - new_opp
         if pieces_captured > 0:
             # Base mill reward
             reward += self.config['mill_reward'] * pieces_captured
-            
+
             # Bonus for multiple captures (rare but powerful)
             if pieces_captured >= 2:
                 reward += self.config['double_mill_reward']
-        
-        # Note: Enemy captures are now handled in worker.py when opponent moves
-        # This gives cleaner credit assignment
-        
+
+        # Continuous piece advantage signal — pushes model toward capturing
+        my_pieces = new_state_info.get('my_pieces', 0)
+        opp_pieces = new_state_info.get('opp_pieces', 0)
+        piece_diff = my_pieces - opp_pieces
+        reward += piece_diff * self.config.get('piece_advantage_reward', 0.02)
+
         return reward
     
     def calculate_timeout_penalty(self) -> float:

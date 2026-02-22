@@ -46,6 +46,7 @@ try:
     import torch
     import torch.nn.functional as F
     from torch.amp import autocast
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -53,12 +54,14 @@ except ImportError:
 try:
     from utils import get_legal_mask
 except ImportError:
+
     def get_legal_mask(state, num_actions):
         mask = [0] * num_actions
         for a in state.legal_actions():
             if a < num_actions:
                 mask[a] = 1
         return mask
+
 
 import pyspiel
 from game_wrapper import load_game as load_game_fixed
@@ -84,87 +87,156 @@ from game_wrapper import load_game as load_game_fixed
 #    21----------22----------23
 MILLS: Tuple[Tuple[int, int, int], ...] = (
     # Outer square sides
-    (0, 1, 2), (0, 9, 21), (2, 14, 23), (21, 22, 23),
+    (0, 1, 2),
+    (0, 9, 21),
+    (2, 14, 23),
+    (21, 22, 23),
     # Middle square sides
-    (3, 4, 5), (3, 10, 18), (5, 13, 20), (18, 19, 20),
+    (3, 4, 5),
+    (3, 10, 18),
+    (5, 13, 20),
+    (18, 19, 20),
     # Inner square sides
-    (6, 7, 8), (6, 11, 15), (8, 12, 17), (15, 16, 17),
+    (6, 7, 8),
+    (6, 11, 15),
+    (8, 12, 17),
+    (15, 16, 17),
     # Cross connections
-    (1, 4, 7), (9, 10, 11), (12, 13, 14), (16, 19, 22),
+    (1, 4, 7),
+    (9, 10, 11),
+    (12, 13, 14),
+    (16, 19, 22),
 )
 
 # Adjacent positions (row-by-row numbering)
 ADJACENCY: Tuple[Tuple[int, ...], ...] = (
-    (1, 9),          # 0
-    (0, 2, 4),       # 1
-    (1, 14),         # 2
-    (4, 10),         # 3
-    (1, 3, 5, 7),    # 4
-    (4, 13),         # 5
-    (7, 11),         # 6
-    (4, 6, 8),       # 7
-    (7, 12),         # 8
-    (0, 10, 21),     # 9
+    (1, 9),  # 0
+    (0, 2, 4),  # 1
+    (1, 14),  # 2
+    (4, 10),  # 3
+    (1, 3, 5, 7),  # 4
+    (4, 13),  # 5
+    (7, 11),  # 6
+    (4, 6, 8),  # 7
+    (7, 12),  # 8
+    (0, 10, 21),  # 9
     (3, 9, 11, 18),  # 10
-    (6, 10, 15),     # 11
-    (8, 13, 17),     # 12
-    (5, 12, 14, 20), # 13
-    (2, 13, 23),     # 14
-    (11, 16),        # 15
-    (15, 17, 19),    # 16
-    (12, 16),        # 17
-    (10, 19),        # 18
-    (16, 18, 20, 22),# 19
-    (13, 19),        # 20
-    (9, 22),         # 21
-    (19, 21, 23),    # 22
-    (14, 22),        # 23
+    (6, 10, 15),  # 11
+    (8, 13, 17),  # 12
+    (5, 12, 14, 20),  # 13
+    (2, 13, 23),  # 14
+    (11, 16),  # 15
+    (15, 17, 19),  # 16
+    (12, 16),  # 17
+    (10, 19),  # 18
+    (16, 18, 20, 22),  # 19
+    (13, 19),  # 20
+    (9, 22),  # 21
+    (19, 21, 23),  # 22
+    (14, 22),  # 23
 )
 
 # Mills per position (precomputed for speed)
 POSITION_TO_MILLS: Tuple[Tuple[Tuple[int, int, int], ...], ...] = tuple(
-    tuple(mill for mill in MILLS if pos in mill)
-    for pos in range(24)
+    tuple(mill for mill in MILLS if pos in mill) for pos in range(24)
 )
 
 # Position strategic values (based on connectivity)
 # Corners have 2 connections, midpoints with cross have 3-4 connections
 POSITION_VALUES: Tuple[int, ...] = (
-    2, 3, 2,  # Row 0: outer top (0=corner, 1=midpoint+cross, 2=corner)
-    2, 4, 2,  # Row 1: middle top (3=corner, 4=midpoint+2cross, 5=corner)
-    2, 3, 2,  # Row 2: inner top (6=corner, 7=midpoint, 8=corner)
-    3, 4, 3,  # Row 3 left: (9=midpoint+cross, 10=midpoint+2cross, 11=midpoint+cross)
-    3, 4, 3,  # Row 3 right: (12=midpoint+cross, 13=midpoint+2cross, 14=midpoint+cross)
-    2, 3, 2,  # Row 4: inner bottom (15=corner, 16=midpoint, 17=corner)
-    2, 4, 2,  # Row 5: middle bottom (18=corner, 19=midpoint+2cross, 20=corner)
-    2, 3, 2,  # Row 6: outer bottom (21=corner, 22=midpoint+cross, 23=corner)
+    2,
+    3,
+    2,  # Row 0: outer top (0=corner, 1=midpoint+cross, 2=corner)
+    2,
+    4,
+    2,  # Row 1: middle top (3=corner, 4=midpoint+2cross, 5=corner)
+    2,
+    3,
+    2,  # Row 2: inner top (6=corner, 7=midpoint, 8=corner)
+    3,
+    4,
+    3,  # Row 3 left: (9=midpoint+cross, 10=midpoint+2cross, 11=midpoint+cross)
+    3,
+    4,
+    3,  # Row 3 right: (12=midpoint+cross, 13=midpoint+2cross, 14=midpoint+cross)
+    2,
+    3,
+    2,  # Row 4: inner bottom (15=corner, 16=midpoint, 17=corner)
+    2,
+    4,
+    2,  # Row 5: middle bottom (18=corner, 19=midpoint+2cross, 20=corner)
+    2,
+    3,
+    2,  # Row 6: outer bottom (21=corner, 22=midpoint+cross, 23=corner)
 )
 
 # Improved position values for placement phase - prioritize cross positions more heavily
 POSITION_VALUES_PLACEMENT: Tuple[int, ...] = (
-    3, 4, 3,  # Row 0: outer top (corners=3, cross midpoint=4)
-    3, 5, 3,  # Row 1: middle top (corners=3, double-cross=5)
-    2, 3, 2,  # Row 2: inner top (less valuable - fewer escape routes)
-    4, 5, 3,  # Row 3 left: (cross=4, double-cross=5, inner=3)
-    3, 5, 4,  # Row 3 right: (inner=3, double-cross=5, cross=4)
-    2, 3, 2,  # Row 4: inner bottom
-    3, 5, 3,  # Row 5: middle bottom
-    3, 4, 3,  # Row 6: outer bottom
+    3,
+    4,
+    3,  # Row 0: outer top (corners=3, cross midpoint=4)
+    3,
+    5,
+    3,  # Row 1: middle top (corners=3, double-cross=5)
+    2,
+    3,
+    2,  # Row 2: inner top (less valuable - fewer escape routes)
+    4,
+    5,
+    3,  # Row 3 left: (cross=4, double-cross=5, inner=3)
+    3,
+    5,
+    4,  # Row 3 right: (inner=3, double-cross=5, cross=4)
+    2,
+    3,
+    2,  # Row 4: inner bottom
+    3,
+    5,
+    3,  # Row 5: middle bottom
+    3,
+    4,
+    3,  # Row 6: outer bottom
 )
 
 # Best opening positions (most connected, part of most mills)
-STRONG_OPENING_POSITIONS: Tuple[int, ...] = (4, 10, 13, 19, 1, 9, 14, 22)  # Cross positions first
+STRONG_OPENING_POSITIONS: Tuple[int, ...] = (
+    4,
+    10,
+    13,
+    19,
+    1,
+    9,
+    14,
+    22,
+)  # Cross positions first
 
 # Board position (0-23) to 7x7 grid (row, col) mapping for observation tensor parsing
 # OpenSpiel uses a 5x7x7 tensor where planes 0/1 are white/black pieces on a 7x7 grid
 BOARD_POS_TO_GRID: Tuple[Tuple[int, int], ...] = (
-    (0, 0), (0, 3), (0, 6),                         # 0-2: outer top
-    (1, 1), (1, 3), (1, 5),                         # 3-5: middle top
-    (2, 2), (2, 3), (2, 4),                         # 6-8: inner top
-    (3, 0), (3, 1), (3, 2), (3, 4), (3, 5), (3, 6), # 9-14: middle row
-    (4, 2), (4, 3), (4, 4),                         # 15-17: inner bottom
-    (5, 1), (5, 3), (5, 5),                         # 18-20: middle bottom
-    (6, 0), (6, 3), (6, 6),                         # 21-23: outer bottom
+    (0, 0),
+    (0, 3),
+    (0, 6),  # 0-2: outer top
+    (1, 1),
+    (1, 3),
+    (1, 5),  # 3-5: middle top
+    (2, 2),
+    (2, 3),
+    (2, 4),  # 6-8: inner top
+    (3, 0),
+    (3, 1),
+    (3, 2),
+    (3, 4),
+    (3, 5),
+    (3, 6),  # 9-14: middle row
+    (4, 2),
+    (4, 3),
+    (4, 4),  # 15-17: inner bottom
+    (5, 1),
+    (5, 3),
+    (5, 5),  # 18-20: middle bottom
+    (6, 0),
+    (6, 3),
+    (6, 6),  # 21-23: outer bottom
 )
 
 
@@ -172,27 +244,29 @@ BOARD_POS_TO_GRID: Tuple[Tuple[int, int], ...] = (
 # ZOBRIST HASHING
 # ============================================================================
 
+
 class ZobristHash:
     """
     Zobrist hashing for fast incremental position hashing.
     Uses 64-bit random numbers for each (position, player) combination.
     """
-    
+
     def __init__(self, seed: int = 42):
         rng = random.Random(seed)
-        
+
         # Random values for each (position, player) combination
         # Index: position * 2 + player
         self.piece_keys: Tuple[int, ...] = tuple(
             rng.getrandbits(64) for _ in range(24 * 2)
         )
-        
+
         # Random value for side to move
         self.side_key: int = rng.getrandbits(64)
-        
+
         # Keys for game phase and pieces in hand (for complete state hashing)
         self.phase_keys: Tuple[int, ...] = tuple(
-            rng.getrandbits(64) for _ in range(3)  # placing, moving, flying
+            rng.getrandbits(64)
+            for _ in range(3)  # placing, moving, flying
         )
         self.hand_keys: Tuple[Tuple[int, ...], ...] = tuple(
             tuple(rng.getrandbits(64) for _ in range(10))  # 0-9 pieces in hand
@@ -201,11 +275,14 @@ class ZobristHash:
 
         # Key for pending removal state (critical: different action space)
         self.pending_removal_key: int = rng.getrandbits(64)
-    
-    def hash_board(self, board: Tuple[Optional[int], ...],
-                   current_player: int,
-                   pieces_in_hand: Tuple[int, int] = (0, 0),
-                   pending_removal: bool = False) -> int:
+
+    def hash_board(
+        self,
+        board: Tuple[Optional[int], ...],
+        current_player: int,
+        pieces_in_hand: Tuple[int, int] = (0, 0),
+        pending_removal: bool = False,
+    ) -> int:
         """Compute full hash from scratch."""
         h = 0
         for pos, player in enumerate(board):
@@ -224,19 +301,20 @@ class ZobristHash:
             h ^= self.pending_removal_key
 
         return h
-    
-    def update_move(self, h: int, from_pos: Optional[int], to_pos: int, 
-                    player: int) -> int:
+
+    def update_move(
+        self, h: int, from_pos: Optional[int], to_pos: int, player: int
+    ) -> int:
         """Incrementally update hash for a move."""
         if from_pos is not None:
             h ^= self.piece_keys[from_pos * 2 + player]
         h ^= self.piece_keys[to_pos * 2 + player]
         return h
-    
+
     def update_capture(self, h: int, pos: int, player: int) -> int:
         """Incrementally update hash for a capture."""
         return h ^ self.piece_keys[pos * 2 + player]
-    
+
     def update_side(self, h: int) -> int:
         """Toggle side to move."""
         return h ^ self.side_key
@@ -250,45 +328,48 @@ ZOBRIST = ZobristHash()
 # TRANSPOSITION TABLE
 # ============================================================================
 
+
 class TTEntryType(IntEnum):
     """Transposition table entry types."""
-    EXACT = 0      # Exact score
-    LOWER = 1      # Score is lower bound (failed high / beta cutoff)
-    UPPER = 2      # Score is upper bound (failed low / alpha cutoff)
+
+    EXACT = 0  # Exact score
+    LOWER = 1  # Score is lower bound (failed high / beta cutoff)
+    UPPER = 2  # Score is upper bound (failed low / alpha cutoff)
 
 
 @dataclass(slots=True)
 class TTEntry:
     """Transposition table entry."""
-    hash_key: int          # Full hash for collision detection
-    depth: int             # Search depth
-    score: float           # Evaluated score
+
+    hash_key: int  # Full hash for collision detection
+    depth: int  # Search depth
+    score: float  # Evaluated score
     entry_type: TTEntryType  # Type of bound
-    best_move: int         # Best move found (-1 if none)
-    age: int               # When this entry was created
+    best_move: int  # Best move found (-1 if none)
+    age: int  # When this entry was created
 
 
 class TranspositionTable:
     """
     Lock-free transposition table with replacement strategy.
-    
+
     Uses a large numpy array for memory efficiency.
     Supports ~100M+ entries with 10GB RAM.
     """
-    
+
     # Entry size in bytes (approximate)
     ENTRY_SIZE = 40
-    
+
     def __init__(self, size_mb: int = 8192):
         """
         Initialize transposition table.
-        
+
         Args:
             size_mb: Size in megabytes (default 8GB)
         """
         self.size = (size_mb * 1024 * 1024) // self.ENTRY_SIZE
         self.size = max(1, self.size)
-        
+
         # Use dictionary for simplicity and flexibility
         # For maximum performance, could use numpy structured array
         self.table: Dict[int, TTEntry] = {}
@@ -297,46 +378,52 @@ class TranspositionTable:
         self.misses = 0
         self.collisions = 0
         self._lock = threading.Lock()
-    
+
     def new_search(self):
         """Increment age for new search (for replacement strategy)."""
         self.age += 1
-    
+
     def probe(self, hash_key: int) -> Optional[TTEntry]:
         """Look up position in table."""
         idx = hash_key % self.size
-        
+
         entry = self.table.get(idx)
         if entry is None:
             self.misses += 1
             return None
-        
+
         if entry.hash_key != hash_key:
             self.collisions += 1
             return None
-        
+
         self.hits += 1
         return entry
-    
-    def store(self, hash_key: int, depth: int, score: float, 
-              entry_type: TTEntryType, best_move: int):
+
+    def store(
+        self,
+        hash_key: int,
+        depth: int,
+        score: float,
+        entry_type: TTEntryType,
+        best_move: int,
+    ):
         """Store position in table with replacement strategy."""
         idx = hash_key % self.size
-        
+
         existing = self.table.get(idx)
-        
+
         # Replacement strategy: replace if
         # 1. Empty slot
         # 2. Same position (update)
         # 3. Older entry
         # 4. Shallower search depth
         should_replace = (
-            existing is None or
-            existing.hash_key == hash_key or
-            existing.age < self.age or
-            existing.depth <= depth
+            existing is None
+            or existing.hash_key == hash_key
+            or existing.age < self.age
+            or existing.depth <= depth
         )
-        
+
         if should_replace:
             self.table[idx] = TTEntry(
                 hash_key=hash_key,
@@ -344,9 +431,9 @@ class TranspositionTable:
                 score=score,
                 entry_type=entry_type,
                 best_move=best_move,
-                age=self.age
+                age=self.age,
             )
-    
+
     def clear(self):
         """Clear the table."""
         self.table.clear()
@@ -354,19 +441,19 @@ class TranspositionTable:
         self.hits = 0
         self.misses = 0
         self.collisions = 0
-    
+
     def stats(self) -> Dict:
         """Return table statistics."""
         total = self.hits + self.misses
         hit_rate = self.hits / total if total > 0 else 0
         return {
-            'entries': len(self.table),
-            'capacity': self.size,
-            'fill_rate': len(self.table) / self.size,
-            'hits': self.hits,
-            'misses': self.misses,
-            'collisions': self.collisions,
-            'hit_rate': hit_rate,
+            "entries": len(self.table),
+            "capacity": self.size,
+            "fill_rate": len(self.table) / self.size,
+            "hits": self.hits,
+            "misses": self.misses,
+            "collisions": self.collisions,
+            "hit_rate": hit_rate,
         }
 
 
@@ -374,10 +461,11 @@ class TranspositionTable:
 # MOVE ORDERING
 # ============================================================================
 
+
 class MoveOrderer:
     """
     Move ordering for better alpha-beta pruning.
-    
+
     Priority order:
     1. Hash move (from transposition table)
     2. Winning captures
@@ -385,62 +473,68 @@ class MoveOrderer:
     4. History heuristic
     5. Other moves
     """
-    
+
     # Move score bonuses
     HASH_MOVE_BONUS = 10_000_000
     WINNING_CAPTURE_BONUS = 5_000_000
     MILL_FORMING_BONUS = 1_000_000
     KILLER_BONUS = [900_000, 800_000]  # First and second killer
     CAPTURE_BONUS = 500_000
-    
+
     def __init__(self, max_ply: int = 64):
         self.max_ply = max_ply
-        
+
         # Killer moves: 2 slots per ply
         self.killers: List[List[int]] = [[-1, -1] for _ in range(max_ply)]
-        
+
         # History heuristic: score for each move that caused cutoff
         # Index by (from_pos, to_pos) or just action
         self.history: Dict[int, int] = defaultdict(int)
-        
+
         # Counter-move heuristic: best response to opponent's last move
         self.counter_moves: Dict[int, int] = {}
-        
+
     def clear(self):
         """Clear move ordering data for new game."""
         self.killers = [[-1, -1] for _ in range(self.max_ply)]
         self.history.clear()
         self.counter_moves.clear()
-    
+
     def update_killer(self, ply: int, move: int):
         """Add a killer move (caused beta cutoff)."""
         if ply >= self.max_ply:
             return
-        
+
         # Don't add duplicates
         if move != self.killers[ply][0]:
             self.killers[ply][1] = self.killers[ply][0]
             self.killers[ply][0] = move
-    
+
     def update_history(self, move: int, depth: int):
         """Update history score for a move that caused cutoff."""
         # Depth-squared bonus
         self.history[move] += depth * depth
-    
+
     def update_counter_move(self, prev_move: int, response: int):
         """Record a good response to opponent's move."""
         self.counter_moves[prev_move] = response
-    
-    def score_move(self, move: int, ply: int, hash_move: int,
-                   is_capture: bool, forms_mill: bool,
-                   prev_move: int = -1) -> int:
+
+    def score_move(
+        self,
+        move: int,
+        ply: int,
+        hash_move: int,
+        is_capture: bool,
+        forms_mill: bool,
+        prev_move: int = -1,
+    ) -> int:
         """Score a move for ordering."""
         score = 0
-        
+
         # Hash move (from TT)
         if move == hash_move:
             return self.HASH_MOVE_BONUS
-        
+
         # Captures
         if is_capture:
             if forms_mill:
@@ -449,25 +543,30 @@ class MoveOrderer:
                 score += self.CAPTURE_BONUS
         elif forms_mill:
             score += self.MILL_FORMING_BONUS
-        
+
         # Killer moves
         if ply < self.max_ply:
             if move == self.killers[ply][0]:
                 score += self.KILLER_BONUS[0]
             elif move == self.killers[ply][1]:
                 score += self.KILLER_BONUS[1]
-        
+
         # Counter-move
         if prev_move >= 0 and self.counter_moves.get(prev_move) == move:
             score += 700_000
-        
+
         # History heuristic
         score += min(self.history.get(move, 0), 500_000)
-        
+
         return score
-    
-    def _order_placement_moves(self, moves: List[int], board: Tuple[Optional[int], ...],
-                                player: int, hash_move: int = -1) -> List[int]:
+
+    def _order_placement_moves(
+        self,
+        moves: List[int],
+        board: Tuple[Optional[int], ...],
+        player: int,
+        hash_move: int = -1,
+    ) -> List[int]:
         """
         Order moves during placement phase with strategic priorities.
 
@@ -520,8 +619,15 @@ class MoveOrderer:
         scored_moves.sort(key=lambda x: -x[0])
         return [m for _, m in scored_moves]
 
-    def order_moves(self, moves: List[int], state, player: int, ply: int,
-                    hash_move: int = -1, prev_move: int = -1) -> List[int]:
+    def order_moves(
+        self,
+        moves: List[int],
+        state,
+        player: int,
+        ply: int,
+        hash_move: int = -1,
+        prev_move: int = -1,
+    ) -> List[int]:
         """Order moves by estimated quality."""
         if len(moves) <= 1:
             return moves
@@ -554,7 +660,7 @@ class MoveOrderer:
         # Sort descending by score
         scored_moves.sort(key=lambda x: -x[0])
         return [m for _, m in scored_moves]
-    
+
     def _parse_board(self, state, player: int) -> Tuple[Optional[int], ...]:
         """
         Parse board from state using correct 5x7x7 tensor layout.
@@ -577,7 +683,7 @@ class MoveOrderer:
             board = []
             for pos in range(24):
                 r, c = BOARD_POS_TO_GRID[pos]
-                if obs_array[0, r, c] == 1:    # Plane 0 = Player 0's pieces
+                if obs_array[0, r, c] == 1:  # Plane 0 = Player 0's pieces
                     board.append(0)
                 elif obs_array[1, r, c] == 1:  # Plane 1 = Player 1's pieces
                     board.append(1)
@@ -586,9 +692,10 @@ class MoveOrderer:
             return tuple(board)
         except:
             return tuple(None for _ in range(24))
-    
-    def _would_form_mill(self, action: int, board: Tuple[Optional[int], ...],
-                         player: int, state) -> bool:
+
+    def _would_form_mill(
+        self, action: int, board: Tuple[Optional[int], ...], player: int, state
+    ) -> bool:
         """Check if action would form a mill."""
         # Decode action to get destination based on action encoding:
         # - Actions 0-23: placement (destination = action) or removal (not relevant)
@@ -636,10 +743,11 @@ class MoveOrderer:
 # OPTIMIZED MINIMAX BOT
 # ============================================================================
 
+
 class OptimizedMinimaxBot:
     """
     Fully optimized Minimax with all standard enhancements.
-    
+
     Features:
     - Alpha-Beta Pruning
     - Transposition Table with Zobrist Hashing
@@ -653,40 +761,45 @@ class OptimizedMinimaxBot:
     - Quiescence Search
     - Multi-threaded root search
     """
-    
+
     # Evaluation weights
     WEIGHTS = {
-        'win': 1_000_000,
-        'loss': -1_000_000,
-        'draw': -50_000,
-        'mill': 5_000,
-        'potential_mill': 1_500,
-        'double_mill': 8_000,
-        'blocked_mill': 2_000,
-        'unblocked_threat': 3_000,    # Penalty for leaving opponent threats open
-        'mobility': 100,
-        'position': 50,
+        "win": 1_000_000,
+        "loss": -1_000_000,
+        "draw": -50_000,
+        "piece": 10_000,
+        "critical_3": 50_000,  # Bonus/penalty when at 3 pieces (one capture from win/loss)
+        "mill": 15_000,  # Must be high enough to override mobility at depth 1
+        "capture": 12_000,  # Bonus for capturing (part of mill completion)
+        "potential_mill": 1_500,
+        "double_mill": 20_000,  # Significantly higher - allows repeated captures
+        "blocked_mill": 2_000,
+        "unblocked_threat": 5_000,  # Increased penalty for leaving threats open
+        "mobility": 50,  # Reduced to not outweigh mill at shallow depth
+        "position": 50,
     }
-    
+
     # Search constants
     NULL_MOVE_REDUCTION = 2
     LMR_THRESHOLD = 4  # Start reducing after this many moves
     LMR_REDUCTION = 1
     ASPIRATION_WINDOW = 500
     QUIESCENCE_DEPTH = 4
-    
-    def __init__(self,
-                 max_depth: int = 6,
-                 num_threads: int = 4,
-                 tt_size_mb: int = 8192,
-                 random_move_prob: float = 0.0,
-                 use_null_move: bool = False,  # Disabled: NMM doesn't support passing
-                 use_lmr: bool = True,
-                 use_quiescence: bool = True,
-                 time_limit: Optional[float] = None):
+
+    def __init__(
+        self,
+        max_depth: int = 6,
+        num_threads: int = 4,
+        tt_size_mb: int = 8192,
+        random_move_prob: float = 0.0,
+        use_null_move: bool = False,  # Disabled: NMM doesn't support passing
+        use_lmr: bool = True,
+        use_quiescence: bool = True,
+        time_limit: Optional[float] = None,
+    ):
         """
         Initialize optimized minimax bot.
-        
+
         Args:
             max_depth: Maximum search depth
             num_threads: Threads for parallel root search
@@ -704,37 +817,37 @@ class OptimizedMinimaxBot:
         self.use_lmr = use_lmr
         self.use_quiescence = use_quiescence
         self.time_limit = time_limit
-        
+
         # Initialize components
         self.tt = TranspositionTable(size_mb=tt_size_mb)
         self.move_orderer = MoveOrderer()
-        
+
         # Statistics
         self.nodes_evaluated = 0
         self.tt_cutoffs = 0
         self.null_move_cutoffs = 0
         self.lmr_searches = 0
         self.quiescence_nodes = 0
-        
+
         # Time management
         self.search_start_time = 0.0
         self.search_stopped = False
-        
+
         # Thread safety
         self._lock = threading.Lock()
         self._local = threading.local()
-        
+
     def _increment_stat(self, name: str, value: int = 1):
         """Thread-safe statistic increment."""
         with self._lock:
             setattr(self, name, getattr(self, name) + value)
-    
+
     def _check_time(self) -> bool:
         """Check if we've exceeded time limit."""
         if self.time_limit is None:
             return False
         return time.time() - self.search_start_time >= self.time_limit
-    
+
     def _parse_board(self, state, player: int) -> Tuple[Optional[int], ...]:
         """
         Parse board from observation tensor using correct 5x7x7 layout.
@@ -760,7 +873,7 @@ class OptimizedMinimaxBot:
             board = []
             for pos in range(24):
                 r, c = BOARD_POS_TO_GRID[pos]
-                if obs_array[0, r, c] == 1:    # Plane 0 = Player 0's pieces
+                if obs_array[0, r, c] == 1:  # Plane 0 = Player 0's pieces
                     board.append(0)
                 elif obs_array[1, r, c] == 1:  # Plane 1 = Player 1's pieces
                     board.append(1)
@@ -769,7 +882,7 @@ class OptimizedMinimaxBot:
             return tuple(board)
         except:
             return tuple(None for _ in range(24))
-    
+
     def _is_removal_state(self, state, board: Tuple[Optional[int], ...]) -> bool:
         """
         Detect if we're in a pending removal state (must capture opponent piece).
@@ -798,7 +911,9 @@ class OptimizedMinimaxBot:
             opponent = 1 - current
             opponent_positions = [pos for pos in range(24) if board[pos] == opponent]
             # If legal actions are a subset of opponent positions, it's removal
-            if opponent_positions and all(a in opponent_positions for a in legal_actions):
+            if opponent_positions and all(
+                a in opponent_positions for a in legal_actions
+            ):
                 return True
 
         return False
@@ -810,19 +925,18 @@ class OptimizedMinimaxBot:
         # Check for pending removal state (affects legal actions)
         pending_removal = self._is_removal_state(state, board)
         return ZOBRIST.hash_board(board, current, pending_removal=pending_removal)
-    
+
     def _count_pieces(self, board: Tuple[Optional[int], ...], player: int) -> int:
         """Count pieces for a player."""
         return sum(1 for p in board if p == player)
-    
+
     def _count_mills(self, board: Tuple[Optional[int], ...], player: int) -> int:
         """Count complete mills."""
-        return sum(
-            1 for mill in MILLS
-            if all(board[p] == player for p in mill)
-        )
-    
-    def _count_potential_mills(self, board: Tuple[Optional[int], ...], player: int) -> int:
+        return sum(1 for mill in MILLS if all(board[p] == player for p in mill))
+
+    def _count_potential_mills(
+        self, board: Tuple[Optional[int], ...], player: int
+    ) -> int:
         """Count potential mills (2 pieces + 1 empty)."""
         count = 0
         for mill in MILLS:
@@ -832,7 +946,9 @@ class OptimizedMinimaxBot:
                 count += 1
         return count
 
-    def _count_blocked_mills(self, board: Tuple[Optional[int], ...], player: int) -> int:
+    def _count_blocked_mills(
+        self, board: Tuple[Optional[int], ...], player: int
+    ) -> int:
         """Count opponent potential mills that we are blocking (opponent has 2, we have 1)."""
         opponent = 1 - player
         count = 0
@@ -844,7 +960,9 @@ class OptimizedMinimaxBot:
                 count += 1
         return count
 
-    def _count_unblocked_threats(self, board: Tuple[Optional[int], ...], player: int) -> int:
+    def _count_unblocked_threats(
+        self, board: Tuple[Optional[int], ...], player: int
+    ) -> int:
         """Count opponent potential mills that we are NOT blocking (opponent has 2, spot is empty)."""
         opponent = 1 - player
         count = 0
@@ -855,7 +973,7 @@ class OptimizedMinimaxBot:
             if opp_count == 2 and empty_count == 1:
                 count += 1
         return count
-    
+
     def _count_double_mills(self, board: Tuple[Optional[int], ...], player: int) -> int:
         """
         Count windmill (double mill / see-saw) configurations.
@@ -876,8 +994,7 @@ class OptimizedMinimaxBot:
 
             # X must be in at least one complete mill
             if not any(
-                all(board[p] == player for p in mill)
-                for mill in POSITION_TO_MILLS[x]
+                all(board[p] == player for p in mill) for mill in POSITION_TO_MILLS[x]
             ):
                 continue
 
@@ -902,25 +1019,30 @@ class OptimizedMinimaxBot:
             if found:
                 count += 1
         return count
-    
+
     def _get_mobility(self, board: Tuple[Optional[int], ...], player: int) -> int:
-        """Count available moves."""
+        """Count available moves. Flying (<=3 pieces) is capped to not
+        reward losing pieces just for mobility."""
         piece_count = self._count_pieces(board, player)
-        
-        if piece_count <= 3:
-            # Flying: can move anywhere
-            empty = sum(1 for p in board if p is None)
-            return piece_count * empty
-        
+
         # Normal: adjacent moves only
         moves = 0
         for pos in range(24):
             if board[pos] == player:
-                for adj in ADJACENCY[pos]:
-                    if board[adj] is None:
-                        moves += 1
+                if piece_count <= 3:
+                    # Flying: can move to any empty, but cap per piece
+                    # to avoid rewarding piece loss
+                    for adj in range(24):
+                        if board[adj] is None:
+                            moves += 1
+                            if moves >= 12:  # Cap flying mobility
+                                return moves
+                else:
+                    for adj in ADJACENCY[pos]:
+                        if board[adj] is None:
+                            moves += 1
         return moves
-    
+
     def _positional_score(self, board: Tuple[Optional[int], ...], player: int) -> int:
         """Calculate positional advantage."""
         score = 0
@@ -930,7 +1052,7 @@ class OptimizedMinimaxBot:
             elif board[pos] == 1 - player:
                 score -= POSITION_VALUES[pos]
         return score
-    
+
     def evaluate(self, state, player: int) -> float:
         """
         Comprehensive position evaluation.
@@ -943,13 +1065,12 @@ class OptimizedMinimaxBot:
         if state.is_terminal():
             returns = state.returns()
             if returns[0] == returns[1]:
-                # Draw - neutral from any perspective
-                return self.WEIGHTS['draw']
-            # In Nine Men's Morris, the winner always made the last move
-            # (by capturing a piece or blocking the opponent).
-            # The "would-be mover" at terminal is the loser.
+                return self.WEIGHTS["draw"]
+            # In NMM the would-be mover at terminal is the loser (no moves or <3 pieces).
             # Negamax expects score from current mover's perspective, so return loss.
-            return self.WEIGHTS['loss']
+            # The parent's -score negation converts this to a win for the side that
+            # made the winning move.
+            return self.WEIGHTS["loss"]
 
         current_mover = state.current_player()
         board = self._parse_board(state, player)
@@ -960,119 +1081,146 @@ class OptimizedMinimaxBot:
 
         score = 0.0
 
+        # Piece count
+        my_pieces = self._count_pieces(board, mover)
+        opp_pieces = self._count_pieces(board, opponent)
+        score += (my_pieces - opp_pieces) * self.WEIGHTS["piece"]
+
+        # Critical thresholds: 3 pieces = one capture from win/loss
+        if opp_pieces <= 3:
+            score += self.WEIGHTS["critical_3"]  # Close to winning
+        if my_pieces <= 3:
+            score -= self.WEIGHTS["critical_3"]  # Close to losing
+
         # Mills
         my_mills = self._count_mills(board, mover)
         opp_mills = self._count_mills(board, opponent)
-        score += (my_mills - opp_mills) * self.WEIGHTS['mill']
+        score += (my_mills - opp_mills) * self.WEIGHTS["mill"]
 
         # Potential mills
         my_potential = self._count_potential_mills(board, mover)
         opp_potential = self._count_potential_mills(board, opponent)
-        score += (my_potential - opp_potential) * self.WEIGHTS['potential_mill']
+        score += (my_potential - opp_potential) * self.WEIGHTS["potential_mill"]
 
         # Blocked mills (reward blocking opponent's potential mills)
         my_blocks = self._count_blocked_mills(board, mover)
         opp_blocks = self._count_blocked_mills(board, opponent)
-        score += (my_blocks - opp_blocks) * self.WEIGHTS['blocked_mill']
+        score += (my_blocks - opp_blocks) * self.WEIGHTS["blocked_mill"]
 
         # Unblocked threats (penalize leaving opponent threats open)
         threats_against_me = self._count_unblocked_threats(board, mover)
         threats_against_opp = self._count_unblocked_threats(board, opponent)
-        score -= threats_against_me * self.WEIGHTS['unblocked_threat']
-        score += threats_against_opp * self.WEIGHTS['unblocked_threat']
+        score -= threats_against_me * self.WEIGHTS["unblocked_threat"]
+        score += threats_against_opp * self.WEIGHTS["unblocked_threat"]
 
         # Double mills
         my_double = self._count_double_mills(board, mover)
         opp_double = self._count_double_mills(board, opponent)
-        score += (my_double - opp_double) * self.WEIGHTS['double_mill']
+        score += (my_double - opp_double) * self.WEIGHTS["double_mill"]
 
         # Mobility
         my_mobility = self._get_mobility(board, mover)
         opp_mobility = self._get_mobility(board, opponent)
-        score += (my_mobility - opp_mobility) * self.WEIGHTS['mobility']
+        score += (my_mobility - opp_mobility) * self.WEIGHTS["mobility"]
 
         # Positional control
-        score += self._positional_score(board, mover) * self.WEIGHTS['position']
+        score += self._positional_score(board, mover) * self.WEIGHTS["position"]
 
         return score
-    
-    def quiescence(self, state, alpha: float, beta: float, 
-                   player: int, depth: int = 0) -> float:
+
+    def quiescence(
+        self, state, alpha: float, beta: float, player: int, depth: int = 0
+    ) -> float:
         """
         Quiescence search - extend search for captures.
         Prevents horizon effect by searching until position is "quiet".
         """
-        self._increment_stat('quiescence_nodes')
-        
+        self._increment_stat("quiescence_nodes")
+
         # Stand-pat: evaluate current position
         stand_pat = self.evaluate(state, player)
-        
+
         if depth >= self.QUIESCENCE_DEPTH:
             return stand_pat
-        
+
         if state.is_terminal():
             return stand_pat
-        
+
         # Beta cutoff
         if stand_pat >= beta:
             return beta
-        
+
         # Update alpha
         if stand_pat > alpha:
             alpha = stand_pat
-        
+
         # Only search captures (moves that form mills in Nine Men's Morris)
         legal_actions = state.legal_actions()
         board = self._parse_board(state, player)
         current = state.current_player()
-        is_maximizing = (current == player)
-        
+        is_maximizing = current == player
+
         # Filter to "loud" moves (captures/mills)
         capture_moves = []
         for action in legal_actions:
             if self.move_orderer._would_form_mill(action, board, current, state):
                 capture_moves.append(action)
-        
+
         if not capture_moves:
             return stand_pat
-        
+
         for action in capture_moves:
             child = state.clone()
             child.apply_action(action)
-            
-            score = -self.quiescence(child, -beta, -alpha, player, depth + 1)
-            
+
+            # Same-player check (removal after mill)
+            same_player = not child.is_terminal() and child.current_player() == current
+
+            if same_player:
+                # Mill capture doesn't count as extra depth
+                score = self.quiescence(child, alpha, beta, player, depth)
+            else:
+                score = -self.quiescence(child, -beta, -alpha, player, depth + 1)
+
             if score >= beta:
                 return beta
             if score > alpha:
                 alpha = score
-        
+
         return alpha
-    
-    def pvs(self, state, depth: int, alpha: float, beta: float,
-            player: int, ply: int = 0, null_move_allowed: bool = True,
-            prev_move: int = -1) -> Tuple[float, int]:
+
+    def pvs(
+        self,
+        state,
+        depth: int,
+        alpha: float,
+        beta: float,
+        player: int,
+        ply: int = 0,
+        null_move_allowed: bool = True,
+        prev_move: int = -1,
+    ) -> Tuple[float, int]:
         """
         Principal Variation Search with all optimizations.
-        
+
         Returns (score, best_move).
         """
-        self._increment_stat('nodes_evaluated')
-        
+        self._increment_stat("nodes_evaluated")
+
         # Time check
         if self._check_time():
             self.search_stopped = True
             return 0, -1
-        
+
         # Terminal or depth limit
         if state.is_terminal():
             return self.evaluate(state, player), -1
-        
+
         if depth <= 0:
             if self.use_quiescence:
                 return self.quiescence(state, alpha, beta, player), -1
             return self.evaluate(state, player), -1
-        
+
         # Get legal actions early (needed for TT validation and move ordering)
         legal_actions = state.legal_actions()
         if not legal_actions:
@@ -1093,7 +1241,7 @@ class OptimizedMinimaxBot:
 
             if tt_entry.depth >= depth and tt_move >= 0:
                 if tt_entry.entry_type == TTEntryType.EXACT:
-                    self._increment_stat('tt_cutoffs')
+                    self._increment_stat("tt_cutoffs")
                     return tt_entry.score, tt_move
                 elif tt_entry.entry_type == TTEntryType.LOWER:
                     alpha = max(alpha, tt_entry.score)
@@ -1101,7 +1249,7 @@ class OptimizedMinimaxBot:
                     beta = min(beta, tt_entry.score)
 
                 if alpha >= beta:
-                    self._increment_stat('tt_cutoffs')
+                    self._increment_stat("tt_cutoffs")
                     return tt_entry.score, tt_move
 
         current_player = state.current_player()
@@ -1111,24 +1259,37 @@ class OptimizedMinimaxBot:
         # which Nine Men's Morris doesn't support (no passing). This is kept as a
         # simplified heuristic that can be enabled for experimentation, but it
         # doesn't provide the same benefits as in chess-like games.
-        if (self.use_null_move and null_move_allowed and
-            depth >= 3 and not state.is_terminal() and current_player == player):
+        if (
+            self.use_null_move
+            and null_move_allowed
+            and depth >= 3
+            and not state.is_terminal()
+            and current_player == player
+        ):
             null_score = self.evaluate(state, player)
 
             if null_score >= beta:
                 # Verify with shallow search (approximation since we can't pass)
-                _, _ = self.pvs(state, depth - 1 - self.NULL_MOVE_REDUCTION,
-                               beta - 1, beta, player, ply + 1, False, prev_move)
+                _, _ = self.pvs(
+                    state,
+                    depth - 1 - self.NULL_MOVE_REDUCTION,
+                    beta - 1,
+                    beta,
+                    player,
+                    ply + 1,
+                    False,
+                    prev_move,
+                )
                 if not self.search_stopped:
-                    self._increment_stat('null_move_cutoffs')
+                    self._increment_stat("null_move_cutoffs")
 
         # Order moves (legal_actions already retrieved and validated above)
         ordered_moves = self.move_orderer.order_moves(
             legal_actions, state, current_player, ply, tt_move, prev_move
         )
-        
+
         # Negamax: always maximize (score negation handles perspective)
-        best_score = float('-inf')
+        best_score = float("-inf")
         best_move = ordered_moves[0]
         entry_type = TTEntryType.UPPER
 
@@ -1139,36 +1300,75 @@ class OptimizedMinimaxBot:
             child = state.clone()
             child.apply_action(action)
 
-            # Determine search depth (LMR)
-            new_depth = depth - 1
-            if (self.use_lmr and i >= self.LMR_THRESHOLD and
-                depth >= 3 and not state.is_terminal()):
-                new_depth -= self.LMR_REDUCTION
-                self._increment_stat('lmr_searches')
+            # Check if same player acts next (e.g. removal after forming a mill).
+            # Negamax negation must be SKIPPED when the same player continues.
+            same_player = (
+                not child.is_terminal() and child.current_player() == current_player
+            )
 
-            if i == 0:
+            # Determine search depth
+            # Mill captures (same player continues) don't consume depth —
+            # the place/move + capture is treated as one logical move.
+            if same_player:
+                base_depth = depth
+            else:
+                base_depth = depth - 1
+
+            new_depth = base_depth
+
+            # LMR only applies to normal opponent moves, not mill captures
+            if (
+                self.use_lmr
+                and not same_player
+                and i >= self.LMR_THRESHOLD
+                and depth >= 3
+                and not state.is_terminal()
+            ):
+                new_depth -= self.LMR_REDUCTION
+                self._increment_stat("lmr_searches")
+
+            if same_player:
+                # Same player continues (removal turn) — no negation
+                score, _ = self.pvs(
+                    child, new_depth, alpha, beta, player, ply + 1, True, action
+                )
+            elif i == 0:
                 # First move: full window search
-                score, _ = self.pvs(child, new_depth, -beta, -alpha,
-                                   player, ply + 1, True, action)
+                score, _ = self.pvs(
+                    child, new_depth, -beta, -alpha, player, ply + 1, True, action
+                )
                 score = -score
             else:
                 # PVS: null window search first
-                score, _ = self.pvs(child, new_depth, -alpha - 1, -alpha,
-                                   player, ply + 1, True, action)
+                score, _ = self.pvs(
+                    child, new_depth, -alpha - 1, -alpha, player, ply + 1, True, action
+                )
                 score = -score
 
                 # Re-search with full window if improved alpha
                 if alpha < score < beta and not self.search_stopped:
-                    score, _ = self.pvs(child, new_depth, -beta, -alpha,
-                                       player, ply + 1, True, action)
+                    score, _ = self.pvs(
+                        child, new_depth, -beta, -alpha, player, ply + 1, True, action
+                    )
                     score = -score
 
             # LMR re-search if reduced search found improvement
-            if (self.use_lmr and i >= self.LMR_THRESHOLD and
-                new_depth < depth - 1 and score > alpha and not self.search_stopped):
-                score, _ = self.pvs(child, depth - 1, -beta, -alpha,
-                                   player, ply + 1, True, action)
-                score = -score
+            if (
+                self.use_lmr
+                and i >= self.LMR_THRESHOLD
+                and new_depth < base_depth
+                and score > alpha
+                and not self.search_stopped
+            ):
+                if same_player:
+                    score, _ = self.pvs(
+                        child, base_depth, alpha, beta, player, ply + 1, True, action
+                    )
+                else:
+                    score, _ = self.pvs(
+                        child, base_depth, -beta, -alpha, player, ply + 1, True, action
+                    )
+                    score = -score
 
             # Negamax: always maximize
             if score > best_score:
@@ -1187,13 +1387,13 @@ class OptimizedMinimaxBot:
                     self.move_orderer.update_counter_move(prev_move, action)
                 entry_type = TTEntryType.LOWER
                 break
-        
+
         # Store in TT
         if not self.search_stopped:
             self.tt.store(hash_key, depth, best_score, entry_type, best_move)
-        
+
         return best_score, best_move
-    
+
     def iterative_deepening(self, state, player: int) -> Tuple[float, int]:
         """
         Iterative deepening with aspiration windows.
@@ -1201,51 +1401,72 @@ class OptimizedMinimaxBot:
         self.tt.new_search()
         self.search_stopped = False
         self.search_start_time = time.time()
-        
+
         best_move = -1
         best_score = 0
-        
+
         legal_actions = state.legal_actions()
         if len(legal_actions) == 1:
             return 0, legal_actions[0]
-        
+
         # Start with depth 1
         for depth in range(1, self.max_depth + 1):
             if self.search_stopped:
                 break
-            
+
             # Aspiration window
-            if depth >= 4 and abs(best_score) < self.WEIGHTS['win'] // 2:
+            if depth >= 4 and abs(best_score) < self.WEIGHTS["win"] // 2:
                 alpha = best_score - self.ASPIRATION_WINDOW
                 beta = best_score + self.ASPIRATION_WINDOW
-                
+
                 score, move = self.pvs(state, depth, alpha, beta, player)
-                
+
                 # Re-search if outside window
                 if not self.search_stopped:
                     if score <= alpha:
-                        score, move = self.pvs(state, depth, float('-inf'), beta, player)
+                        score, move = self.pvs(
+                            state, depth, float("-inf"), beta, player
+                        )
                     elif score >= beta:
-                        score, move = self.pvs(state, depth, alpha, float('inf'), player)
+                        score, move = self.pvs(
+                            state, depth, alpha, float("inf"), player
+                        )
             else:
-                score, move = self.pvs(state, depth, float('-inf'), float('inf'), player)
-            
+                score, move = self.pvs(
+                    state, depth, float("-inf"), float("inf"), player
+                )
+
             if not self.search_stopped and move >= 0:
                 best_score = score
                 best_move = move
-        
+
         return best_score, best_move
-    
-    def _evaluate_root_action(self, state, action: int, depth: int, 
-                               player: int) -> Tuple[int, float]:
+
+    def _evaluate_root_action(
+        self, state, action: int, depth: int, player: int
+    ) -> Tuple[int, float]:
         """Evaluate single root action for parallel search."""
         child = state.clone()
         child.apply_action(action)
-        
-        score, _ = self.pvs(child, depth - 1, float('-inf'), float('inf'),
-                           player, 1, True, action)
-        return action, -score
-    
+
+        # Check if same player acts next (mill capture)
+        current_player = state.current_player()
+        same_player = (
+            not child.is_terminal() and child.current_player() == current_player
+        )
+
+        if same_player:
+            # Mill capture: don't decrement depth, don't negate score
+            score, _ = self.pvs(
+                child, depth, float("-inf"), float("inf"), player, 1, True, action
+            )
+            return action, score
+        else:
+            score, _ = self.pvs(
+                child, depth - 1, float("-inf"), float("inf"), player, 1, True, action
+            )
+            return action, -score
+
     def search_parallel(self, state, player: int) -> Tuple[float, int]:
         """
         Parallel search at root level.
@@ -1253,21 +1474,19 @@ class OptimizedMinimaxBot:
         self.tt.new_search()
         self.search_stopped = False
         self.search_start_time = time.time()
-        
+
         legal_actions = state.legal_actions()
         if len(legal_actions) == 1:
             return 0, legal_actions[0]
-        
+
         # Order root moves
-        ordered_moves = self.move_orderer.order_moves(
-            legal_actions, state, player, 0
-        )
-        
-        best_score = float('-inf')
+        ordered_moves = self.move_orderer.order_moves(legal_actions, state, player, 0)
+
+        best_score = float("-inf")
         best_move = ordered_moves[0]
-        
+
         num_workers = min(self.num_threads, len(ordered_moves))
-        
+
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = {
                 executor.submit(
@@ -1275,62 +1494,64 @@ class OptimizedMinimaxBot:
                 ): action
                 for action in ordered_moves
             }
-            
+
             for future in as_completed(futures):
                 if self.search_stopped:
                     break
-                    
+
                 action, score = future.result()
                 if score > best_score:
                     best_score = score
                     best_move = action
-        
+
         return best_score, best_move
-    
-    def get_action(self, state, use_iterative: bool = True, 
-                   use_threading: bool = False) -> int:
+
+    def get_action(
+        self, state, use_iterative: bool = True, use_threading: bool = False
+    ) -> int:
         """
         Get best action for current state.
-        
+
         Args:
             state: Current game state
             use_iterative: Use iterative deepening (recommended)
             use_threading: Use parallel root search
         """
         legal_actions = state.legal_actions()
-        
+
         # Random move for training variety
         if self.random_move_prob > 0 and random.random() < self.random_move_prob:
             return random.choice(legal_actions)
-        
+
         # Reset stats
         self.nodes_evaluated = 0
         self.tt_cutoffs = 0
         self.null_move_cutoffs = 0
         self.lmr_searches = 0
         self.quiescence_nodes = 0
-        
+
         player = state.current_player()
-        
+
         if use_threading and self.num_threads > 1:
             _, action = self.search_parallel(state, player)
         elif use_iterative:
             _, action = self.iterative_deepening(state, player)
         else:
-            _, action = self.pvs(state, self.max_depth, 
-                                float('-inf'), float('inf'), player)
-        
+            _, action = self.pvs(
+                state, self.max_depth, float("-inf"), float("inf"), player
+            )
+
         return action
-    
+
     def get_stats(self) -> Dict:
         """Return search statistics."""
         return {
-            'nodes': self.nodes_evaluated,
-            'tt_cutoffs': self.tt_cutoffs,
-            'null_move_cutoffs': self.null_move_cutoffs,
-            'lmr_searches': self.lmr_searches,
-            'quiescence_nodes': self.quiescence_nodes,
-            'tt_stats': self.tt.stats(),
+            "nodes": self.nodes_evaluated,
+            "tt_cutoffs": self.tt_cutoffs,
+            "null_move_cutoffs": self.null_move_cutoffs,
+            "lmr_searches": self.lmr_searches,
+            "quiescence_nodes": self.quiescence_nodes,
+            "tt_stats": self.tt.stats(),
         }
 
 
@@ -1338,9 +1559,11 @@ class OptimizedMinimaxBot:
 # EVALUATION FUNCTIONS
 # ============================================================================
 
+
 def _prepare_game_state(state, random_moves: int):
     """Play random moves to prepare the board state (not recorded)."""
     import random
+
     moves_made = 0
     while moves_made < random_moves and not state.is_terminal():
         # Check if either player has only 3 stones - stop early
@@ -1371,7 +1594,7 @@ def evaluate_vs_minimax(
     max_steps: int = 200,
     use_mixed_precision: bool = True,
     unlimited: bool = True,
-    config = None,
+    config=None,
     random_moves: int = 150,
     tt_size_mb: int = 4096,
 ) -> Tuple[int, Dict]:
@@ -1398,31 +1621,31 @@ def evaluate_vs_minimax(
         raise ImportError("PyTorch required for evaluation")
 
     game = pyspiel.load_game("nine_mens_morris")
-    
+
     results = {}
     max_depth_beaten = 0
-    
+
     model.eval()
-    
+
     # Create single bot instance with shared TT
     bot = OptimizedMinimaxBot(
         max_depth=1,  # Will be updated
         tt_size_mb=tt_size_mb,
         num_threads=4,
     )
-    
+
     depth = 1
     while True:
         if not unlimited and depth > max_depth:
             break
-        
+
         bot.max_depth = depth
         bot.tt.clear()  # Clear for fair comparison
         bot.move_orderer.clear()  # Clear killer/history heuristics
-        
+
         wins, draws, losses = 0, 0, 0
         total_nodes = 0
-        
+
         with torch.no_grad():
             for game_idx in range(games_per_depth):
                 state = game.new_initial_state()
@@ -1440,30 +1663,35 @@ def evaluate_vs_minimax(
 
                 while not state.is_terminal() and steps < max_steps:
                     current = state.current_player()
-                    
+
                     if current == ai_player:
                         obs = torch.tensor(
                             state.observation_tensor(current),
-                            dtype=torch.float32, device=device
+                            dtype=torch.float32,
+                            device=device,
                         ).unsqueeze(0)
                         mask = torch.tensor(
                             get_legal_mask(state, num_actions),
-                            dtype=torch.float32, device=device
+                            dtype=torch.float32,
+                            device=device,
                         ).unsqueeze(0)
-                        
-                        with autocast('cuda', enabled=use_mixed_precision and device.type == 'cuda'):
+
+                        with autocast(
+                            "cuda",
+                            enabled=use_mixed_precision and device.type == "cuda",
+                        ):
                             logits, _ = model(obs)
-                        
+
                         masked = logits.squeeze(0).float()
                         masked[mask.squeeze(0) == 0] = -1e9
                         action = masked.argmax().item()
                     else:
                         action = bot.get_action(state, use_iterative=True)
                         total_nodes += bot.nodes_evaluated
-                    
+
                     state.apply_action(action)
                     steps += 1
-                
+
                 if state.is_terminal():
                     returns = state.returns()
                     if returns[ai_player] > returns[1 - ai_player]:
@@ -1474,15 +1702,15 @@ def evaluate_vs_minimax(
                         draws += 1
                 else:
                     draws += 1
-        
+
         win_rate = (wins + 0.5 * draws) / games_per_depth
         results[depth] = {
-            'wins': wins,
-            'draws': draws,
-            'losses': losses,
-            'win_rate': win_rate,
-            'total_nodes': total_nodes,
-            'tt_stats': bot.tt.stats(),
+            "wins": wins,
+            "draws": draws,
+            "losses": losses,
+            "win_rate": win_rate,
+            "total_nodes": total_nodes,
+            "tt_stats": bot.tt.stats(),
         }
 
         if win_rate > 0.5:
@@ -1490,7 +1718,7 @@ def evaluate_vs_minimax(
             depth += 1
         else:
             break
-    
+
     return max_depth_beaten, results
 
 
@@ -1514,6 +1742,7 @@ MinimaxBot = OptimizedMinimaxBot
 # ============================================================================
 # TESTING
 # ============================================================================
+
 
 def test_optimizations():
     """Test that optimizations are working."""
@@ -1542,8 +1771,10 @@ def test_optimizations():
         state.apply_action(action)
 
         stats = bot.get_stats()
-        print(f"Move {i+1}: Action={action}, Nodes={stats['nodes']:,}, "
-              f"TT Hit Rate={stats['tt_stats']['hit_rate']:.1%}")
+        print(
+            f"Move {i + 1}: Action={action}, Nodes={stats['nodes']:,}, "
+            f"TT Hit Rate={stats['tt_stats']['hit_rate']:.1%}"
+        )
 
     print("\nFinal TT Stats:", bot.tt.stats())
     print("Test completed!")

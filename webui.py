@@ -4,6 +4,13 @@ Interactive interface for testing trained models against various opponents.
 """
 
 import os
+# Limit OpenMP threads to prevent "Thread creation failed" errors
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
+os.environ['OPENBLAS_NUM_THREADS'] = '4'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '4'
+os.environ['NUMEXPR_NUM_THREADS'] = '4'
+
 import sys
 import json
 import random
@@ -1544,4 +1551,4 @@ if __name__ == '__main__':
     print("Open http://192.168.178.23:7860 in your browser")
     print("=" * 60)
 
-    app.run(host='0.0.0.0', port=7860, debug=True)
+    app.run(host='0.0.0.0', port=7860, debug=True, use_reloader=False)

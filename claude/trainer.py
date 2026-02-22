@@ -128,9 +128,9 @@ class PPOTrainer:
             if new_config and new_config.opponent_type == 'mixed':
                 self._update_clone_model()
 
-        # Phase 10: Update minimax depth range to D1-D6
+        # Phase 10: Update minimax depth range to D1-D4
         if new_phase == Phase.PHASE_10:
-            self._broadcast_minimax_range(min_depth=1, max_depth=6)
+            self._broadcast_minimax_range(min_depth=1, max_depth=4)
 
     def _broadcast_minimax_range(self, min_depth: int, max_depth: int):
         """Send minimax depth range to all workers."""
@@ -233,7 +233,17 @@ class PPOTrainer:
         self.request_queue = mp.Queue()
         self.experience_queue = mp.Queue()
 
-        shared_state = {}
+        # Shared minimax move cache for D1/D2 across all workers
+        # Max ~180GB: ~150 bytes/entry in Manager dict → ~1.2B entries
+        MINIMAX_CACHE_MAX_ENTRIES = int(180 * (1024**3) / 150)
+        self.cache_manager = mp.Manager()
+        self.minimax_move_cache = self.cache_manager.dict()
+        self.minimax_cache_max_entries = MINIMAX_CACHE_MAX_ENTRIES
+
+        shared_state = {
+            'minimax_move_cache': self.minimax_move_cache,
+            'minimax_cache_max_entries': MINIMAX_CACHE_MAX_ENTRIES,
+        }
 
         for i in range(self.config.num_workers):
             response_q = mp.Queue()
@@ -287,6 +297,15 @@ class PPOTrainer:
             p.join(timeout=2)
             if p.is_alive():
                 p.terminate()
+
+        # Clean up shared cache manager
+        if hasattr(self, 'cache_manager'):
+            try:
+                cache_size = len(self.minimax_move_cache)
+                print(f"  Minimax move cache: {cache_size:,} entries")
+                self.cache_manager.shutdown()
+            except:
+                pass
 
     def pause_workers(self):
         """Pause all workers for PPO update."""
@@ -621,10 +640,9 @@ class PPOTrainer:
         draw_rate = curr_stats.get_draw_rate()
 
         elapsed = time.time() - self.start_time
-        eps_per_sec = self.episode_count / elapsed if elapsed > 0 else 0
+        eps_per_sec = (self.episode_count - self.start_episode_count) / elapsed if elapsed > 0 else 0
 
-        # max_depth_beaten, minimax_str = self.evaluate_vs_minimax_progressive()
-        max_depth_beaten, minimax_str = -1, -1
+        max_depth_beaten, minimax_str = self.evaluate_vs_minimax_progressive()
         curriculum_status = self.curriculum.get_status_string()
         config = self.curriculum.get_config()
 
@@ -752,7 +770,7 @@ class PPOTrainer:
         print()
 
         print(f"Phase 10 (Final):")
-        print(f"  Minimax: Random D1-D6, no shaping, 1M episodes")
+        print(f"  Minimax: Random D1-D4, no shaping, 1M episodes")
         print()
 
         config = self.curriculum.get_config()
@@ -762,6 +780,7 @@ class PPOTrainer:
         print("=" * 70)
 
         self.start_time = time.time()
+        self.start_episode_count = self.episode_count
 
         self.start_workers()
 
@@ -771,40 +790,32 @@ class PPOTrainer:
                     print(f"\nReached max episodes ({cfg.total_episodes:,})")
                     break
 
-                # Collect experiences
+                # Collect experiences (workers run, main serves inference)
                 experiences, returns = self.collect_experiences(cfg.episodes_per_update)
 
-                # PPO update
-                self.pause_workers()
+                # PPO update — workers are NOT paused.
+                # They keep playing (minimax, random, self-play turns) and
+                # queue up inference requests. Requests pile up during PPO
+                # and get served on the next collect_experiences call.
                 metrics = self.update_policy(experiences)
 
                 self._update_learning_rate()
 
-                self.resume_workers()
-
-                # Check for clone update (90% WR over 5000 self-play games)
+                # Check for clone update (80% WR over 500 self-play games)
                 if self.curriculum.should_update_clone():
-                    self.pause_workers()
                     self.curriculum.do_clone_update()
-                    self.resume_workers()
 
                 # Logging
                 if self.episode_count % cfg.log_interval < cfg.episodes_per_update:
-                    self.pause_workers()
                     self.log_progress(returns, metrics)
-                    self.resume_workers()
 
                 # Check graduation
                 if self.episode_count % cfg.graduation_check_interval < cfg.episodes_per_update:
-                    self.pause_workers()
                     self.curriculum.check_and_graduate()
-                    self.resume_workers()
 
                 # Checkpointing
                 if self.episode_count % cfg.save_interval < cfg.episodes_per_update:
-                    self.pause_workers()
                     self.save_checkpoint()
-                    self.resume_workers()
 
         except KeyboardInterrupt:
             print("\n  Interrupted")
@@ -822,6 +833,7 @@ class PPOTrainer:
                 self.log_file.close()
 
             elapsed = time.time() - self.start_time
-            print(f"\nDone: {self.episode_count:,} episodes in {elapsed / 3600:.1f}h ({self.episode_count / elapsed:.0f}/s)")
+            session_eps = self.episode_count - self.start_episode_count
+            print(f"\nDone: {session_eps:,} episodes in {elapsed / 3600:.1f}h ({session_eps / elapsed:.0f}/s)")
 
             self.curriculum.print_summary()

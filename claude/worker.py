@@ -11,6 +11,7 @@ os.environ['MKL_NUM_THREADS'] = '1'
 import time
 import random
 import queue
+from concurrent.futures import ThreadPoolExecutor, Future
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -28,6 +29,118 @@ from minimax import MinimaxBot
 # Import pyspiel with bug fix wrapper
 import pyspiel
 from game_wrapper import load_game as load_game_fixed
+
+
+class CachedMinimaxBot:
+    """
+    Wrapper around MinimaxBot that caches (hash → action) for D1/D2.
+    Cache is a process-local dict (shared TT already helps across games).
+    For cross-process sharing, a multiprocessing shared dict is passed in.
+    """
+
+    def __init__(self, bot: MinimaxBot, depth: int,
+                 shared_cache: Optional[Dict] = None,
+                 max_cache_entries: int = 0):
+        self.bot = bot
+        self.depth = depth
+        self.random_move_prob = bot.random_move_prob
+        self.bot.random_move_prob = 0.0  # handled here to avoid double roll
+        self.shared_cache = shared_cache  # mp.Manager dict or None
+        self.max_cache_entries = max_cache_entries  # 0 = unlimited
+        self.local_cache: Dict[int, int] = {}  # fast process-local cache
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self._shared_cache_full = False
+
+    def get_action(self, state) -> int:
+        # Random move check
+        if self.random_move_prob > 0 and random.random() < self.random_move_prob:
+            return random.choice(state.legal_actions())
+
+        # Only cache D1 and D2
+        if self.depth > 2:
+            return self.bot.get_action(state)
+
+        # Compute hash
+        h = self.bot._get_hash(state, state.current_player())
+        cache_key = h ^ (self.depth * 0x9E3779B97F4A7C15)  # mix depth into key
+
+        # Check local cache first (fast)
+        cached = self.local_cache.get(cache_key)
+        if cached is not None:
+            # Validate the cached action is still legal
+            legal = state.legal_actions()
+            if cached in legal:
+                self.cache_hits += 1
+                return cached
+
+        # Check shared cache
+        if self.shared_cache is not None:
+            try:
+                cached = self.shared_cache.get(cache_key)
+                if cached is not None:
+                    legal = state.legal_actions()
+                    if cached in legal:
+                        self.cache_hits += 1
+                        self.local_cache[cache_key] = cached
+                        return cached
+            except:
+                pass  # shared cache may fail under load
+
+        # Cache miss — run minimax
+        self.cache_misses += 1
+        action = self.bot.get_action(state)
+
+        # Store in local cache
+        self.local_cache[cache_key] = action
+
+        # Store in shared cache (best-effort, respects max size)
+        if self.shared_cache is not None and not self._shared_cache_full:
+            try:
+                # Check size every 10000 misses to avoid expensive IPC len()
+                if self.max_cache_entries > 0 and self.cache_misses % 10000 == 0:
+                    if len(self.shared_cache) >= self.max_cache_entries:
+                        self._shared_cache_full = True
+                        return action
+                self.shared_cache[cache_key] = action
+            except:
+                pass
+
+        return action
+
+
+class MinimaxBotPool:
+    """
+    Pool of persistent MinimaxBot instances keyed by depth.
+    Reuses bots (and their transposition tables) across games.
+    D1/D2 bots are wrapped with CachedMinimaxBot for move caching.
+    """
+
+    def __init__(self, tt_budget_mb: int = 2048,
+                 shared_cache: Optional[Dict] = None,
+                 max_cache_entries: int = 0):
+        self._bots = {}
+        self._tt_budget_mb = tt_budget_mb
+        self._shared_cache = shared_cache
+        self._max_cache_entries = max_cache_entries
+
+    def get(self, depth: int):
+        if depth not in self._bots:
+            n_depths = max(len(self._bots) + 1, 2)
+            per_depth_mb = max(64, self._tt_budget_mb // n_depths)
+            bot = MinimaxBot(
+                max_depth=depth, random_move_prob=0.3,
+                tt_size_mb=per_depth_mb,
+            )
+            if depth <= 2:
+                # Wrap D1/D2 with move cache
+                self._bots[depth] = CachedMinimaxBot(
+                    bot, depth, shared_cache=self._shared_cache,
+                    max_cache_entries=self._max_cache_entries,
+                )
+            else:
+                self._bots[depth] = bot
+        return self._bots[depth]
 
 
 class EnvState:
@@ -51,12 +164,18 @@ class EnvState:
         self.minimax_depth = 0
         self.clone_player = 1 - self.ai_player
 
-    def setup_opponent(self, opponent_type: str, minimax_depth: int = 1):
+        # Async minimax state
+        self.pending_minimax: Optional[Future] = None
+
+    def setup_opponent(self, opponent_type: str, minimax_depth: int = 1,
+                       bot_pool: 'MinimaxBotPool' = None):
         """Configure opponent for this game."""
         self.opponent_type = opponent_type
         self.minimax_depth = minimax_depth if opponent_type == 'minimax' else 0
 
-        if opponent_type == 'minimax':
+        if opponent_type == 'minimax' and bot_pool is not None:
+            self.minimax_bot = bot_pool.get(minimax_depth)
+        elif opponent_type == 'minimax':
             self.minimax_bot = MinimaxBot(max_depth=minimax_depth, random_move_prob=0.3)
         else:
             self.minimax_bot = None
@@ -69,7 +188,7 @@ def get_opponent_action(env: EnvState, state, num_actions: int, clone_model: Opt
 
     elif env.opponent_type == 'minimax':
         if env.minimax_bot is None:
-            env.minimax_bot = MinimaxBot(max_depth=env.minimax_depth, random_move_prob=0.3)
+            return random.choice(state.legal_actions())
         return env.minimax_bot.get_action(state)
 
     elif env.opponent_type == 'self' and clone_model is not None:
@@ -144,6 +263,8 @@ def worker_process(
         'double_mill_reward': 0.5,
         'double_mill_extra_reward': 0.8,
         'setup_capture_reward': 0.2,
+        'step_penalty': -0.003,
+        'piece_advantage_reward': 0.02,
     }
     reward_calculator = RewardCalculator(default_reward_config)
 
@@ -161,6 +282,19 @@ def worker_process(
 
     # Clone model for self-play
     clone_model: Optional[ActorCritic] = None
+
+    # Shared minimax move cache for D1/D2 (passed from trainer via shared_state)
+    minimax_move_cache = shared_state.get('minimax_move_cache', None)
+    minimax_cache_max_entries = shared_state.get('minimax_cache_max_entries', 0)
+
+    # Persistent minimax bot pool (shared TT across games)
+    # Budget: ~100GB total / num_workers per worker
+    tt_budget_per_worker = max(256, (100 * 1024) // max(1, config.num_workers))
+    bot_pool = MinimaxBotPool(
+        tt_budget_mb=tt_budget_per_worker,
+        shared_cache=minimax_move_cache,
+        max_cache_entries=minimax_cache_max_entries,
+    )
 
     ready_event.set()
     running = True
@@ -260,15 +394,86 @@ def worker_process(
 
         if current_opponent_type == 'mixed':
             opp_type, depth = select_mixed_opponent()
-            env.setup_opponent(opp_type, depth)
+            env.setup_opponent(opp_type, depth, bot_pool=bot_pool)
         else:
-            env.setup_opponent(current_opponent_type, current_minimax_depth)
+            env.setup_opponent(current_opponent_type, current_minimax_depth, bot_pool=bot_pool)
 
         env.reward_calculator.update_config(current_reward_config)
 
     # Initialize all environments
     for env in envs:
         setup_new_game(env)
+
+    # Thread pool for async minimax (2 threads — minimax is CPU-heavy)
+    minimax_executor = ThreadPoolExecutor(max_workers=2)
+
+    def apply_opponent_action(env: EnvState, player: int, action: int):
+        """Apply an opponent action and track shaping penalties."""
+        state = env.state
+        legal_actions = state.legal_actions()
+        if not legal_actions:
+            return
+        if action not in legal_actions:
+            action = random.choice(legal_actions)
+
+        ai_player = env.ai_player
+        prev_ai_pieces = env.pieces[ai_player]
+
+        state.apply_action(action)
+        env.step_count += 1
+
+        if not state.is_terminal():
+            my_pieces, opp_pieces = count_pieces_from_state(state, player)
+            env.pieces[player] = my_pieces
+            env.pieces[1 - player] = opp_pieces
+
+            new_ai_pieces = env.pieces[ai_player]
+            if new_ai_pieces < prev_ai_pieces:
+                pieces_lost = prev_ai_pieces - new_ai_pieces
+                if env.experiences[ai_player]:
+                    penalty = env.reward_calculator.config.get('enemy_mill_penalty', -0.3)
+                    env.experiences[ai_player][-1]['reward'] += penalty * pieces_lost
+
+    def finalize_game(env: EnvState):
+        """Finalize a completed game and submit experience batches."""
+        state = env.state
+        for player in [0, 1]:
+            if env.experiences[player]:
+                if state.is_terminal():
+                    final_reward = env.reward_calculator.calculate_terminal_reward(
+                        state.returns(), player, env.step_count, config.max_game_steps
+                    )
+                else:
+                    final_reward = env.reward_calculator.calculate_timeout_penalty()
+
+                env.experiences[player][-1]['reward'] += final_reward
+                env.experiences[player][-1]['done'] = 1.0
+
+                rewards = np.array([e['reward'] for e in env.experiences[player]], dtype=np.float32)
+                values = np.array([e['value'] for e in env.experiences[player]], dtype=np.float32)
+
+                advantages, returns = compute_gae(
+                    rewards, values,
+                    gamma=config.gamma,
+                    gae_lambda=config.gae_lambda
+                )
+
+                batch = ExperienceBatch(
+                    obs=np.stack([e['obs'] for e in env.experiences[player]]),
+                    actions=np.array([e['action'] for e in env.experiences[player]], dtype=np.int64),
+                    logprobs=np.array([e['logprob'] for e in env.experiences[player]], dtype=np.float32),
+                    values=values,
+                    rewards=rewards,
+                    dones=np.array([e['done'] for e in env.experiences[player]], dtype=np.float32),
+                    masks=np.stack([e['mask'] for e in env.experiences[player]]),
+                    advantages=advantages,
+                    returns=returns,
+                    game_result=final_reward,
+                    game_steps=env.step_count,
+                    opponent_type=env.opponent_type,
+                    minimax_depth=env.minimax_depth
+                )
+                experience_queue.put(batch)
 
     while running:
         # Check for pause signal
@@ -299,7 +504,6 @@ def worker_process(
                     current_opponent_mix = msg['opponent_mix']
 
             elif msg['type'] == 'update_game_settings':
-                # New game settings (random moves for board preparation)
                 new_random_moves = msg.get('random_moves', current_random_moves)
                 if new_random_moves != current_random_moves:
                     current_random_moves = new_random_moves
@@ -313,60 +517,33 @@ def worker_process(
                     clone_model.eval()
 
             elif msg['type'] == 'update_minimax_range':
-                # Update minimax depth range (for Phase 10)
                 current_minimax_min_depth = msg.get('min_depth', 1)
                 current_minimax_max_depth = msg.get('max_depth', 4)
 
         except queue.Empty:
             pass
 
-        # Collect observations needing inference
+        # --- Phase 1: Collect completed async minimax results ---
+        for env in envs:
+            if env.pending_minimax is not None and env.pending_minimax.done():
+                action = env.pending_minimax.result()
+                player = env.state.current_player()
+                apply_opponent_action(env, player, action)
+                env.pending_minimax = None
+
+        # --- Phase 2: Collect observations / submit opponent actions ---
         inference_requests = []
-        opponent_actions = []
 
         for env_idx, env in enumerate(envs):
+            # Skip envs waiting for async minimax
+            if env.pending_minimax is not None:
+                continue
+
             state = env.state
 
             # Check terminal
             if state.is_terminal() or env.step_count >= config.max_game_steps:
-                for player in [0, 1]:
-                    if env.experiences[player]:
-                        if state.is_terminal():
-                            final_reward = env.reward_calculator.calculate_terminal_reward(
-                                state.returns(), player, env.step_count, config.max_game_steps
-                            )
-                        else:
-                            final_reward = env.reward_calculator.calculate_timeout_penalty()
-
-                        env.experiences[player][-1]['reward'] += final_reward
-                        env.experiences[player][-1]['done'] = 1.0
-
-                        rewards = np.array([e['reward'] for e in env.experiences[player]], dtype=np.float32)
-                        values = np.array([e['value'] for e in env.experiences[player]], dtype=np.float32)
-
-                        advantages, returns = compute_gae(
-                            rewards, values,
-                            gamma=config.gamma,
-                            gae_lambda=config.gae_lambda
-                        )
-
-                        batch = ExperienceBatch(
-                            obs=np.stack([e['obs'] for e in env.experiences[player]]),
-                            actions=np.array([e['action'] for e in env.experiences[player]], dtype=np.int64),
-                            logprobs=np.array([e['logprob'] for e in env.experiences[player]], dtype=np.float32),
-                            values=values,
-                            rewards=rewards,
-                            dones=np.array([e['done'] for e in env.experiences[player]], dtype=np.float32),
-                            masks=np.stack([e['mask'] for e in env.experiences[player]]),
-                            advantages=advantages,
-                            returns=returns,
-                            game_result=final_reward,
-                            game_steps=env.step_count,
-                            opponent_type=env.opponent_type,
-                            minimax_depth=env.minimax_depth
-                        )
-                        experience_queue.put(batch)
-
+                finalize_game(env)
                 setup_new_game(env)
                 continue
 
@@ -386,11 +563,7 @@ def worker_process(
                     })
                 else:
                     action = get_clone_action(state, num_actions, clone_model)
-                    opponent_actions.append({
-                        'env_idx': env_idx,
-                        'player': current_player,
-                        'action': action
-                    })
+                    apply_opponent_action(env, current_player, action)
             elif env.opponent_type == 'self':
                 obs = np.array(state.observation_tensor(current_player), dtype=np.float32)
                 mask = get_legal_mask(state, num_actions)
@@ -412,44 +585,15 @@ def worker_process(
                     'is_ai_player': True
                 })
             else:
-                action = get_opponent_action(env, state, num_actions, clone_model)
-                opponent_actions.append({
-                    'env_idx': env_idx,
-                    'player': current_player,
-                    'action': action
-                })
-
-        # Apply opponent actions immediately
-        for opp in opponent_actions:
-            env = envs[opp['env_idx']]
-            state = env.state
-            player = opp['player']
-            action = opp['action']
-
-            # Validate action is legal (state may have changed)
-            legal_actions = state.legal_actions()
-            if not legal_actions:
-                continue
-            if action not in legal_actions:
-                action = random.choice(legal_actions)
-
-            ai_player = env.ai_player
-            prev_ai_pieces = env.pieces[ai_player]
-
-            state.apply_action(action)
-            env.step_count += 1
-
-            if not state.is_terminal():
-                my_pieces, opp_pieces = count_pieces_from_state(state, player)
-                env.pieces[player] = my_pieces
-                env.pieces[1 - player] = opp_pieces
-
-                new_ai_pieces = env.pieces[ai_player]
-                if new_ai_pieces < prev_ai_pieces:
-                    pieces_lost = prev_ai_pieces - new_ai_pieces
-                    if env.experiences[ai_player]:
-                        penalty = env.reward_calculator.config.get('enemy_mill_penalty', -0.3)
-                        env.experiences[ai_player][-1]['reward'] += penalty * pieces_lost
+                # Opponent turn (non-AI)
+                if env.opponent_type == 'minimax' and env.minimax_bot is not None:
+                    # Submit minimax to thread pool — don't block
+                    state_clone = state.clone()
+                    bot = env.minimax_bot
+                    env.pending_minimax = minimax_executor.submit(bot.get_action, state_clone)
+                else:
+                    action = get_opponent_action(env, state, num_actions, clone_model)
+                    apply_opponent_action(env, current_player, action)
 
         if not inference_requests:
             time.sleep(0.001)
@@ -501,7 +645,6 @@ def worker_process(
 
             legal_actions = state.legal_actions()
             if not legal_actions:
-                # State became terminal between request and response, skip
                 continue
             if action not in legal_actions:
                 action = random.choice(legal_actions)
@@ -542,4 +685,5 @@ def worker_process(
                     'mask': mask
                 })
 
+    minimax_executor.shutdown(wait=False)
     print(f"Worker {worker_id} finished")
