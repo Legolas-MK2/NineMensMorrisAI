@@ -22,36 +22,13 @@ from config import Config
 from model import ActorCritic
 from trainer import PPOTrainer
 from minimax import MinimaxBot, evaluate_vs_minimax
-from utils import get_legal_mask
+from utils import get_legal_mask, prepare_game_state
 from curriculum import CurriculumManager, Phase, PHASE_CONFIGS
 
 
 def get_game():
     """Get game instance using pyspiel with position 0 bug fix."""
     return load_game_fixed("nine_mens_morris")
-
-
-def prepare_game_state(state, random_moves: int):
-    """Play random moves to prepare the board state (not recorded)."""
-    moves_made = 0
-    while moves_made < random_moves and not state.is_terminal():
-        # Check if either player has only 3 stones - stop early
-        try:
-            obs = state.observation_tensor(0)
-            p0_pieces = sum(1 for i in range(24) if obs[i] == 1)
-            p1_pieces = sum(1 for i in range(24) if obs[i + 24] == 1)
-            if p0_pieces <= 3 or p1_pieces <= 3:
-                break
-        except:
-            pass
-
-        legal_actions = state.legal_actions()
-        if not legal_actions:
-            break
-
-        action = random.choice(legal_actions)
-        state.apply_action(action)
-        moves_made += 1
 
 
 def play_interactive(config: Config = None):
@@ -331,6 +308,10 @@ Examples:
         '--phase', type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         help='Start from specific phase (1-10)'
     )
+    parser.add_argument(
+        '--use-last-checkpoint', action='store_true',
+        help='Load model weights from the latest checkpoint when starting fresh training'
+    )
 
     args = parser.parse_args()
     
@@ -349,6 +330,18 @@ Examples:
         config.envs_per_worker = args.envs
 
         trainer = PPOTrainer(config)
+
+        # Load weights from checkpoint if specified (training state stays fresh)
+        if args.checkpoint:
+            ckpt_path = args.checkpoint
+            trainer.load_weights_only(ckpt_path)
+        elif args.use_last_checkpoint:
+            ckpts = glob.glob("checkpoints/*.pt")
+            if ckpts:
+                latest = max(ckpts, key=os.path.getmtime)
+                trainer.load_weights_only(latest)
+            else:
+                print("No checkpoints found, starting with a new model.")
 
         # Start from specific phase if requested
         if args.phase:

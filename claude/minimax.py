@@ -52,7 +52,7 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 try:
-    from utils import get_legal_mask
+    from utils import get_legal_mask, prepare_game_state
 except ImportError:
 
     def get_legal_mask(state, num_actions):
@@ -1560,29 +1560,6 @@ class OptimizedMinimaxBot:
 # ============================================================================
 
 
-def _prepare_game_state(state, random_moves: int):
-    """Play random moves to prepare the board state (not recorded)."""
-    import random
-
-    moves_made = 0
-    while moves_made < random_moves and not state.is_terminal():
-        # Check if either player has only 3 stones - stop early
-        try:
-            obs = state.observation_tensor(0)
-            p0_pieces = sum(1 for i in range(24) if obs[i] == 1)
-            p1_pieces = sum(1 for i in range(24) if obs[i + 24] == 1)
-            if p0_pieces <= 3 or p1_pieces <= 3:
-                break
-        except:
-            pass
-
-        legal_actions = state.legal_actions()
-        if not legal_actions:
-            break
-
-        action = random.choice(legal_actions)
-        state.apply_action(action)
-        moves_made += 1
 
 
 def evaluate_vs_minimax(
@@ -1620,7 +1597,7 @@ def evaluate_vs_minimax(
     if not TORCH_AVAILABLE:
         raise ImportError("PyTorch required for evaluation")
 
-    game = pyspiel.load_game("nine_mens_morris")
+    game = load_game_fixed("nine_mens_morris")
 
     results = {}
     max_depth_beaten = 0
@@ -1651,7 +1628,7 @@ def evaluate_vs_minimax(
                 state = game.new_initial_state()
 
                 # Prepare board with random moves
-                _prepare_game_state(state, random_moves)
+                prepare_game_state(state, random_moves)
 
                 # Skip if game ended during preparation
                 if state.is_terminal():
@@ -1748,7 +1725,7 @@ def test_optimizations():
     """Test that optimizations are working."""
     print("Testing optimized minimax...")
 
-    game = pyspiel.load_game("nine_mens_morris")
+    game = load_game_fixed("nine_mens_morris")
 
     # Test with small TT for speed
     bot = OptimizedMinimaxBot(
@@ -1760,7 +1737,7 @@ def test_optimizations():
     state = game.new_initial_state()
 
     # Prepare board with some random moves
-    _prepare_game_state(state, 50)
+    prepare_game_state(state, 50)
 
     # Make a few moves
     for i in range(5):

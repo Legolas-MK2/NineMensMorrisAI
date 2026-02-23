@@ -42,10 +42,6 @@ class PhaseConfig:
     phase: Phase
     description: str
 
-    # Game settings
-    stones_per_player: int = 3
-    start_phase: str = 'jumping'  # 'placing', 'moving', or 'jumping'
-
     # Opponent settings for Phase 1 (random only)
     opponent_type: str = 'random'  # 'random' for Phase 1, 'mixed' for Phase 2+
 
@@ -128,9 +124,7 @@ PHASE_10_CONFIG = {
 PHASE_CONFIGS = {
     Phase.PHASE_1: PhaseConfig(
         phase=Phase.PHASE_1,
-        description="Warmup: random 3-9 stones jumping vs random",
-        stones_per_player=3,  # Base value, actual is random 3-9
-        start_phase='jumping',
+        description="Warmup: 150 random pre-moves, vs random",
         opponent_type='random',
         lr_start=3e-4,
         lr_end=1e-4,
@@ -147,9 +141,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_2: PhaseConfig(
         phase=Phase.PHASE_2,
-        description="3 stones jumping, mixed opponents",
-        stones_per_player=3,
-        start_phase='jumping',
+        description="150 random pre-moves, vs mixed",
         opponent_type='mixed',
         lr_start=1e-4,
         lr_end=5e-5,
@@ -165,9 +157,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_3: PhaseConfig(
         phase=Phase.PHASE_3,
-        description="4 stones moving, mixed opponents",
-        stones_per_player=4,
-        start_phase='moving',
+        description="~129 random pre-moves, vs mixed",
         opponent_type='mixed',
         lr_start=5e-5,
         lr_end=3e-5,
@@ -183,9 +173,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_4: PhaseConfig(
         phase=Phase.PHASE_4,
-        description="5 stones moving, mixed opponents",
-        stones_per_player=5,
-        start_phase='moving',
+        description="~107 random pre-moves, vs mixed",
         opponent_type='mixed',
         lr_start=3e-5,
         lr_end=2e-5,
@@ -201,9 +189,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_5: PhaseConfig(
         phase=Phase.PHASE_5,
-        description="6 stones moving, mixed opponents",
-        stones_per_player=6,
-        start_phase='moving',
+        description="~86 random pre-moves, vs mixed",
         opponent_type='mixed',
         lr_start=2e-5,
         lr_end=1e-5,
@@ -219,9 +205,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_6: PhaseConfig(
         phase=Phase.PHASE_6,
-        description="7 stones moving, mixed opponents",
-        stones_per_player=7,
-        start_phase='moving',
+        description="~64 random pre-moves, vs mixed",
         opponent_type='mixed',
         lr_start=1e-5,
         lr_end=7e-6,
@@ -237,9 +221,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_7: PhaseConfig(
         phase=Phase.PHASE_7,
-        description="8 stones moving, mixed opponents",
-        stones_per_player=8,
-        start_phase='moving',
+        description="~43 random pre-moves, vs mixed",
         opponent_type='mixed',
         lr_start=7e-6,
         lr_end=5e-6,
@@ -255,9 +237,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_8: PhaseConfig(
         phase=Phase.PHASE_8,
-        description="9 stones moving, mixed opponents",
-        stones_per_player=9,
-        start_phase='moving',
+        description="~21 random pre-moves, vs mixed",
         opponent_type='mixed',
         lr_start=5e-6,
         lr_end=3e-6,
@@ -273,9 +253,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_9: PhaseConfig(
         phase=Phase.PHASE_9,
-        description="Full game (9 stones from placing), mixed opponents",
-        stones_per_player=9,
-        start_phase='placing',
+        description="Full game from start (0 pre-moves), vs mixed",
         opponent_type='mixed',
         lr_start=3e-6,
         lr_end=1e-6,
@@ -291,9 +269,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_10: PhaseConfig(
         phase=Phase.PHASE_10,
-        description="Final: full game, no shaping, D1-D6 minimax",
-        stones_per_player=9,
-        start_phase='placing',
+        description="Full game, 0-150 random pre-moves, vs harder minimax",
         opponent_type='mixed',
         lr_start=1e-6,
         lr_end=5e-7,
@@ -331,10 +307,15 @@ class MixedTrainingState:
     games_vs_minimax: int = 0
     games_vs_self: int = 0
 
+    # Active minimax depth ceiling (starts at D2, unlocks D3/D4 progressively)
+    active_minimax_max_depth: int = 2
+
     # Win tracking for last 500 games per opponent type
     results_vs_random: deque = field(default_factory=lambda: deque(maxlen=500))
     results_vs_minimax_d1: deque = field(default_factory=lambda: deque(maxlen=500))
     results_vs_minimax_d2: deque = field(default_factory=lambda: deque(maxlen=500))
+    results_vs_minimax_d3: deque = field(default_factory=lambda: deque(maxlen=500))
+    results_vs_minimax_d4: deque = field(default_factory=lambda: deque(maxlen=500))
     results_vs_self: deque = field(default_factory=lambda: deque(maxlen=500))
 
     def get_selfplay_win_rate(self) -> float:
@@ -345,7 +326,7 @@ class MixedTrainingState:
         return wins / len(self.selfplay_results)
 
     def should_update_clone(self) -> bool:
-        """Check if clone should be updated (80% WR over 500 games)."""
+        """Check if clone should be updated (85% WR over 1000 games)."""
         if len(self.selfplay_results) < MIXED_CONFIG['selfplay_winrate_games']:
             return False
         return self.get_selfplay_win_rate() >= MIXED_CONFIG['selfplay_winrate_threshold']
@@ -377,6 +358,10 @@ class MixedTrainingState:
             results = self.results_vs_minimax_d1
         elif opponent_type == 'minimax' and depth == 2:
             results = self.results_vs_minimax_d2
+        elif opponent_type == 'minimax' and depth == 3:
+            results = self.results_vs_minimax_d3
+        elif opponent_type == 'minimax' and depth == 4:
+            results = self.results_vs_minimax_d4
         elif opponent_type == 'self':
             results = self.results_vs_self
         else:
@@ -395,6 +380,10 @@ class MixedTrainingState:
             self.results_vs_minimax_d1.append(result_str)
         elif opponent_type == 'minimax' and depth == 2:
             self.results_vs_minimax_d2.append(result_str)
+        elif opponent_type == 'minimax' and depth == 3:
+            self.results_vs_minimax_d3.append(result_str)
+        elif opponent_type == 'minimax' and depth == 4:
+            self.results_vs_minimax_d4.append(result_str)
         elif opponent_type == 'self':
             self.results_vs_self.append(result_str)
 
@@ -479,11 +468,6 @@ class CurriculumManager:
         if self.current_phase == Phase.COMPLETED:
             return PHASE_CONFIGS[Phase.PHASE_9]
         return PHASE_CONFIGS[self.current_phase]
-
-    def get_game_settings(self) -> Tuple[int, str]:
-        """Get stones_per_player and start_phase for current phase."""
-        config = self.get_config()
-        return config.stones_per_player, config.start_phase
 
     def get_random_moves_for_phase(self) -> int:
         """
@@ -580,40 +564,6 @@ class CurriculumManager:
             'step_penalty': -0.003,
             'piece_advantage_reward': 0.02,
         }
-
-    def select_opponent_for_game(self) -> Tuple[str, int]:
-        """
-        Select opponent for next game.
-        Returns (opponent_type, minimax_depth).
-
-        For Phase 1: always ('random', 0)
-        For Phase 2+: mixed selection with random minimax depth
-        """
-        config = self.get_config()
-
-        if config.opponent_type == 'random':
-            return ('random', 0)
-
-        # Get config based on phase (Phase 10 uses harder minimax)
-        if self.current_phase == Phase.PHASE_10:
-            mix_config = PHASE_10_CONFIG
-        else:
-            mix_config = MIXED_CONFIG
-
-        # Mixed opponent selection
-        mix = mix_config['opponent_mix']
-        roll = np.random.random()
-
-        if roll < mix['minimax']:
-            # Random depth selection (no progressive rounds)
-            min_depth = mix_config['minimax_min_depth']
-            max_depth = mix_config['minimax_max_depth']
-            depth = np.random.randint(min_depth, max_depth + 1)
-            return ('minimax', depth)
-        elif roll < mix['minimax'] + mix['self']:
-            return ('self', 0)
-        else:
-            return ('random', 0)
 
     def add_game_result(self, result: float, opponent_type: str = 'random', minimax_depth: int = 0):
         """
@@ -807,7 +757,6 @@ class CurriculumManager:
         print(f"  GRADUATED from Phase {int(old_phase)} to Phase {int(self.current_phase)}! (reason: {graduation_reason})")
         if new_config:
             print(f"  {new_config.description}")
-            print(f"  Stones: {new_config.stones_per_player}, Start: {new_config.start_phase}")
         print(f"{'='*60}\n")
 
         self.save_state()
@@ -831,10 +780,12 @@ class CurriculumManager:
         stats = self.stats
         wr = stats.get_win_rate()
         shaping_mult = self.get_shaping_multiplier()
+        random_moves = self.get_random_moves_for_phase()
+        pre = f"{random_moves}pre" if random_moves >= 0 else "0-150pre"
 
         parts = [
             f"Phase {int(self.current_phase)}/10",
-            f"{config.stones_per_player}s/{config.start_phase[:4]}",
+            pre,
             f"WR:{wr:.0%}",
             f"Shape:{shaping_mult:.2f}",
         ]
@@ -845,14 +796,55 @@ class CurriculumManager:
 
         return " | ".join(parts)
 
+    def get_active_minimax_max_depth(self) -> int:
+        """Get currently unlocked maximum minimax depth (starts at 2, max 4)."""
+        return self.mixed_state.active_minimax_max_depth
+
+    def check_and_unlock_minimax_depth(self) -> bool:
+        """
+        Progressively unlock harder minimax depths based on win rate:
+        - D3 unlocks when WR vs D1 >= 80% over last 500 games (min 100 games)
+        - D4 unlocks when WR vs D2 >= 80% over last 500 games (min 100 games)
+        Returns True if a new depth was unlocked.
+        """
+        config = self.get_config()
+        if config.opponent_type != 'mixed':
+            return False
+
+        ms = self.mixed_state
+        unlocked = False
+
+        # Unlock D3 when WR vs D1 > 80%
+        if ms.active_minimax_max_depth < 3:
+            if len(ms.results_vs_minimax_d1) >= 100:
+                wr_d1 = ms.get_win_rate_vs_opponent('minimax', 1)
+                if wr_d1 >= 0.80:
+                    ms.active_minimax_max_depth = 3
+                    print(f"\n  [Depth Unlock] D3 minimax unlocked! (WR vs D1: {wr_d1:.0%})")
+                    unlocked = True
+
+        # Unlock D4 when WR vs D2 > 80%
+        if ms.active_minimax_max_depth < 4:
+            if len(ms.results_vs_minimax_d2) >= 100:
+                wr_d2 = ms.get_win_rate_vs_opponent('minimax', 2)
+                if wr_d2 >= 0.80:
+                    ms.active_minimax_max_depth = 4
+                    print(f"\n  [Depth Unlock] D4 minimax unlocked! (WR vs D2: {wr_d2:.0%})")
+                    unlocked = True
+
+        return unlocked
+
     def get_opponent_win_rates(self) -> Dict[str, float]:
         """Get win rates vs each opponent type (last 500 games)."""
         ms = self.mixed_state
         return {
             'wr_vs_mm_d1': ms.get_win_rate_vs_opponent('minimax', 1),
             'wr_vs_mm_d2': ms.get_win_rate_vs_opponent('minimax', 2),
+            'wr_vs_mm_d3': ms.get_win_rate_vs_opponent('minimax', 3),
+            'wr_vs_mm_d4': ms.get_win_rate_vs_opponent('minimax', 4),
             'wr_vs_random': ms.get_win_rate_vs_opponent('random'),
             'wr_vs_self': ms.get_win_rate_vs_opponent('self'),
+            'active_mm_max_depth': ms.active_minimax_max_depth,
         }
 
     def save_state(self, path: Optional[str] = None):
@@ -882,6 +874,7 @@ class CurriculumManager:
                 'games_vs_self': self.mixed_state.games_vs_self,
                 'minimax_wins_by_depth': dict(self.mixed_state.minimax_wins_by_depth),
                 'minimax_winrate_snapshots': self.mixed_state.minimax_winrate_snapshots,
+                'active_minimax_max_depth': self.mixed_state.active_minimax_max_depth,
             },
         }
 
@@ -924,6 +917,7 @@ class CurriculumManager:
                     games_vs_random=ms.get('games_vs_random', 0),
                     games_vs_minimax=ms.get('games_vs_minimax', 0),
                     games_vs_self=ms.get('games_vs_self', 0),
+                    active_minimax_max_depth=ms.get('active_minimax_max_depth', 2),
                 )
                 if 'minimax_wins_by_depth' in ms:
                     self.mixed_state.minimax_wins_by_depth = {
@@ -933,7 +927,6 @@ class CurriculumManager:
 
             config = self.get_config()
             print(f"  Loaded curriculum: Phase {int(self.current_phase)}, {self.total_episodes:,} episodes")
-            print(f"  Game: {config.stones_per_player} stones, {config.start_phase}")
             return True
         except Exception as e:
             print(f"  Failed to load curriculum state: {e}")
@@ -970,23 +963,3 @@ class CurriculumManager:
         print("="*60 + "\n")
 
 
-def calculate_win_reward(steps: int, max_steps: int = 200) -> float:
-    """Calculate win reward based on game length."""
-    if steps < 50:
-        return 2.0
-    elif steps < 100:
-        return 1.5 + 0.5 * (100 - steps) / 50
-    elif steps < 150:
-        return 1.0 + 0.5 * (150 - steps) / 50
-    else:
-        return 1.0
-
-
-def calculate_loss_penalty(steps: int, base_penalty: float = -1.5) -> float:
-    """Calculate loss penalty based on game length."""
-    if steps < 30:
-        return base_penalty * 1.33
-    elif steps < 60:
-        return base_penalty
-    else:
-        return base_penalty * 0.67

@@ -32,16 +32,6 @@ from minimax import MinimaxBot
 import pyspiel
 from game_wrapper import load_game as load_game_fixed
 
-# Import random_train model with alias to avoid conflicts
-sys.path.insert(0, str(Path(__file__).parent / "random_train"))
-try:
-    from random_train.model import ActorCritic as RandomTrainActorCritic
-    from random_train.config import Config as RandomTrainConfig
-    RANDOM_TRAIN_AVAILABLE = True
-except ImportError:
-    RANDOM_TRAIN_AVAILABLE = False
-    print("Warning: Random train model not available")
-
 app = Flask(__name__)
 
 # Game constants - using pyspiel with position 0 bug fix
@@ -81,22 +71,6 @@ POINT_TO_COORD = {
 }
 
 COORD_TO_POINT = {v: k for k, v in POINT_TO_COORD.items()}
-
-# Adjacent positions for each point (row-by-row numbering)
-# Cross connections: 1<->4<->7, 9<->10<->11, 12<->13<->14, 16<->19<->22
-ADJACENCY = {
-    # Top rows
-    0: [1, 9], 1: [0, 2, 4], 2: [1, 14],
-    3: [4, 10], 4: [1, 3, 5, 7], 5: [4, 13],
-    6: [7, 11], 7: [4, 6, 8, 16], 8: [7, 12],
-    # Middle row
-    9: [0, 10, 21], 10: [3, 9, 11, 18], 11: [6, 10, 15],
-    12: [8, 13, 17], 13: [5, 12, 14, 20], 14: [2, 13, 23],
-    # Bottom rows
-    15: [11, 16], 16: [7, 15, 17, 19], 17: [12, 16],
-    18: [10, 19], 19: [16, 18, 20, 22], 20: [13, 19],
-    21: [9, 22], 22: [19, 21, 23], 23: [14, 22],
-}
 
 
 @dataclass
@@ -148,26 +122,6 @@ def get_available_models() -> List[Dict[str, str]]:
                 "type": "claude"
             })
 
-    # Check random_train/models directory
-    random_train_models_dir = Path(__file__).parent / "random_train" / "models"
-    if random_train_models_dir.exists():
-        for pt_file in sorted(random_train_models_dir.glob("*.pt"), reverse=True):
-            models.append({
-                "name": f"random_train/{pt_file.name}",
-                "path": str(pt_file),
-                "type": "random_train"
-            })
-
-    # Check random_train/checkpoints directory
-    random_train_checkpoints_dir = Path(__file__).parent / "random_train" / "checkpoints"
-    if random_train_checkpoints_dir.exists():
-        for pt_file in sorted(random_train_checkpoints_dir.glob("*.pt"), reverse=True):
-            models.append({
-                "name": f"random_train/checkpoints/{pt_file.name}",
-                "path": str(pt_file),
-                "type": "random_train"
-            })
-
     # Check models directory
     models_dir = Path(__file__).parent / "models"
     if models_dir.exists():
@@ -177,7 +131,7 @@ def get_available_models() -> List[Dict[str, str]]:
                 models.append({
                     "name": f"models/{pt_file.name}",
                     "path": str(pt_file),
-                    "type": "gemini"
+                    "type": "claude"
                 })
 
     return models
@@ -187,15 +141,8 @@ def load_model(model_info: Dict[str, str]) -> Tuple[Any, str]:
     """Load a model from disk."""
     model_type = model_info["type"]
 
-    if model_type == "random_train":
-        if not RANDOM_TRAIN_AVAILABLE:
-            raise ImportError("Random train model not available")
-        config = RandomTrainConfig()
-        model = RandomTrainActorCritic(OBS_SIZE, NUM_ACTIONS, config).to(DEVICE)
-    else:
-        # Default to claude model for 'claude' and other types
-        config = Config()
-        model = ActorCritic(OBS_SIZE, NUM_ACTIONS, config).to(DEVICE)
+    config = Config()
+    model = ActorCritic(OBS_SIZE, NUM_ACTIONS, config).to(DEVICE)
 
     checkpoint = torch.load(model_info["path"], map_location=DEVICE, weights_only=False)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -246,9 +193,9 @@ def get_board_state() -> Dict[str, Any]:
     # Get legal actions to understand board state
     legal = state.legal_actions()
 
-    # Count pieces - W for player 0, B for player 1
-    p0_pieces = state_str.count('W')
-    p1_pieces = state_str.count('B')
+    # Count pieces - 'o'/'O' for player 0, 'x'/'X' for player 1
+    p0_pieces = state_str.count('o') + state_str.count('O')
+    p1_pieces = state_str.count('x') + state_str.count('X')
 
     # Determine phase by checking the state string for capture indicator
     # and by analyzing legal actions
@@ -1548,7 +1495,10 @@ if __name__ == '__main__':
     print(f"Device: {DEVICE}")
     print(f"Available models: {len(get_available_models())}")
     print()
-    print("Open http://192.168.178.23:7860 in your browser")
+    import socket
+    hostname = socket.gethostname()
+    local_ip = socket.gethostbyname(hostname)
+    print(f"Open http://{local_ip}:7860 in your browser")
     print("=" * 60)
 
     app.run(host='0.0.0.0', port=7860, debug=True, use_reloader=False)

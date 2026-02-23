@@ -4,7 +4,8 @@ Game helpers, reward calculation, and experience data structures
 """
 
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
+import random
 import numpy as np
 
 
@@ -31,27 +32,6 @@ def count_pieces_from_state(state, player: int) -> Tuple[int, int]:
         return p0_pieces, p1_pieces
     else:
         return p1_pieces, p0_pieces
-
-
-def detect_mill(state, player: int) -> bool:
-    """
-    Check if a mill was just formed by looking at state.
-    This is a simplified check - in practice you'd track state changes.
-    """
-    # Mill detection would require comparing before/after states
-    # For now, we detect mills through piece count changes
-    return False
-
-
-def count_mills(state_str: str, player: int) -> int:
-    """
-    Count the number of mills for a player.
-    This is a heuristic based on board patterns.
-    """
-    # Nine Men's Morris mill positions (simplified)
-    # A mill is 3 pieces in a row on the board
-    # This would need proper board parsing - placeholder for now
-    return 0
 
 
 class RewardCalculator:
@@ -189,81 +169,24 @@ class ExperienceBatch:
     minimax_depth: int = 0  # Depth if opponent is minimax
 
 
-class BoardAnalyzer:
-    """
-    Analyzes Nine Men's Morris board state for reward shaping.
-    """
-    
-    # Mill positions on the board (groups of 3 that form mills)
-    # Row-by-row numbering:
-    #     0-----------1-----------2
-    #     |           |           |
-    #     |     3-----4-----5     |
-    #     |     |     |     |     |
-    #     |     |  6--7--8  |     |
-    #     |     |  |     |  |     |
-    #     9----10-11    12-13----14
-    #     |     |  |     |  |     |
-    #     |     | 15-16-17  |     |
-    #     |     |     |     |     |
-    #     |    18----19----20     |
-    #     |           |           |
-    #    21----------22----------23
-    MILL_POSITIONS = [
-        # Outer square sides
-        [0, 1, 2], [0, 9, 21], [2, 14, 23], [21, 22, 23],
-        # Middle square sides
-        [3, 4, 5], [3, 10, 18], [5, 13, 20], [18, 19, 20],
-        # Inner square sides
-        [6, 7, 8], [6, 11, 15], [8, 12, 17], [15, 16, 17],
-        # Cross connections
-        [1, 4, 7], [9, 10, 11], [12, 13, 14], [16, 19, 22],
-    ]
-    
-    @staticmethod
-    def parse_board(state_str: str) -> Dict[int, Optional[int]]:
-        """
-        Parse board state string into position -> player mapping.
-        Returns dict with position index -> player (0, 1, or None for empty)
-        """
-        # This is a simplified parser - actual implementation depends on
-        # how pyspiel formats the Nine Men's Morris state string
-        board = {}
-        
-        # Count pieces as a simple heuristic
-        for i, char in enumerate(state_str):
-            if char in 'oO':
-                board[i] = 0
-            elif char in 'xX':
-                board[i] = 1
-        
-        return board
-    
-    @classmethod
-    def count_potential_mills(cls, board: Dict[int, Optional[int]], player: int) -> int:
-        """Count positions where player is one move away from a mill."""
-        potential = 0
-        
-        for mill in cls.MILL_POSITIONS:
-            player_count = sum(1 for pos in mill if board.get(pos) == player)
-            empty_count = sum(1 for pos in mill if board.get(pos) is None)
-            
-            # Two pieces + one empty = potential mill
-            if player_count == 2 and empty_count == 1:
-                potential += 1
-        
-        return potential
-    
-    @classmethod
-    def can_block_mill(cls, board: Dict[int, Optional[int]], player: int) -> bool:
-        """Check if player can block opponent's potential mill."""
-        opponent = 1 - player
-        
-        for mill in cls.MILL_POSITIONS:
-            opp_count = sum(1 for pos in mill if board.get(pos) == opponent)
-            empty_count = sum(1 for pos in mill if board.get(pos) is None)
-            
-            if opp_count == 2 and empty_count == 1:
-                return True
-        
-        return False
+def prepare_game_state(state, random_moves: int):
+    """Play random vs random moves to prepare a mid-game board position (not recorded)."""
+    moves_made = 0
+    while moves_made < random_moves and not state.is_terminal():
+        # Stop early if either player is down to 3 stones (about to enter jumping phase)
+        try:
+            obs = state.observation_tensor(0)
+            p0_pieces = sum(1 for i in range(24) if obs[i] == 1)
+            p1_pieces = sum(1 for i in range(24) if obs[i + 24] == 1)
+            if p0_pieces <= 3 or p1_pieces <= 3:
+                break
+        except:
+            pass
+
+        legal_actions = state.legal_actions()
+        if not legal_actions:
+            break
+
+        action = random.choice(legal_actions)
+        state.apply_action(action)
+        moves_made += 1

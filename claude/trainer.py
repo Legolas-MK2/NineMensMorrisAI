@@ -4,12 +4,11 @@ Main training loop with phased curriculum progression
 
 Phase Structure:
 - Phase 1: 3 stones jumping, vs random (warmup)
-- Phase 2-8: 3-9 stones, mixed opponents (30% minimax, 50% self, 20% random)
-- Phase 9: Full game (placing phase), mixed opponents
+- Phase 2-9: 3-9 stones, mixed opponents (30% minimax, 60% self, 10% random)
+- Phase 10: Full game, harder minimax (35% minimax, 55% self, 10% random)
 """
 
 import os
-import math
 import time
 import csv
 import random
@@ -17,26 +16,24 @@ import queue
 from collections import deque
 from typing import List, Tuple, Dict, Optional
 import multiprocessing as mp
-from multiprocessing import Process, Queue, Event, Value
+from multiprocessing import Process, Queue, Event
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 
-import pyspiel
 from game_wrapper import load_game as load_game_fixed
 
 from config import Config
 from model import ActorCritic
-from utils import get_legal_mask, ExperienceBatch
+from utils import get_legal_mask, ExperienceBatch, prepare_game_state
 from minimax import evaluate_vs_minimax, format_minimax_results
 from worker import worker_process
 from curriculum import (
     CurriculumManager, Phase, PHASE_CONFIGS, MIXED_CONFIG,
-    calculate_win_reward, calculate_loss_penalty
 )
-from minimax import MinimaxBot
+from shared_cache import SharedMoveCache
 
 
 class PPOTrainer:
@@ -127,10 +124,8 @@ class PPOTrainer:
             new_config = PHASE_CONFIGS.get(new_phase)
             if new_config and new_config.opponent_type == 'mixed':
                 self._update_clone_model()
-
-        # Phase 10: Update minimax depth range to D1-D4
-        if new_phase == Phase.PHASE_10:
-            self._broadcast_minimax_range(min_depth=1, max_depth=4)
+                # New mixed phase starts at D1-D2; D3/D4 unlock progressively via win rate
+                self._broadcast_minimax_range(min_depth=1, max_depth=2)
 
     def _broadcast_minimax_range(self, min_depth: int, max_depth: int):
         """Send minimax depth range to all workers."""
@@ -158,7 +153,7 @@ class PPOTrainer:
         self._broadcast_clone_update()
 
     def _on_clone_update(self):
-        """Callback when clone should be updated (90% WR over 5000 games)."""
+        """Callback when clone should be updated (85% WR over 1000 games)."""
         self._update_clone_model()
 
     def _broadcast_clone_update(self):
@@ -233,16 +228,16 @@ class PPOTrainer:
         self.request_queue = mp.Queue()
         self.experience_queue = mp.Queue()
 
-        # Shared minimax move cache for D1/D2 across all workers
-        # Max ~180GB: ~150 bytes/entry in Manager dict → ~1.2B entries
-        MINIMAX_CACHE_MAX_ENTRIES = int(180 * (1024**3) / 150)
-        self.cache_manager = mp.Manager()
-        self.minimax_move_cache = self.cache_manager.dict()
-        self.minimax_cache_max_entries = MINIMAX_CACHE_MAX_ENTRIES
+        # Shared move cache: 20 GB lock-free shared memory hash table (D1/D2 only)
+        # TT budget: 130 GB split across workers for alpha-beta search (D1-D4)
+        MOVE_CACHE_GB = 20.0
+        TT_BUDGET_MB = 130 * 1024
+        self.shared_move_cache = SharedMoveCache(size_gb=MOVE_CACHE_GB, create=True)
+        tt_budget_per_worker = TT_BUDGET_MB // max(1, self.config.num_workers)
 
         shared_state = {
-            'minimax_move_cache': self.minimax_move_cache,
-            'minimax_cache_max_entries': MINIMAX_CACHE_MAX_ENTRIES,
+            'shm_cache_size_gb': MOVE_CACHE_GB,
+            'tt_budget_mb': tt_budget_per_worker,
         }
 
         for i in range(self.config.num_workers):
@@ -280,6 +275,10 @@ class PPOTrainer:
         self._broadcast_game_settings()
         self._broadcast_curriculum_update()
 
+        # Set initial minimax range: start at D1-D2, unlock D3/D4 progressively
+        active_max = self.curriculum.get_active_minimax_max_depth()
+        self._broadcast_minimax_range(min_depth=1, max_depth=active_max)
+
         # Initialize clone for mixed phases
         config = self.curriculum.get_config()
         if config.opponent_type == 'mixed':
@@ -298,13 +297,12 @@ class PPOTrainer:
             if p.is_alive():
                 p.terminate()
 
-        # Clean up shared cache manager
-        if hasattr(self, 'cache_manager'):
+        # Clean up shared memory move cache
+        if hasattr(self, 'shared_move_cache'):
             try:
-                cache_size = len(self.minimax_move_cache)
-                print(f"  Minimax move cache: {cache_size:,} entries")
-                self.cache_manager.shutdown()
-            except:
+                self.shared_move_cache.close()
+                self.shared_move_cache.unlink()
+            except Exception:
                 pass
 
     def pause_workers(self):
@@ -534,28 +532,6 @@ class PPOTrainer:
 
         return metrics
 
-    def _prepare_game_state(self, state, random_moves: int):
-        """Play random moves to prepare the board state (not recorded)."""
-        moves_made = 0
-        while moves_made < random_moves and not state.is_terminal():
-            # Check if either player has only 3 stones - stop early
-            try:
-                obs = state.observation_tensor(0)
-                p0_pieces = sum(1 for i in range(24) if obs[i] == 1)
-                p1_pieces = sum(1 for i in range(24) if obs[i + 24] == 1)
-                if p0_pieces <= 3 or p1_pieces <= 3:
-                    break
-            except:
-                pass
-
-            legal_actions = state.legal_actions()
-            if not legal_actions:
-                break
-
-            action = random.choice(legal_actions)
-            state.apply_action(action)
-            moves_made += 1
-
     def evaluate_vs_random(self, num_games: int = 200) -> float:
         """Evaluate model against random opponent."""
         game = load_game_fixed("nine_mens_morris")
@@ -570,7 +546,7 @@ class PPOTrainer:
                 state = game.new_initial_state()
 
                 # Prepare board with random moves
-                self._prepare_game_state(state, random_moves)
+                prepare_game_state(state, random_moves)
 
                 # Skip if game ended during preparation
                 if state.is_terminal():
@@ -657,8 +633,11 @@ class PPOTrainer:
             f"LR: {metrics.get('lr', 0):.1e} | "
             f"{eps_per_sec:.0f}/s"
         )
+        active_max = opp_wr['active_mm_max_depth']
+        d3_str = f" D3:{opp_wr['wr_vs_mm_d3']:.0%}" if active_max >= 3 else " D3:locked"
+        d4_str = f" D4:{opp_wr['wr_vs_mm_d4']:.0%}" if active_max >= 4 else " D4:locked"
         print(f"  Minimax: {minimax_str}")
-        print(f"  WR(500): D1:{opp_wr['wr_vs_mm_d1']:.0%} D2:{opp_wr['wr_vs_mm_d2']:.0%} Rnd:{opp_wr['wr_vs_random']:.0%} Self:{opp_wr['wr_vs_self']:.0%}")
+        print(f"  WR(500): D1:{opp_wr['wr_vs_mm_d1']:.0%} D2:{opp_wr['wr_vs_mm_d2']:.0%}{d3_str}{d4_str} [MaxD:{active_max}] Rnd:{opp_wr['wr_vs_random']:.0%} Self:{opp_wr['wr_vs_self']:.0%}")
 
         # CSV logging
         if self.log_file is None:
@@ -668,7 +647,9 @@ class PPOTrainer:
                 'episode', 'phase', 'random_moves', 'steps', 'avg_return', 'ema_return',
                 'win_rate', 'draw_rate', 'policy_loss', 'value_loss', 'entropy', 'kl_div',
                 'clip_frac', 'grad_norm', 'lr', 'minimax_depth_beaten', 'clone_gen',
-                'wr_vs_mm_d1', 'wr_vs_mm_d2', 'wr_vs_random', 'wr_vs_self'
+                'active_mm_max_depth',
+                'wr_vs_mm_d1', 'wr_vs_mm_d2', 'wr_vs_mm_d3', 'wr_vs_mm_d4',
+                'wr_vs_random', 'wr_vs_self'
             ])
             self.log_writer.writeheader()
 
@@ -690,8 +671,11 @@ class PPOTrainer:
             'lr': metrics.get('lr', 0),
             'minimax_depth_beaten': max_depth_beaten,
             'clone_gen': self.curriculum.mixed_state.clone_generation,
+            'active_mm_max_depth': opp_wr['active_mm_max_depth'],
             'wr_vs_mm_d1': opp_wr['wr_vs_mm_d1'],
             'wr_vs_mm_d2': opp_wr['wr_vs_mm_d2'],
+            'wr_vs_mm_d3': opp_wr['wr_vs_mm_d3'],
+            'wr_vs_mm_d4': opp_wr['wr_vs_mm_d4'],
             'wr_vs_random': opp_wr['wr_vs_random'],
             'wr_vs_self': opp_wr['wr_vs_self'],
         })
@@ -717,6 +701,13 @@ class PPOTrainer:
         print(f"  Saved: {path}")
 
         self.curriculum.save_state()
+
+    def load_weights_only(self, path: str):
+        """Load only model weights from checkpoint, resetting all training state."""
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(ckpt['model_state_dict'])
+        print(f"  Loaded model weights from: {path}")
+        print(f"  Training state reset to beginning (episode 0, Phase 1)")
 
     def load_checkpoint(self, path: str):
         """Load model from checkpoint."""
@@ -801,9 +792,15 @@ class PPOTrainer:
 
                 self._update_learning_rate()
 
-                # Check for clone update (80% WR over 500 self-play games)
+                # Check for clone update (85% WR over 1000 self-play games)
                 if self.curriculum.should_update_clone():
                     self.curriculum.do_clone_update()
+
+                # Check for minimax depth unlock (D3 when D1 WR>80%, D4 when D2 WR>80%)
+                if self.curriculum.check_and_unlock_minimax_depth():
+                    new_max = self.curriculum.get_active_minimax_max_depth()
+                    self._broadcast_minimax_range(min_depth=1, max_depth=new_max)
+                    self.save_checkpoint(f"depth{new_max}_unlocked")
 
                 # Logging
                 if self.episode_count % cfg.log_interval < cfg.episodes_per_update:

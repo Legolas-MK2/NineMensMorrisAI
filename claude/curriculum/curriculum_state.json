@@ -1,96 +1,82 @@
 {
-  "current_phase": 7,
-  "total_episodes": 18200198,
+  "current_phase": 4,
+  "total_episodes": 6701227,
   "stats": {
-    "phase": 7,
-    "episodes_in_phase": 1593401,
-    "total_games": 1593401,
-    "wins": 1188153,
-    "losses": 142811,
-    "draws": 262437,
-    "best_win_rate": 0.869
+    "phase": 4,
+    "episodes_in_phase": 2900007,
+    "total_games": 2900007,
+    "wins": 1788640,
+    "losses": 465114,
+    "draws": 646253,
+    "best_win_rate": 1.0
   },
   "phase_history": [
     {
-      "phase": 1,
-      "episodes": 201706,
-      "total_games": 201706,
-      "wins": 150189,
-      "losses": 30707,
-      "draws": 20810,
-      "best_win_rate": 0.9515,
-      "clone_generations": 0,
-      "duration_seconds": 1038.2802166938782
-    },
-    {
       "phase": 2,
-      "episodes": 2330685,
-      "total_games": 2330685,
-      "wins": 1141746,
-      "losses": 963746,
-      "draws": 225193,
-      "best_win_rate": 0.9354838709677419,
-      "clone_generations": 10,
-      "duration_seconds": 59857.927543878555
+      "episodes": 1900609,
+      "total_games": 1900609,
+      "wins": 1128818,
+      "losses": 545334,
+      "draws": 226457,
+      "best_win_rate": 1.0,
+      "clone_generations": 0,
+      "graduation_reason": "stagnation",
+      "duration_seconds": 13516.616247653961
     },
     {
       "phase": 3,
-      "episodes": 1556530,
-      "total_games": 1556530,
-      "wins": 953929,
-      "losses": 397454,
-      "draws": 205147,
-      "best_win_rate": 0.82825,
-      "clone_generations": 10,
-      "duration_seconds": 36944.62968707085
-    },
-    {
-      "phase": 4,
-      "episodes": 2515043,
-      "total_games": 2515043,
-      "wins": 1782813,
-      "losses": 327657,
-      "draws": 404573,
-      "best_win_rate": 0.87975,
-      "clone_generations": 10,
-      "duration_seconds": 50392.93572449684
-    },
-    {
-      "phase": 5,
-      "episodes": 5001447,
-      "total_games": 5001447,
-      "wins": 3647771,
-      "losses": 490615,
-      "draws": 863061,
-      "best_win_rate": 0.8995,
-      "clone_generations": 2,
-      "duration_seconds": 101793.68833398819
-    },
-    {
-      "phase": 6,
-      "episodes": 5001386,
-      "total_games": 5001386,
-      "wins": 3645889,
-      "losses": 479460,
-      "draws": 876037,
-      "best_win_rate": 1.0,
-      "clone_generations": 6,
-      "duration_seconds": 103257.25674247742
+      "episodes": 1900611,
+      "total_games": 1900611,
+      "wins": 1255158,
+      "losses": 396937,
+      "draws": 248516,
+      "best_win_rate": 0.84825,
+      "clone_generations": 0,
+      "graduation_reason": "stagnation",
+      "duration_seconds": 13076.916749477386
     }
   ],
   "mixed_state": {
-    "total_episodes": 1593401,
-    "clone_generation": 1,
-    "games_vs_random": 159243,
-    "games_vs_minimax": 477601,
-    "games_vs_self": 956557,
+    "total_episodes": 2900007,
+    "clone_generation": 5,
+    "last_clone_episode": 2572327,
+    "games_vs_random": 290566,
+    "games_vs_minimax": 870094,
+    "games_vs_self": 1739347,
     "minimax_wins_by_depth": {
-      "1": 102640,
-      "2": 97496,
-      "3": 88197,
-      "4": 60519,
+      "1": 220977,
+      "2": 198432,
+      "3": 131270,
+      "4": 61220,
       "5": 0,
       "6": 0
-    }
+    },
+    "minimax_winrate_snapshots": [
+      [
+        2400000,
+        0.81
+      ],
+      [
+        2500000,
+        0.77
+      ],
+      [
+        2600000,
+        0.801
+      ],
+      [
+        2700000,
+        0.802
+      ],
+      [
+        2800000,
+        0.802
+      ],
+      [
+        2900000,
+        0.795
+      ]
+    ],
+    "active_minimax_max_depth": 4
   }
 }

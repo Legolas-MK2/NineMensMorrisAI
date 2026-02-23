@@ -19,10 +19,10 @@ class Config:
     """Training configuration - curriculum-aware."""
     
     # Training scale
-    total_episodes: int = 50_000_000  # Max episodes (curriculum may finish earlier)
-    episodes_per_update: int = 4096
-    ppo_epochs: int = 3
-    mini_batch_size: int = 1024
+    total_episodes: int = 500_000_000  # Max episodes (curriculum may finish earlier)
+    episodes_per_update: int = 16384
+    ppo_epochs: int = 5
+    mini_batch_size: int = 8192
     
     # Parallelism (optimized for Threadripper 3960X + RTX 3090)
     num_workers: int = 22

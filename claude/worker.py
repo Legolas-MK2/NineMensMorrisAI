@@ -25,6 +25,7 @@ from utils import (
     compute_gae, ExperienceBatch, RewardCalculator
 )
 from minimax import MinimaxBot
+from shared_cache import SharedMoveCache
 
 # Import pyspiel with bug fix wrapper
 import pyspiel
@@ -34,77 +35,50 @@ from game_wrapper import load_game as load_game_fixed
 class CachedMinimaxBot:
     """
     Wrapper around MinimaxBot that caches (hash → action) for D1/D2.
-    Cache is a process-local dict (shared TT already helps across games).
-    For cross-process sharing, a multiprocessing shared dict is passed in.
+
+    Two-level cache:
+      1. local_cache: per-process dict, zero overhead
+      2. shared_cache: SharedMoveCache in shared memory, zero-copy across workers
     """
 
     def __init__(self, bot: MinimaxBot, depth: int,
-                 shared_cache: Optional[Dict] = None,
-                 max_cache_entries: int = 0):
+                 shared_cache: Optional[SharedMoveCache] = None):
         self.bot = bot
         self.depth = depth
         self.random_move_prob = bot.random_move_prob
         self.bot.random_move_prob = 0.0  # handled here to avoid double roll
-        self.shared_cache = shared_cache  # mp.Manager dict or None
-        self.max_cache_entries = max_cache_entries  # 0 = unlimited
-        self.local_cache: Dict[int, int] = {}  # fast process-local cache
-        self.cache_hits = 0
-        self.cache_misses = 0
-        self._shared_cache_full = False
+        self.shared_cache = shared_cache
+        self.local_cache: Dict[int, int] = {}
 
     def get_action(self, state) -> int:
-        # Random move check
         if self.random_move_prob > 0 and random.random() < self.random_move_prob:
             return random.choice(state.legal_actions())
 
-        # Only cache D1 and D2
         if self.depth > 2:
             return self.bot.get_action(state)
 
-        # Compute hash
         h = self.bot._get_hash(state, state.current_player())
-        cache_key = h ^ (self.depth * 0x9E3779B97F4A7C15)  # mix depth into key
+        cache_key = h ^ (self.depth * 0x9E3779B97F4A7C15)
 
-        # Check local cache first (fast)
+        legal = state.legal_actions()
+
+        # 1. local cache (fastest)
         cached = self.local_cache.get(cache_key)
-        if cached is not None:
-            # Validate the cached action is still legal
-            legal = state.legal_actions()
-            if cached in legal:
-                self.cache_hits += 1
+        if cached is not None and cached in legal:
+            return cached
+
+        # 2. shared memory cache (zero-copy, no IPC)
+        if self.shared_cache is not None:
+            cached = self.shared_cache.get(cache_key)
+            if cached is not None and cached in legal:
+                self.local_cache[cache_key] = cached
                 return cached
 
-        # Check shared cache
-        if self.shared_cache is not None:
-            try:
-                cached = self.shared_cache.get(cache_key)
-                if cached is not None:
-                    legal = state.legal_actions()
-                    if cached in legal:
-                        self.cache_hits += 1
-                        self.local_cache[cache_key] = cached
-                        return cached
-            except:
-                pass  # shared cache may fail under load
-
-        # Cache miss — run minimax
-        self.cache_misses += 1
+        # cache miss — run minimax
         action = self.bot.get_action(state)
-
-        # Store in local cache
         self.local_cache[cache_key] = action
-
-        # Store in shared cache (best-effort, respects max size)
-        if self.shared_cache is not None and not self._shared_cache_full:
-            try:
-                # Check size every 10000 misses to avoid expensive IPC len()
-                if self.max_cache_entries > 0 and self.cache_misses % 10000 == 0:
-                    if len(self.shared_cache) >= self.max_cache_entries:
-                        self._shared_cache_full = True
-                        return action
-                self.shared_cache[cache_key] = action
-            except:
-                pass
+        if self.shared_cache is not None:
+            self.shared_cache[cache_key] = action
 
         return action
 
@@ -114,29 +88,40 @@ class MinimaxBotPool:
     Pool of persistent MinimaxBot instances keyed by depth.
     Reuses bots (and their transposition tables) across games.
     D1/D2 bots are wrapped with CachedMinimaxBot for move caching.
+
+    TT budget is split depth-aware: D1/D2 get small fixed allocations
+    (their search trees are tiny); D3/D4 share the remaining budget.
     """
 
-    def __init__(self, tt_budget_mb: int = 2048,
-                 shared_cache: Optional[Dict] = None,
-                 max_cache_entries: int = 0):
+    # Fixed TT for shallow depths — their search trees are tiny
+    _FIXED_TT_MB = {1: 64, 2: 256}
+
+    def __init__(self, tt_budget_mb: int = 6000,
+                 shared_cache: Optional[SharedMoveCache] = None):
         self._bots = {}
         self._tt_budget_mb = tt_budget_mb
         self._shared_cache = shared_cache
-        self._max_cache_entries = max_cache_entries
+        # MB already committed to fixed-depth bots
+        self._fixed_used_mb = sum(self._FIXED_TT_MB.values())
+
+    def _tt_for_depth(self, depth: int) -> int:
+        if depth in self._FIXED_TT_MB:
+            return self._FIXED_TT_MB[depth]
+        # Remaining budget split equally among D3+ bots (usually 2: D3 and D4)
+        remaining = max(64, self._tt_budget_mb - self._fixed_used_mb)
+        higher_depths_expected = 2  # D3 and D4
+        return max(64, remaining // higher_depths_expected)
 
     def get(self, depth: int):
         if depth not in self._bots:
-            n_depths = max(len(self._bots) + 1, 2)
-            per_depth_mb = max(64, self._tt_budget_mb // n_depths)
+            tt_mb = self._tt_for_depth(depth)
             bot = MinimaxBot(
                 max_depth=depth, random_move_prob=0.3,
-                tt_size_mb=per_depth_mb,
+                tt_size_mb=tt_mb,
             )
             if depth <= 2:
-                # Wrap D1/D2 with move cache
                 self._bots[depth] = CachedMinimaxBot(
                     bot, depth, shared_cache=self._shared_cache,
-                    max_cache_entries=self._max_cache_entries,
                 )
             else:
                 self._bots[depth] = bot
@@ -283,17 +268,19 @@ def worker_process(
     # Clone model for self-play
     clone_model: Optional[ActorCritic] = None
 
-    # Shared minimax move cache for D1/D2 (passed from trainer via shared_state)
-    minimax_move_cache = shared_state.get('minimax_move_cache', None)
-    minimax_cache_max_entries = shared_state.get('minimax_cache_max_entries', 0)
+    # Attach to the shared memory move cache created by the trainer
+    shm_size_gb = shared_state.get('shm_cache_size_gb', 20.0)
+    shared_move_cache = None
+    try:
+        shared_move_cache = SharedMoveCache.attach(size_gb=shm_size_gb)
+    except Exception as e:
+        print(f"  Worker {worker_id}: shared cache unavailable ({e}), using local only")
 
-    # Persistent minimax bot pool (shared TT across games)
-    # Budget: ~100GB total / num_workers per worker
-    tt_budget_per_worker = max(256, (100 * 1024) // max(1, config.num_workers))
+    # Persistent minimax bot pool — depth-aware TT, 130 GB total / num_workers
+    tt_budget_mb = shared_state.get('tt_budget_mb', max(256, (130 * 1024) // max(1, config.num_workers)))
     bot_pool = MinimaxBotPool(
-        tt_budget_mb=tt_budget_per_worker,
-        shared_cache=minimax_move_cache,
-        max_cache_entries=minimax_cache_max_entries,
+        tt_budget_mb=tt_budget_mb,
+        shared_cache=shared_move_cache,
     )
 
     ready_event.set()
