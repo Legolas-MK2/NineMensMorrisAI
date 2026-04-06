@@ -8,11 +8,12 @@ Phase Structure:
 - Phase 2-9: 3-9 stones, mixed opponents (30% minimax D1-D2, 65% self-play, 5% random)
              Shaping multiplier: 1.0 -> 0.0 over first 3/4 of phase, then 0.0 for last 1/4
              Resets to 1.0 at start of each new phase
-- Phase 10: Full game, no shaping (multiplier=0.0), 1M episodes, minimax D1-D6 (30% minimax, 65% self-play, 5% random)
+- Phase 10: Full game, no shaping (multiplier=0.0), 1M episodes, minimax D1-D4 (35% minimax, 55% self-play, 10% random)
 """
 
 import os
 import json
+import math
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Tuple, Any
@@ -55,8 +56,8 @@ class PhaseConfig:
     loss_reward: float = -1.0
     draw_penalty: float = -0.5
 
-    # Shaping reward multiplier (0.0 = no shaping, 1.0 = full shaping)
-    shaping_multiplier: float = 0.0  # TEMPORARILY DISABLED - set back to 1.0 to re-enable
+    # Base shaping intensity per phase (further reduced by schedule)
+    shaping_multiplier: float = 0.0
 
     # Base shaping rewards
     mill_reward: float = 0.3
@@ -73,20 +74,17 @@ class PhaseConfig:
     # Duration limits
     min_episodes: int = 0  # Minimum episodes before graduation allowed
     max_episodes: int = 0  # 0 means no limit
-    lr_decay_episodes: int = 500_000
+    lr_cycle_episodes: int = 500_000  # Cosine cycle length per clone generation
 
 
 # Mixed opponent configuration for Phase 2+
 MIXED_CONFIG = {
     # Opponent distribution - increased minimax to reduce self-play overfitting
     'opponent_mix': {
-        'minimax': 0.30,   # 30% minimax (was 15%)
+        'minimax': 0.37,   # 30% minimax (was 15%)
         'self': 0.60,      # 60% self-play (was 80%)
-        'random': 0.10,    # 10% random (was 5%)
+        'random': 0.03,    # 10% random (was 5%)
     },
-
-
-
 
     # Self-play: clone update at 85% win rate (was 90%, less aggressive)
     'selfplay_winrate_threshold': 0.85,
@@ -96,12 +94,9 @@ MIXED_CONFIG = {
     'minimax_min_depth': 1,
     'minimax_max_depth': 2,  # D1-D2 for phases 2-9
 
-    # Graduation: 5M episodes per phase
-    'graduation_episodes': 5_000_000,
-
     # Stagnation detection: graduate early if model stops improving
     'stagnation_min_episodes': 1_000_000,    # Don't trigger before 1M episodes in phase
-    'stagnation_clone_window': 1_500_000,    # Episodes without a clone update = stuck
+    'stagnation_clone_window': 3_000_000,    # Evaluate only after 3M eps since phase start / last clone
     'stagnation_snapshot_interval': 100_000, # Take minimax WR snapshot every 100k episodes
     'stagnation_snapshot_window': 5,         # Compare last 5 snapshots (= 500k episodes)
     'stagnation_threshold': 0.03,            # Must improve combined d1+d2 WR by 3%
@@ -116,7 +111,14 @@ PHASE_10_CONFIG = {
     'selfplay_winrate_games': 1000,
     'minimax_min_depth': 1,
     'minimax_max_depth': 4,  # D1-D4 for final phase
-    'graduation_episodes': 5_000_000,
+}
+
+
+# Graduation trend detection settings
+# Sample winrate every 25k episodes, keep 40 samples = 1M episode window
+GRADUATION_CONFIG = {
+    'trend_window_samples': 40,      # Number of samples to keep for trend calculation
+    'trend_max_angle_degrees': 1.0,  # Max angle (degrees) for graduation
 }
 
 
@@ -124,7 +126,7 @@ PHASE_10_CONFIG = {
 PHASE_CONFIGS = {
     Phase.PHASE_1: PhaseConfig(
         phase=Phase.PHASE_1,
-        description="Warmup: 150 random pre-moves, vs random",
+        description="Warmup: 0-150 random pre-moves, vs random",
         opponent_type='random',
         lr_start=3e-4,
         lr_end=1e-4,
@@ -133,10 +135,10 @@ PHASE_CONFIGS = {
         loss_reward=-1.0,
         draw_penalty=-0.8,
         shaping_multiplier=1.0,
-        win_rate_threshold=0.85,
+        win_rate_threshold=0.75,  # Lowered from 0.85 - 80% is sufficient for warmup
         min_games_for_graduation=2000,
-        min_episodes=200_000,  # At least 200k episodes before graduation
-        lr_decay_episodes=500_000,
+        min_episodes=100_000,  # Reduced from 200k - allow earlier graduation
+        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_2: PhaseConfig(
@@ -152,7 +154,7 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.7,
         win_rate_threshold=0.80,
         min_games_for_graduation=1000,
-        lr_decay_episodes=500_000,
+        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_3: PhaseConfig(
@@ -168,7 +170,7 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.5,
         win_rate_threshold=0.75,
         min_games_for_graduation=1000,
-        lr_decay_episodes=500_000,
+        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_4: PhaseConfig(
@@ -184,7 +186,7 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.3,
         win_rate_threshold=0.70,
         min_games_for_graduation=1000,
-        lr_decay_episodes=500_000,
+        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_5: PhaseConfig(
@@ -200,7 +202,7 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.2,
         win_rate_threshold=0.65,
         min_games_for_graduation=1000,
-        lr_decay_episodes=500_000,
+        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_6: PhaseConfig(
@@ -216,7 +218,7 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.1,
         win_rate_threshold=0.60,
         min_games_for_graduation=1000,
-        lr_decay_episodes=500_000,
+        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_7: PhaseConfig(
@@ -232,7 +234,7 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.05,
         win_rate_threshold=0.55,
         min_games_for_graduation=1000,
-        lr_decay_episodes=500_000,
+        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_8: PhaseConfig(
@@ -248,7 +250,7 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.0,
         win_rate_threshold=0.50,
         min_games_for_graduation=1000,
-        lr_decay_episodes=500_000,
+        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_9: PhaseConfig(
@@ -264,7 +266,7 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.0,
         win_rate_threshold=0.50,
         min_games_for_graduation=1000,
-        lr_decay_episodes=5_000_000,
+        lr_cycle_episodes=5_000_000,
     ),
 
     Phase.PHASE_10: PhaseConfig(
@@ -280,8 +282,8 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.0,  # No shaping rewards
         win_rate_threshold=0.50,
         min_games_for_graduation=1000,
-        max_episodes=1_000_000,  # Fixed 1M episodes
-        lr_decay_episodes=1_000_000,
+        max_episodes=0,  # No fixed limit - uses trend-based graduation
+        lr_cycle_episodes=1_000_000,
     ),
 }
 
@@ -318,6 +320,10 @@ class MixedTrainingState:
     results_vs_minimax_d4: deque = field(default_factory=lambda: deque(maxlen=500))
     results_vs_self: deque = field(default_factory=lambda: deque(maxlen=500))
 
+    # Winrate history for trend-based graduation (phases 2+)
+    # Samples combined minimax winrate every 25k episodes, keeps 40 samples (1M episode window)
+    minimax_wr_history: deque = field(default_factory=lambda: deque(maxlen=40))
+
     def get_selfplay_win_rate(self) -> float:
         """Get win rate from last N self-play games."""
         if len(self.selfplay_results) < 50:
@@ -334,6 +340,8 @@ class MixedTrainingState:
     def on_clone_updated(self):
         """Called when clone is updated."""
         self.selfplay_results.clear()
+        # Reset stagnation history so the next stagnation window starts fresh.
+        self.minimax_winrate_snapshots.clear()
         self.clone_generation += 1
         self.last_clone_episode = self.total_episodes
 
@@ -345,6 +353,15 @@ class MixedTrainingState:
     def get_combined_minimax_win_rate(self) -> float:
         """Get combined win rate vs minimax d1 and d2 (last 500 games each)."""
         combined = list(self.results_vs_minimax_d1) + list(self.results_vs_minimax_d2)
+        if len(combined) < 20:
+            return 0.0
+        wins = sum(1 for r in combined if r == 'win')
+        return wins / len(combined)
+
+    def get_combined_minimax_win_rate_phase10(self) -> float:
+        """Get combined win rate vs minimax d1-d4 for phase 10 (last 500 games each)."""
+        combined = list(self.results_vs_minimax_d1) + list(self.results_vs_minimax_d2) + \
+                   list(self.results_vs_minimax_d3) + list(self.results_vs_minimax_d4)
         if len(combined) < 20:
             return 0.0
         wins = sum(1 for r in combined if r == 'win')
@@ -386,6 +403,47 @@ class MixedTrainingState:
             self.results_vs_minimax_d4.append(result_str)
         elif opponent_type == 'self':
             self.results_vs_self.append(result_str)
+
+    def calculate_winrate_trend(self, active_max_depth: int) -> float:
+        """
+        Calculate the trend (slope) of combined minimax winrate using linear regression.
+        
+        Uses least-squares regression on the winrate history.
+        Returns the slope as winrate change per episode.
+        
+        For phase 2-9: uses D1+D2 combined winrate
+        For phase 10: uses D1+D2+D3+D4 combined winrate
+        """
+        if len(self.minimax_wr_history) < 10:
+            # Not enough samples for reliable trend
+            return float('inf')  # Don't graduate yet
+        
+        # Convert deque to list for indexing
+        history = list(self.minimax_wr_history)
+        
+        # Use linear regression: y = mx + b, we want m (slope)
+        n = len(history)
+        x = np.arange(n)  # Sample indices (0, 1, 2, ...)
+        y = np.array(history)  # Winrate values
+        
+        # Least squares: m = (n*sum(xy) - sum(x)*sum(y)) / (n*sum(x^2) - (sum(x))^2)
+        sum_x = np.sum(x)
+        sum_y = np.sum(y)
+        sum_xy = np.sum(x * y)
+        sum_x2 = np.sum(x ** 2)
+        
+        denominator = n * sum_x2 - sum_x ** 2
+        if abs(denominator) < 1e-10:
+            return 0.0
+        
+        slope_per_sample = (n * sum_xy - sum_x * sum_y) / denominator
+        
+        # Convert slope from "per sample" to "per episode"
+        # Each sample is 25,000 episodes apart (log_interval)
+        episodes_per_sample = 25000
+        slope_per_episode = slope_per_sample / episodes_per_sample
+        
+        return slope_per_episode
 
 
 @dataclass
@@ -487,8 +545,12 @@ class CurriculumManager:
 
         phase_num = int(self.current_phase)
 
-        # Phase 1-2: 150 random moves
-        if phase_num <= 2:
+        # Phase 1: random between 0 and 150 (signal with -1)
+        if phase_num == 1:
+            return -1
+
+        # Phase 2: 150 random moves
+        if phase_num == 2:
             return 150
 
         # Phase 9: 0 random moves
@@ -507,43 +569,64 @@ class CurriculumManager:
         return max(0, moves)
 
     def get_learning_rate(self) -> float:
-        """Get current learning rate."""
+        """Cosine annealing that restarts at lr_start on every clone update.
+
+        For Phase 1 (random-only): decays over the full phase.
+        For Phase 2+ (mixed): each clone generation gets its own cosine cycle,
+        restarting from lr_start whenever a new clone is deployed.
+        """
         config = self.get_config()
-        progress = min(1.0, self.stats.episodes_in_phase / config.lr_decay_episodes)
-        return config.lr_start + progress * (config.lr_end - config.lr_start)
+
+        if config.opponent_type != 'mixed':
+            # Phase 1: one cosine cycle over the whole phase
+            eps = self.stats.episodes_in_phase
+        else:
+            # Phase 2+: restart cycle on every clone update
+            # last_clone_episode == 0 at phase start, so first cycle begins fresh
+            eps = self.mixed_state.total_episodes - self.mixed_state.last_clone_episode
+
+        progress = min(1.0, eps / config.lr_cycle_episodes)
+        return config.lr_end + 0.5 * (config.lr_start - config.lr_end) * (1.0 + math.cos(math.pi * progress))
 
     def get_shaping_multiplier(self) -> float:
         """
         Get current shaping multiplier based on phase and progress.
 
-        - Phase 1: Static 1.0 (full shaping)
-        - Phase 2-9: Starts at 1.0, linearly decreases to 0 at 3/4 of phase,
+        Low-shaping schedule (intentionally conservative):
+        - Phase 1: small fixed shaping
+        - Phase 2-9: small shaping that decays to 0 at 3/4 of phase,
                      then stays at 0 for the last 1/4. Resets each phase.
         - Phase 10: Always 0.0 (no shaping)
+        
+        Uses trend-based graduation (not fixed episode count).
+        Shaping decays over lr_cycle_episodes to ensure it reaches 0 before
+        trend-based graduation typically occurs (~1-2M episodes).
         """
-        # TEMPORARILY DISABLED - remove this early return to re-enable shaping
-        return 0.0
-
         if self.current_phase == Phase.COMPLETED:
             return 0.0
-
-        if self.current_phase == Phase.PHASE_1:
-            return 1.0
 
         if self.current_phase == Phase.PHASE_10:
             return 0.0
 
-        # Phase 2-9: Dynamic shaping based on progress
-        graduation_episodes = MIXED_CONFIG['graduation_episodes']
-        progress = self.mixed_state.total_episodes / graduation_episodes
+        cfg = self.get_config()
+        base = min(0.20, max(0.0, cfg.shaping_multiplier * 0.25))
 
-        # First 3/4: linear decay from 1.0 to 0.0
+        if self.current_phase == Phase.PHASE_1:
+            return base
+
+        # Phase 2-9: Dynamic low shaping based on phase progress
+        # Use lr_cycle_episodes as the reference timescale for shaping decay
+        # This ensures shaping reaches 0 around the time plateau detection kicks in
+        decay_episodes = cfg.lr_cycle_episodes
+        progress = min(1.0, self.stats.episodes_in_phase / decay_episodes)
+
+        # First 3/4: linear decay from base to 0.0
         # Last 1/4: stay at 0.0
         if progress >= 0.75:
             return 0.0
         else:
-            # Linear interpolation: 1.0 at progress=0, 0.0 at progress=0.75
-            return 1.0 - (progress / 0.75)
+            # Linear interpolation: base at progress=0, 0.0 at progress=0.75
+            return base * (1.0 - (progress / 0.75))
 
     def get_reward_config(self) -> Dict[str, float]:
         """Get current reward configuration."""
@@ -562,7 +645,9 @@ class CurriculumManager:
             'double_mill_extra_reward': config.double_mill_extra_reward * mult,
             'setup_capture_reward': config.setup_capture_reward * mult,
             'step_penalty': -0.003,
-            'piece_advantage_reward': 0.02,
+            'piece_advantage_reward': 0.02 * mult,
+            'mobility_reward': 0.004 * mult,
+            'max_shaping_abs': 0.20,
         }
 
     def add_game_result(self, result: float, opponent_type: str = 'random', minimax_depth: int = 0):
@@ -648,10 +733,12 @@ class CurriculumManager:
     def is_stagnating(self) -> bool:
         """
         Check if the model has stopped improving enough to warrant moving to next phase.
-        Triggers when BOTH conditions hold:
-          1. No new clone in the last 1.5M episodes (model can't beat its own old self)
+        Triggers when BOTH conditions hold after a waiting window:
+          1. Self-play win rate is still below the clone-update threshold
           2. Combined minimax d1+d2 win rate has not improved by 3%+ over last 500k episodes
-        Only activates after 1M episodes in the phase.
+
+        The waiting window is measured since the latest clone update (or phase start),
+        so every clone reset restarts the 3M stagnation clock from zero.
         """
         config = self.get_config()
         if config.opponent_type != 'mixed':
@@ -661,9 +748,12 @@ class CurriculumManager:
         if ms.total_episodes < MIXED_CONFIG['stagnation_min_episodes']:
             return False
 
-        # Condition 1: stuck on same clone for too long
         episodes_since_clone = ms.total_episodes - ms.last_clone_episode
-        clone_stuck = episodes_since_clone >= MIXED_CONFIG['stagnation_clone_window']
+        if episodes_since_clone < MIXED_CONFIG['stagnation_clone_window']:
+            return False
+
+        # Condition 1: still not reliably beating current clone.
+        selfplay_stuck = ms.get_selfplay_win_rate() < MIXED_CONFIG['selfplay_winrate_threshold']
 
         # Condition 2: minimax win rate not improving
         window = MIXED_CONFIG['stagnation_snapshot_window']
@@ -675,7 +765,62 @@ class CurriculumManager:
             newest_wr = snapshots[-1][1]
             minimax_flat = (newest_wr - oldest_wr) < MIXED_CONFIG['stagnation_threshold']
 
-        return clone_stuck and minimax_flat
+        return selfplay_stuck and minimax_flat
+
+    def sample_minimax_winrate(self):
+        """
+        Sample combined minimax winrate for trend-based graduation.
+        Call this at log_interval (every 25,000 episodes).
+        
+        For Phase 2-9: samples D1+D2 combined winrate
+        For Phase 10: samples D1+D2+D3+D4 combined winrate
+        """
+        config = self.get_config()
+        if config.opponent_type != 'mixed':
+            return
+        
+        active_max_depth = self.mixed_state.active_minimax_max_depth
+        
+        if active_max_depth >= 4:
+            # Phase 10 or unlocked D4 - use all depths
+            wr = self.mixed_state.get_combined_minimax_win_rate_phase10()
+        else:
+            # Phase 2-9 - use D1+D2
+            wr = self.mixed_state.get_combined_minimax_win_rate()
+        
+        self.mixed_state.minimax_wr_history.append(wr)
+
+    def _has_plateaued(self) -> bool:
+        """
+        Check if the model has plateaued based on winrate trend.
+        
+        Returns True if the trend slope is < tan(1°) ≈ 0.0175 per 1M episodes
+        (i.e., learning has plateaued or is declining).
+        """
+        config = self.get_config()
+        if config.opponent_type != 'mixed':
+            return False
+        
+        # Need enough samples for reliable trend
+        if len(self.mixed_state.minimax_wr_history) < GRADUATION_CONFIG['trend_window_samples']:
+            return False
+        
+        # Calculate trend (slope per episode)
+        slope_per_episode = self.mixed_state.calculate_winrate_trend(
+            self.mixed_state.active_minimax_max_depth
+        )
+        
+        # Convert to angle: slope over 1M episodes
+        # tan(angle) = slope * 1_000_000
+        # angle = atan(slope * 1_000_000)
+        slope_per_million = slope_per_episode * 1_000_000
+        angle_degrees = math.degrees(math.atan(slope_per_million))
+        
+        # Graduate if angle < 1 degree (trend is flat or declining)
+        max_angle = GRADUATION_CONFIG['trend_max_angle_degrees']
+        plateaued = angle_degrees < max_angle
+        
+        return plateaued
 
     def should_graduate(self) -> bool:
         """Check if ready to move to next phase."""
@@ -697,19 +842,9 @@ class CurriculumManager:
         if config.opponent_type == 'random':
             return stats.get_win_rate() >= config.win_rate_threshold
 
-        # Phase 10: 5M episodes or stagnation
-        if self.current_phase == Phase.PHASE_10:
-            if self.mixed_state.total_episodes >= PHASE_10_CONFIG['graduation_episodes']:
-                return True
-            return self.is_stagnating()
-
-        # Phase 2-9: 5M episodes or stagnation
-        if self.mixed_state.total_episodes >= MIXED_CONFIG['graduation_episodes']:
-            return True
-        if self.is_stagnating():
-            return True
-
-        return False
+        # Phase 2-10: Trend-based graduation only
+        # Advance strictly when minimax trend angle is below threshold.
+        return self._has_plateaued()
 
     def graduate(self) -> bool:
         """Move to next phase. Returns True if graduated."""
@@ -717,8 +852,11 @@ class CurriculumManager:
             return False
 
         # Determine graduation reason for logging
-        stagnated = self.is_stagnating()
-        graduation_reason = 'stagnation' if stagnated else 'episodes'
+        config = self.get_config()
+        if config.opponent_type == 'mixed':
+            graduation_reason = 'plateau (trend < 1°)'
+        else:
+            graduation_reason = f"win rate >= {config.win_rate_threshold:.0%}"
 
         # Save phase history
         self.phase_history.append({
@@ -792,7 +930,13 @@ class CurriculumManager:
 
         if config.opponent_type == 'mixed':
             ms = self.mixed_state
-            parts.append(f"Clone:{ms.clone_generation}")
+            parts.append(f"clone gen:{ms.clone_generation}")
+            # Add trend info
+            if len(ms.minimax_wr_history) >= 10:
+                slope = ms.calculate_winrate_trend(ms.active_minimax_max_depth)
+                slope_per_million = slope * 1_000_000
+                angle = math.degrees(math.atan(slope_per_million)) if abs(slope_per_million) < 1e6 else float('inf')
+                parts.append(f"trend:{angle:.1f}°")
 
         return " | ".join(parts)
 
@@ -847,12 +991,9 @@ class CurriculumManager:
             'active_mm_max_depth': ms.active_minimax_max_depth,
         }
 
-    def save_state(self, path: Optional[str] = None):
-        """Save curriculum state to file."""
-        if path is None:
-            path = os.path.join(self.save_dir, "curriculum_state.json")
-
-        state = {
+    def to_state_dict(self) -> Dict[str, Any]:
+        """Build a serializable curriculum state snapshot."""
+        return {
             'current_phase': int(self.current_phase),
             'total_episodes': self.total_episodes,
             'stats': {
@@ -863,6 +1004,7 @@ class CurriculumManager:
                 'losses': self.stats.losses,
                 'draws': self.stats.draws,
                 'best_win_rate': self.stats.best_win_rate,
+                'recent_results': list(self.stats.recent_results),
             },
             'phase_history': self.phase_history,
             'mixed_state': {
@@ -875,24 +1017,30 @@ class CurriculumManager:
                 'minimax_wins_by_depth': dict(self.mixed_state.minimax_wins_by_depth),
                 'minimax_winrate_snapshots': self.mixed_state.minimax_winrate_snapshots,
                 'active_minimax_max_depth': self.mixed_state.active_minimax_max_depth,
+                'selfplay_results': list(self.mixed_state.selfplay_results),
+                'results_vs_random': list(self.mixed_state.results_vs_random),
+                'results_vs_minimax_d1': list(self.mixed_state.results_vs_minimax_d1),
+                'results_vs_minimax_d2': list(self.mixed_state.results_vs_minimax_d2),
+                'results_vs_minimax_d3': list(self.mixed_state.results_vs_minimax_d3),
+                'results_vs_minimax_d4': list(self.mixed_state.results_vs_minimax_d4),
+                'results_vs_self': list(self.mixed_state.results_vs_self),
+                'minimax_wr_history': list(self.mixed_state.minimax_wr_history),
             },
         }
+
+    def save_state(self, path: Optional[str] = None):
+        """Save curriculum state to file."""
+        if path is None:
+            path = os.path.join(self.save_dir, "curriculum_state.json")
+
+        state = self.to_state_dict()
 
         with open(path, 'w') as f:
             json.dump(state, f, indent=2)
 
-    def load_state(self, path: Optional[str] = None) -> bool:
-        """Load curriculum state from file."""
-        if path is None:
-            path = os.path.join(self.save_dir, "curriculum_state.json")
-
-        if not os.path.exists(path):
-            return False
-
+    def load_state_dict(self, state: Dict[str, Any]) -> bool:
+        """Load curriculum state from a dict."""
         try:
-            with open(path, 'r') as f:
-                state = json.load(f)
-
             self.current_phase = Phase(state['current_phase'])
             self.total_episodes = state['total_episodes']
             self.phase_history = state.get('phase_history', [])
@@ -906,6 +1054,7 @@ class CurriculumManager:
                 losses=stats_data['losses'],
                 draws=stats_data['draws'],
                 best_win_rate=stats_data['best_win_rate'],
+                recent_results=deque(stats_data.get('recent_results', []), maxlen=2000),
             )
 
             if 'mixed_state' in state:
@@ -918,16 +1067,43 @@ class CurriculumManager:
                     games_vs_minimax=ms.get('games_vs_minimax', 0),
                     games_vs_self=ms.get('games_vs_self', 0),
                     active_minimax_max_depth=ms.get('active_minimax_max_depth', 2),
+                    selfplay_results=deque(ms.get('selfplay_results', []), maxlen=MIXED_CONFIG['selfplay_winrate_games']),
+                    results_vs_random=deque(ms.get('results_vs_random', []), maxlen=500),
+                    results_vs_minimax_d1=deque(ms.get('results_vs_minimax_d1', []), maxlen=500),
+                    results_vs_minimax_d2=deque(ms.get('results_vs_minimax_d2', []), maxlen=500),
+                    results_vs_minimax_d3=deque(ms.get('results_vs_minimax_d3', []), maxlen=500),
+                    results_vs_minimax_d4=deque(ms.get('results_vs_minimax_d4', []), maxlen=500),
+                    results_vs_self=deque(ms.get('results_vs_self', []), maxlen=500),
                 )
                 if 'minimax_wins_by_depth' in ms:
                     self.mixed_state.minimax_wins_by_depth = {
                         int(k): v for k, v in ms['minimax_wins_by_depth'].items()
                     }
                 self.mixed_state.minimax_winrate_snapshots = ms.get('minimax_winrate_snapshots', [])
+                if 'minimax_wr_history' in ms:
+                    self.mixed_state.minimax_wr_history = deque(
+                        ms['minimax_wr_history'], 
+                        maxlen=GRADUATION_CONFIG['trend_window_samples']
+                    )
 
-            config = self.get_config()
             print(f"  Loaded curriculum: Phase {int(self.current_phase)}, {self.total_episodes:,} episodes")
             return True
+        except Exception as e:
+            print(f"  Failed to load curriculum state: {e}")
+            return False
+
+    def load_state(self, path: Optional[str] = None) -> bool:
+        """Load curriculum state from file."""
+        if path is None:
+            path = os.path.join(self.save_dir, "curriculum_state.json")
+
+        if not os.path.exists(path):
+            return False
+
+        try:
+            with open(path, 'r') as f:
+                state = json.load(f)
+            return self.load_state_dict(state)
         except Exception as e:
             print(f"  Failed to load curriculum state: {e}")
             return False
@@ -961,5 +1137,3 @@ class CurriculumManager:
             print("\n  TRAINING COMPLETED!")
 
         print("="*60 + "\n")
-
-

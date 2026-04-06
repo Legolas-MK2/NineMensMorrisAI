@@ -21,7 +21,7 @@ from typing import Dict, Any, Optional, Tuple
 from config import Config
 from model import ActorCritic
 from utils import (
-    get_legal_mask, count_pieces_from_state,
+    get_legal_mask, count_pieces_from_state, extract_state_features,
     compute_gae, ExperienceBatch, RewardCalculator
 )
 from minimax import MinimaxBot
@@ -30,6 +30,13 @@ from shared_cache import SharedMoveCache
 # Import pyspiel with bug fix wrapper
 import pyspiel
 from game_wrapper import load_game as load_game_fixed
+
+
+DEFAULT_MIXED_OPPONENT_MIX: Dict[str, float] = {
+    'minimax': 0.37,
+    'self': 0.60,
+    'random': 0.03,
+}
 
 
 class CachedMinimaxBot:
@@ -230,13 +237,23 @@ def worker_process(
 
     num_envs = config.envs_per_worker
 
+    # Bootstrap settings from trainer so workers start in the correct mode
+    # even before first control-queue updates are processed.
+    initial_random_moves = int(shared_state.get('initial_random_moves', 150))
+    initial_opponent_type = str(shared_state.get('initial_opponent_type', 'random'))
+    initial_minimax_depth = int(shared_state.get('initial_minimax_depth', 1))
+    initial_minimax_min_depth = int(shared_state.get('initial_minimax_min_depth', 1))
+    initial_minimax_max_depth = int(shared_state.get('initial_minimax_max_depth', 4))
+    initial_opponent_mix_raw = shared_state.get('initial_opponent_mix')
+    initial_reward_config_raw = shared_state.get('initial_reward_config')
+
     # Current game settings (updated via control queue)
-    current_random_moves = 150  # Number of random moves to prepare board
+    current_random_moves = initial_random_moves
 
     # Create game using pyspiel with position 0 bug fix
     game = load_game_fixed("nine_mens_morris")
 
-    # Initialize reward calculator
+    # Fallback reward config used if no initial config is provided.
     default_reward_config = {
         'win_reward_base': 1.0,
         'win_reward_speed_bonus': 1.0,
@@ -251,19 +268,24 @@ def worker_process(
         'step_penalty': -0.003,
         'piece_advantage_reward': 0.02,
     }
-    reward_calculator = RewardCalculator(default_reward_config)
-
-    envs = [EnvState(game, reward_calculator) for _ in range(num_envs)]
 
     # Current curriculum settings
-    current_opponent_type = 'random'
-    current_minimax_depth = 1
-    current_reward_config = default_reward_config.copy()
+    current_opponent_type = initial_opponent_type
+    current_minimax_depth = initial_minimax_depth
+    if isinstance(initial_reward_config_raw, dict):
+        current_reward_config = dict(initial_reward_config_raw)
+    else:
+        current_reward_config = default_reward_config.copy()
 
     # For mixed mode: opponent selection per game
-    current_opponent_mix = None  # Dict with 'minimax', 'self', 'random' probabilities
-    current_minimax_min_depth = 1
-    current_minimax_max_depth = 4
+    current_opponent_mix = (
+        dict(initial_opponent_mix_raw) if isinstance(initial_opponent_mix_raw, dict) else None
+    )
+    current_minimax_min_depth = initial_minimax_min_depth
+    current_minimax_max_depth = initial_minimax_max_depth
+
+    reward_calculator = RewardCalculator(current_reward_config)
+    envs = [EnvState(game, reward_calculator) for _ in range(num_envs)]
 
     # Clone model for self-play
     clone_model: Optional[ActorCritic] = None
@@ -288,13 +310,9 @@ def worker_process(
     request_counter = 0
 
     def count_stones(state) -> Tuple[int, int]:
-        """Count stones for each player from the state."""
+        """Count stones for each player from the parsed absolute board."""
         try:
-            # Use observation tensor to count pieces
-            obs = state.observation_tensor(0)
-            player0_pieces = sum(1 for i in range(24) if obs[i] == 1)
-            player1_pieces = sum(1 for i in range(24) if obs[i + 24] == 1)
-            return player0_pieces, player1_pieces
+            return count_pieces_from_state(state, 0)
         except:
             return 9, 9  # Default if parsing fails
 
@@ -339,12 +357,22 @@ def worker_process(
 
     def select_mixed_opponent() -> Tuple[str, int]:
         """Select opponent for mixed training mode with random minimax depth."""
-        if current_opponent_mix is None:
-            return ('random', 0)
+        mix = current_opponent_mix or DEFAULT_MIXED_OPPONENT_MIX
+        minimax_prob = max(0.0, float(mix.get('minimax', DEFAULT_MIXED_OPPONENT_MIX['minimax'])))
+        self_prob = max(0.0, float(mix.get('self', DEFAULT_MIXED_OPPONENT_MIX['self'])))
+        random_prob = max(0.0, float(mix.get('random', DEFAULT_MIXED_OPPONENT_MIX['random'])))
+
+        total = minimax_prob + self_prob + random_prob
+        if total <= 1e-8:
+            minimax_prob = DEFAULT_MIXED_OPPONENT_MIX['minimax']
+            self_prob = DEFAULT_MIXED_OPPONENT_MIX['self']
+            random_prob = DEFAULT_MIXED_OPPONENT_MIX['random']
+            total = minimax_prob + self_prob + random_prob
+
+        minimax_prob /= total
+        self_prob /= total
 
         roll = random.random()
-        minimax_prob = current_opponent_mix.get('minimax', 0.35)
-        self_prob = current_opponent_mix.get('self', 0.60)
 
         if roll < minimax_prob:
             # Random depth selection (no progressive rounds)
@@ -365,7 +393,7 @@ def worker_process(
         # Determine number of random moves to prepare the board
         num_random = current_random_moves
         if num_random < 0:
-            # Phase 10: random between 0 and 150
+            # Random between 0 and 150 (used by Phase 1 and Phase 10)
             num_random = random.randint(0, 150)
 
         # Play random moves to prepare the board (not recorded in training)
@@ -392,7 +420,7 @@ def worker_process(
         setup_new_game(env)
 
     # Thread pool for async minimax (2 threads — minimax is CPU-heavy)
-    minimax_executor = ThreadPoolExecutor(max_workers=2)
+    minimax_executor = ThreadPoolExecutor(max_workers=12)
 
     def apply_opponent_action(env: EnvState, player: int, action: int):
         """Apply an opponent action and track shaping penalties."""
@@ -475,40 +503,61 @@ def worker_process(
             request_counter += 1000
             continue
 
-        # Check control messages
-        try:
-            msg = control_queue.get_nowait()
+        # Check and drain all pending control messages to avoid stale settings.
+        recreate_after_control = False
+        while True:
+            try:
+                msg = control_queue.get_nowait()
+            except queue.Empty:
+                break
+
             if msg['type'] == 'stop':
                 running = False
                 break
-            elif msg['type'] == 'update_curriculum':
+
+            if msg['type'] == 'update_curriculum':
+                old_opp_type = current_opponent_type
+                old_mix = current_opponent_mix
+
                 current_opponent_type = msg.get('opponent_type', current_opponent_type)
                 current_minimax_depth = msg.get('minimax_depth', current_minimax_depth)
                 if 'reward_config' in msg:
                     current_reward_config = msg['reward_config']
                     reward_calculator.update_config(current_reward_config)
                 if 'opponent_mix' in msg:
-                    current_opponent_mix = msg['opponent_mix']
+                    current_opponent_mix = dict(msg['opponent_mix'])
 
-            elif msg['type'] == 'update_game_settings':
+                if current_opponent_type != old_opp_type or current_opponent_mix != old_mix:
+                    recreate_after_control = True
+                continue
+
+            if msg['type'] == 'update_game_settings':
                 new_random_moves = msg.get('random_moves', current_random_moves)
                 if new_random_moves != current_random_moves:
                     current_random_moves = new_random_moves
-                    recreate_game()
+                    recreate_after_control = True
+                continue
 
-            elif msg['type'] == 'update_clone':
+            if msg['type'] == 'update_clone':
                 if 'clone_state_dict' in msg:
                     if clone_model is None:
                         clone_model = ActorCritic(obs_size, num_actions, config)
                     clone_model.load_state_dict(msg['clone_state_dict'])
                     clone_model.eval()
+                continue
 
-            elif msg['type'] == 'update_minimax_range':
+            if msg['type'] == 'update_minimax_range':
                 current_minimax_min_depth = msg.get('min_depth', 1)
                 current_minimax_max_depth = msg.get('max_depth', 4)
+                if current_opponent_type == 'mixed':
+                    recreate_after_control = True
+                continue
 
-        except queue.Empty:
-            pass
+        if not running:
+            break
+
+        if recreate_after_control:
+            recreate_game()
 
         # --- Phase 1: Collect completed async minimax results ---
         for env in envs:
@@ -637,25 +686,16 @@ def worker_process(
                 action = random.choice(legal_actions)
                 logprob = -np.log(len(legal_actions))
 
-            prev_my_pieces, prev_opp_pieces = count_pieces_from_state(state, player)
-            prev_state_info = {
-                'my_pieces': prev_my_pieces,
-                'opp_pieces': prev_opp_pieces,
-            }
+            prev_state_info = extract_state_features(state, player)
 
             state.apply_action(action)
             env.step_count += 1
 
             shaping_reward = 0.0
             if not state.is_terminal():
-                new_my_pieces, new_opp_pieces = count_pieces_from_state(state, player)
-                env.pieces[player] = new_my_pieces
-                env.pieces[1 - player] = new_opp_pieces
-
-                new_state_info = {
-                    'my_pieces': new_my_pieces,
-                    'opp_pieces': new_opp_pieces,
-                }
+                new_state_info = extract_state_features(state, player)
+                env.pieces[player] = int(new_state_info.get('my_pieces', env.pieces[player]))
+                env.pieces[1 - player] = int(new_state_info.get('opp_pieces', env.pieces[1 - player]))
 
                 shaping_reward = env.reward_calculator.calculate_shaping_reward(
                     prev_state_info, new_state_info, player

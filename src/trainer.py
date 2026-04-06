@@ -11,6 +11,7 @@ Phase Structure:
 import os
 import time
 import csv
+import glob
 import random
 import queue
 from collections import deque
@@ -34,14 +35,16 @@ from curriculum import (
     CurriculumManager, Phase, PHASE_CONFIGS, MIXED_CONFIG,
 )
 from shared_cache import SharedMoveCache
+from lr_scheduler import RLPlateauScheduler
 
 
 class PPOTrainer:
     """PPO trainer with curriculum-based training."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, resume_mode: bool = False):
         self.config = config
         self.device = torch.device(config.device)
+        self.resume_mode = resume_mode  # Track if we're resuming
 
         # Initialize game engine using pyspiel with position 0 bug fix
         game = load_game_fixed("nine_mens_morris")
@@ -49,11 +52,15 @@ class PPOTrainer:
         self.obs_size = game.observation_tensor_size()
         self.num_actions = game.num_distinct_actions()
 
+        # Store obs shape so the model can encode observations correctly
+        config.obs_shape = list(game.observation_tensor_shape())
+
         # Initialize model
         self.model = ActorCritic(self.obs_size, self.num_actions, config).to(self.device)
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
         # Optimizer with separate param groups
+        # AdamW is superior to SGD for board games with sparse rewards
         policy_params = []
         value_params = []
         for name, param in self.model.named_parameters():
@@ -62,10 +69,24 @@ class PPOTrainer:
             else:
                 policy_params.append(param)
 
+        initial_lr = PHASE_CONFIGS[Phase.PHASE_1].lr_start
         self.optimizer = torch.optim.AdamW([
-            {'params': policy_params, 'lr': config.lr_policy},
-            {'params': value_params, 'lr': config.lr_value}
+            {'params': policy_params, 'lr': initial_lr},
+            {'params': value_params, 'lr': initial_lr}
         ], weight_decay=0.01, eps=1e-5)
+
+        # RL Plateau Scheduler - tracks win rate against hardest opponent (Minimax-2)
+        # This prevents premature LR drop when agent beats easy opponents but not hard ones
+        self.lr_scheduler = RLPlateauScheduler(
+            self.optimizer,
+            factor=config.scheduler_factor,       # LR multiplier when reducing
+            patience=config.scheduler_patience,   # Evaluation steps before reducing
+            min_lr=config.scheduler_min_lr,       # Minimum LR
+            threshold=config.scheduler_threshold, # Minimum improvement to reset patience
+            target_win_rate=config.scheduler_target_wr, # Track WR target (no hard stop)
+            metric_name="wr_vs_mm_d2",
+            allow_early_stop=False
+        )
 
         # Mixed precision
         self.scaler = GradScaler('cuda') if config.use_mixed_precision and self.device.type == 'cuda' else None
@@ -106,13 +127,14 @@ class PPOTrainer:
 
         self.log_file = None
         self.log_writer = None
+        self.existing_log_path = None  # Track existing log path for resume mode
 
     def _on_phase_change(self, old_phase: Phase, new_phase: Phase):
         """Callback when curriculum phase changes."""
         # Save checkpoint at phase transition
         self.save_checkpoint(f"phase{int(old_phase)}_complete")
 
-        # Update learning rate for new phase
+        # Apply new phase's cosine start LR
         self._update_learning_rate()
 
         # Broadcast new game settings and curriculum to workers
@@ -155,6 +177,8 @@ class PPOTrainer:
     def _on_clone_update(self):
         """Callback when clone should be updated (85% WR over 1000 games)."""
         self._update_clone_model()
+        # Restart cosine cycle at lr_start for new clone generation
+        self._update_learning_rate()
 
     def _broadcast_clone_update(self):
         """Send updated clone weights to workers."""
@@ -188,8 +212,16 @@ class PPOTrainer:
                 pass
 
     def _update_learning_rate(self):
-        """Update optimizer learning rate based on curriculum."""
-        lr = self.curriculum.get_learning_rate()
+        """Update LR using the curriculum's cosine annealing schedule.
+        
+        The cosine schedule provides the base LR, restarting at lr_start on
+        every clone update and phase change.
+        """
+        base_lr = self.curriculum.get_learning_rate()
+        config = self.curriculum.get_config()
+
+        # Use curriculum LR directly (cosine annealing per phase/clone)
+        lr = max(min(base_lr, config.lr_start), config.lr_end)
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -234,10 +266,24 @@ class PPOTrainer:
         TT_BUDGET_MB = 130 * 1024
         self.shared_move_cache = SharedMoveCache(size_gb=MOVE_CACHE_GB, create=True)
         tt_budget_per_worker = TT_BUDGET_MB // max(1, self.config.num_workers)
+        curr_cfg = self.curriculum.get_config()
+        curr_reward_cfg = self.curriculum.get_reward_config()
+        curr_random_moves = self.curriculum.get_random_moves_for_phase()
+        curr_active_mm_max = self.curriculum.get_active_minimax_max_depth()
 
         shared_state = {
             'shm_cache_size_gb': MOVE_CACHE_GB,
             'tt_budget_mb': tt_budget_per_worker,
+            # Seed workers with current curriculum at process start to avoid
+            # spending whole batches in fallback random mode if first control
+            # messages are delayed or dropped.
+            'initial_random_moves': curr_random_moves,
+            'initial_opponent_type': curr_cfg.opponent_type,
+            'initial_minimax_depth': 1,
+            'initial_reward_config': curr_reward_cfg,
+            'initial_opponent_mix': dict(MIXED_CONFIG['opponent_mix']) if curr_cfg.opponent_type == 'mixed' else None,
+            'initial_minimax_min_depth': 1,
+            'initial_minimax_max_depth': curr_active_mm_max,
         }
 
         for i in range(self.config.num_workers):
@@ -416,6 +462,23 @@ class PPOTrainer:
 
             except queue.Empty:
                 pass
+
+        # Guardrail: mixed phases should include minimax/self games in each batch.
+        # If we somehow collect only random games, immediately rebroadcast current
+        # curriculum settings so workers can't remain in fallback random-only mode.
+        curr_cfg = self.curriculum.get_config()
+        if curr_cfg.opponent_type == 'mixed' and all_experiences:
+            opp_counts: Dict[str, int] = {}
+            for batch in all_experiences:
+                opp = getattr(batch, 'opponent_type', 'random')
+                opp_counts[opp] = opp_counts.get(opp, 0) + 1
+
+            non_random_games = opp_counts.get('minimax', 0) + opp_counts.get('self', 0)
+            if non_random_games == 0:
+                print("  Warning: mixed phase batch had 0 minimax/self games; rebroadcasting curriculum.")
+                self._broadcast_curriculum_update()
+                active_max = self.curriculum.get_active_minimax_max_depth()
+                self._broadcast_minimax_range(min_depth=1, max_depth=active_max)
 
         self.episode_count += len(all_experiences)
         return all_experiences, all_returns
@@ -622,36 +685,85 @@ class PPOTrainer:
         curriculum_status = self.curriculum.get_status_string()
         config = self.curriculum.get_config()
 
-        # Get per-opponent win rates (last 500 games each)
+        # Get per-opponent win rates (last 500 games each).
+        # Phase 1 uses random-only training and does not populate mixed buffers.
         opp_wr = self.curriculum.get_opponent_win_rates()
+        if config.opponent_type != 'mixed':
+            opp_wr = {
+                'wr_vs_mm_d1': 0.0,
+                'wr_vs_mm_d2': 0.0,
+                'wr_vs_mm_d3': 0.0,
+                'wr_vs_mm_d4': 0.0,
+                'wr_vs_random': win_rate,
+                'wr_vs_self': 0.0,
+                'active_mm_max_depth': 0,
+            }
 
+        # Get scheduler status
+        scheduler_best = self.lr_scheduler.get_best_score() if config.opponent_type == 'mixed' else 0.0
+        scheduler_lr = self.lr_scheduler.get_current_lr() if config.opponent_type == 'mixed' else metrics.get('lr', 0)
+        
+        # Main progress line - matches original format
         print(
-            f"[Phase {int(self.curriculum.current_phase)}] "
-            f"Ep {self.episode_count:,} | {curriculum_status} | "
-            f"Ret: {avg_return:+.3f} | "
-            f"PL: {metrics.get('policy_loss', 0):+.4f} | VL: {metrics.get('value_loss', 0):.3f} | "
-            f"LR: {metrics.get('lr', 0):.1e} | "
-            f"{eps_per_sec:.0f}/s"
+            f"[Phase {int(self.curriculum.current_phase)}] Ep {self.episode_count:,} | {curriculum_status} | "
+            f"Ret: {avg_return:+.3f} | PL: {metrics.get('policy_loss', 0):+.4f} | VL: {metrics.get('value_loss', 0):.3f} | "
+            f"LR: {metrics.get('lr', 0):.1e} | {eps_per_sec:.0f}/s"
         )
+        
+        # Print scheduler status in mixed phases (Phase 2+)
+        if config.opponent_type == 'mixed':
+            print(
+                f"  [Scheduler] Best WR(D2): {scheduler_best:.1%} | Current LR: {scheduler_lr:.1e} | "
+                f"Reductions: {self.lr_scheduler.reductions} | Wait: {self.lr_scheduler.wait}/{self.lr_scheduler.patience}"
+            )
+        
+        # Minimax evaluation results
         active_max = opp_wr['active_mm_max_depth']
         d3_str = f" D3:{opp_wr['wr_vs_mm_d3']:.0%}" if active_max >= 3 else " D3:locked"
         d4_str = f" D4:{opp_wr['wr_vs_mm_d4']:.0%}" if active_max >= 4 else " D4:locked"
         print(f"  Minimax: {minimax_str}")
-        print(f"  WR(500): D1:{opp_wr['wr_vs_mm_d1']:.0%} D2:{opp_wr['wr_vs_mm_d2']:.0%}{d3_str}{d4_str} [MaxD:{active_max}] Rnd:{opp_wr['wr_vs_random']:.0%} Self:{opp_wr['wr_vs_self']:.0%}")
+        if config.opponent_type == 'mixed':
+            print(f"  WR(500): D1:{opp_wr['wr_vs_mm_d1']:.0%} D2:{opp_wr['wr_vs_mm_d2']:.0%}{d3_str}{d4_str} [MaxD:{active_max}] Rnd:{opp_wr['wr_vs_random']:.0%} Self:{opp_wr['wr_vs_self']:.0%}")
+        else:
+            print(f"  WR({len(curr_stats.recent_results)}): Rnd:{win_rate:.0%} (mixed opponent WR tracking starts in Phase 2)")
 
         # CSV logging
         if self.log_file is None:
-            path = os.path.join(self.config.log_dir, f"{time.strftime('%Y%m%d_%H%M%S')}_curriculum.csv")
-            self.log_file = open(path, 'w', newline='')
+            # In resume mode, find and append to existing log file
+            if self.resume_mode and self.existing_log_path:
+                path = self.existing_log_path
+                file_mode = 'a'  # Append mode
+                write_header = False
+            else:
+                # Find existing log file to append to (for resume mode without existing_log_path set)
+                path = None
+                if self.resume_mode:
+                    # Find the most recent curriculum log file
+                    log_files = glob.glob(os.path.join(self.config.log_dir, "*_curriculum.csv"))
+                    if log_files:
+                        path = max(log_files, key=os.path.getmtime)
+                        self.existing_log_path = path
+                        file_mode = 'a'
+                        write_header = False
+                
+                if path is None:
+                    path = os.path.join(self.config.log_dir, f"{time.strftime('%Y%m%d_%H%M%S')}_curriculum.csv")
+                    file_mode = 'w'
+                    write_header = True
+            
+            self.log_file = open(path, file_mode, newline='')
             self.log_writer = csv.DictWriter(self.log_file, fieldnames=[
                 'episode', 'phase', 'random_moves', 'steps', 'avg_return', 'ema_return',
                 'win_rate', 'draw_rate', 'policy_loss', 'value_loss', 'entropy', 'kl_div',
                 'clip_frac', 'grad_norm', 'lr', 'minimax_depth_beaten', 'clone_gen',
                 'active_mm_max_depth',
                 'wr_vs_mm_d1', 'wr_vs_mm_d2', 'wr_vs_mm_d3', 'wr_vs_mm_d4',
-                'wr_vs_random', 'wr_vs_self'
+                'wr_vs_random', 'wr_vs_self',
+                # RL Plateau Scheduler metrics
+                'scheduler_best_wr_d2', 'scheduler_current_lr', 'scheduler_reductions', 'scheduler_wait'
             ])
-            self.log_writer.writeheader()
+            if write_header:
+                self.log_writer.writeheader()
 
         self.log_writer.writerow({
             'episode': self.episode_count,
@@ -678,6 +790,11 @@ class PPOTrainer:
             'wr_vs_mm_d4': opp_wr['wr_vs_mm_d4'],
             'wr_vs_random': opp_wr['wr_vs_random'],
             'wr_vs_self': opp_wr['wr_vs_self'],
+            # RL Plateau Scheduler metrics
+            'scheduler_best_wr_d2': scheduler_best,
+            'scheduler_current_lr': scheduler_lr,
+            'scheduler_reductions': self.lr_scheduler.reductions,
+            'scheduler_wait': self.lr_scheduler.wait,
         })
         self.log_file.flush()
 
@@ -687,6 +804,8 @@ class PPOTrainer:
             self.config.checkpoint_dir,
             f"{time.strftime('%Y%m%d_%H%M%S')}_{prefix}_ep{self.episode_count}.pt"
         )
+        curriculum_state = self.curriculum.to_state_dict()
+        lr_scheduler_state = self.lr_scheduler.get_state_dict()
         torch.save({
             'episode': self.episode_count,
             'total_steps': self.total_steps,
@@ -697,9 +816,13 @@ class PPOTrainer:
             'ema_return': self.ema_return,
             'best_win_rate': self.best_win_rate,
             'curriculum_phase': int(self.curriculum.current_phase),
+            'curriculum_state': curriculum_state,
+            'lr_scheduler_state': lr_scheduler_state,
         }, path)
         print(f"  Saved: {path}")
 
+        # Keep per-checkpoint sidecar state for backward compatibility/debugging.
+        self.curriculum.save_state(path=f"{path}.curriculum.json")
         self.curriculum.save_state()
 
     def load_weights_only(self, path: str):
@@ -727,7 +850,21 @@ class PPOTrainer:
         self.ema_return = ckpt.get('ema_return')
         self.best_win_rate = ckpt.get('best_win_rate', 0.0)
 
-        self.curriculum.load_state()
+        # Load LR scheduler state
+        if 'lr_scheduler_state' in ckpt:
+            self.lr_scheduler.load_state_dict(ckpt['lr_scheduler_state'])
+            print(f"  LR scheduler restored: best_score={self.lr_scheduler.get_best_score():.1%}, reductions={self.lr_scheduler.reductions}")
+
+        curriculum_loaded = False
+        if ckpt.get('curriculum_state') is not None:
+            curriculum_loaded = self.curriculum.load_state_dict(ckpt['curriculum_state'])
+        else:
+            sidecar_path = f"{path}.curriculum.json"
+            if os.path.exists(sidecar_path):
+                curriculum_loaded = self.curriculum.load_state(sidecar_path)
+
+        if not curriculum_loaded:
+            self.curriculum.load_state()
 
         print(f"  Loaded from episode {self.episode_count}, Phase {int(self.curriculum.current_phase)}")
 
@@ -744,12 +881,13 @@ class PPOTrainer:
 
         print("Training Phases (with random board preparation):")
         for phase, phase_cfg in PHASE_CONFIGS.items():
-            if phase_cfg.opponent_type == 'random':
-                grad_str = f"{phase_cfg.win_rate_threshold:.0%} WR vs random"
-            else:
-                grad_str = f"{MIXED_CONFIG['graduation_episodes']/1e6:.1f}M episodes"
             print(f"  Phase {int(phase)}: "
-                  f"LR {phase_cfg.lr_start:.0e}->{phase_cfg.lr_end:.0e} | {phase_cfg.description[:30]}")
+                  f"LR {phase_cfg.lr_start:.0e}→{phase_cfg.lr_end:.0e} cosine | {phase_cfg.description[:30]}")
+        print()
+
+        print(f"LR schedule: RL Plateau Scheduler based on Win Rate vs Minimax-2")
+        print(f"  Cosine annealing per phase, restarts on clone update")
+        print(f"  No scheduler auto-stop (phase completion drives termination)")
         print()
 
         print(f"Mixed Training (Phase 2-9):")
@@ -757,11 +895,11 @@ class PPOTrainer:
         print(f"  Opponent mix: {mix['minimax']*100:.0f}% minimax, {mix['self']*100:.0f}% self-play, {mix['random']*100:.0f}% random")
         print(f"  Minimax: Random D{MIXED_CONFIG['minimax_min_depth']}-D{MIXED_CONFIG['minimax_max_depth']}")
         print(f"  Self-play: Clone update at {MIXED_CONFIG['selfplay_winrate_threshold']*100:.0f}% WR over {MIXED_CONFIG['selfplay_winrate_games']} games")
-        print(f"  Graduation: {MIXED_CONFIG['graduation_episodes']/1e6:.1f}M episodes per phase")
+        print(f"  Graduation: Trend-based (plateau detection < 1° angle over 1M episodes)")
         print()
 
         print(f"Phase 10 (Final):")
-        print(f"  Minimax: Random D1-D4, no shaping, 1M episodes")
+        print(f"  Minimax: Random D1-D4, no shaping, trend-based graduation")
         print()
 
         config = self.curriculum.get_config()
@@ -777,10 +915,6 @@ class PPOTrainer:
 
         try:
             while self.curriculum.current_phase != Phase.COMPLETED:
-                if self.episode_count >= cfg.total_episodes:
-                    print(f"\nReached max episodes ({cfg.total_episodes:,})")
-                    break
-
                 # Collect experiences (workers run, main serves inference)
                 experiences, returns = self.collect_experiences(cfg.episodes_per_update)
 
@@ -790,7 +924,17 @@ class PPOTrainer:
                 # and get served on the next collect_experiences call.
                 metrics = self.update_policy(experiences)
 
+                # Update LR using curriculum cosine schedule
                 self._update_learning_rate()
+
+                # RL Plateau Scheduler step - uses win rate vs hardest opponent (Minimax-2)
+                # This is called during logging intervals (every log_interval episodes)
+                opp_wr = self.curriculum.get_opponent_win_rates()
+                hard_opponent_wr = opp_wr.get('wr_vs_mm_d2', 0.0)
+                
+                # Only use scheduler in mixed phases (Phase 2+) where Minimax-2 is available
+                if config.opponent_type == 'mixed':
+                    self.lr_scheduler.step(hard_opponent_wr, episode=self.episode_count)
 
                 # Check for clone update (85% WR over 1000 self-play games)
                 if self.curriculum.should_update_clone():
@@ -805,6 +949,8 @@ class PPOTrainer:
                 # Logging
                 if self.episode_count % cfg.log_interval < cfg.episodes_per_update:
                     self.log_progress(returns, metrics)
+                    # Sample minimax winrate for trend-based graduation (phases 2+)
+                    self.curriculum.sample_minimax_winrate()
 
                 # Check graduation
                 if self.episode_count % cfg.graduation_check_interval < cfg.episodes_per_update:
@@ -834,3 +980,4 @@ class PPOTrainer:
             print(f"\nDone: {session_eps:,} episodes in {elapsed / 3600:.1f}h ({session_eps / elapsed:.0f}/s)")
 
             self.curriculum.print_summary()
+

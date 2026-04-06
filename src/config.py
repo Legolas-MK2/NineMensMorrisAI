@@ -10,7 +10,8 @@ os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional, List
 import torch
 
 
@@ -20,28 +21,28 @@ class Config:
     
     # Training scale
     total_episodes: int = 500_000_000  # Max episodes (curriculum may finish earlier)
-    episodes_per_update: int = 16384
-    ppo_epochs: int = 5
+    episodes_per_update: int = 8192
+    ppo_epochs: int = 3
     mini_batch_size: int = 8192
     
     # Parallelism (optimized for Threadripper 3960X + RTX 3090)
     num_workers: int = 22
     envs_per_worker: int = 48
     
+    # Observation shape from pyspiel (set at runtime, e.g. [5, 7, 7] for nine_mens_morris)
+    # Channel 0 = player 0 pieces, Channel 1 = player 1 pieces, rest = game state
+    obs_shape: Optional[List[int]] = None
+
     # Model architecture
     hidden_dim: int = 128
     num_res_blocks: int = 8
-    num_attention_heads: int = 8
-    dropout: float = 0.15  # Increased from 0.05 to reduce overfitting
-    
-    # Base learning rate (curriculum manager will override)
-    lr_policy: float = 3e-4
-    lr_value: float = 3e-4
+    num_attention_heads: int = 16
+    dropout: float = 0.05
     
     # PPO hyperparameters
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_epsilon: float = 0.2
+    clip_epsilon: float = 0.12
     max_grad_norm: float = 0.5
     
     # Entropy - gradual decay with floor to prevent policy collapse
@@ -81,8 +82,18 @@ class Config:
     eval_games: int = 200
     graduation_check_interval: int = 5_000  # Check graduation/promotion every N episodes
     
+    # RL Plateau Scheduler - Automatic LR management based on hard opponent win rate
+    # This scheduler prevents premature LR drop when agent beats easy opponents
+    # but hasn't yet learned to beat strong opponents (Minimax-2)
+    scheduler_factor: float = 0.5        # LR multiplier when reducing (0.5 = halve)
+    scheduler_patience: int = 10         # Evaluation steps before reducing (10 * log_interval)
+    scheduler_min_lr: float = 1e-6       # Minimum learning rate
+    scheduler_threshold: float = 0.02    # Minimum improvement to reset patience (2%)
+    scheduler_target_wr: float = 0.95    # Stop training at this win rate vs Minimax-2
+    
     # Directories
     model_dir: str = "models"
     log_dir: str = "logs"
     checkpoint_dir: str = "checkpoints"
     curriculum_dir: str = "curriculum"
+

@@ -61,6 +61,9 @@ def play_interactive(config: Config = None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     game = get_game()
 
+    # Store obs shape so the model can encode observations correctly
+    config.obs_shape = list(game.observation_tensor_shape())
+
     # Load model
     model = ActorCritic(
         game.observation_tensor_size(),
@@ -297,12 +300,12 @@ Examples:
         help='Checkpoint path for resume'
     )
     parser.add_argument(
-        '--workers', type=int, default=16,
-        help='Number of worker processes (default: 16)'
+        '--workers', type=int, default=22,
+        help='Number of worker processes (default: 22)'
     )
     parser.add_argument(
-        '--envs', type=int, default=32,
-        help='Environments per worker (default: 32)'
+        '--envs', type=int, default=48,
+        help='Environments per worker (default: 48)'
     )
     parser.add_argument(
         '--phase', type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
@@ -359,7 +362,7 @@ Examples:
         config.num_workers = args.workers
         config.envs_per_worker = args.envs
 
-        trainer = PPOTrainer(config)
+        trainer = PPOTrainer(config, resume_mode=True)
 
         if args.checkpoint:
             trainer.load_checkpoint(args.checkpoint)
@@ -403,8 +406,8 @@ if __name__ == "__main__":
         print("  python main.py info               # Show phase details")
         print()
         print("Options:")
-        print("  --workers N         Number of worker processes (default: 16)")
-        print("  --envs N            Environments per worker (default: 32)")
+        print("  --workers N         Number of worker processes (default: 22)")
+        print("  --envs N            Environments per worker (default: 48)")
         print("  --episodes N        Maximum total episodes")
         print("  --phase N           Start from curriculum phase N (1-10)")
         print()

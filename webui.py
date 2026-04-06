@@ -36,8 +36,9 @@ app = Flask(__name__)
 
 # Game constants - using pyspiel with position 0 bug fix
 GAME = load_game_fixed("nine_mens_morris")
-NUM_ACTIONS = GAME.num_distinct_actions()  # 600
-OBS_SIZE = GAME.observation_tensor_size()  # 104
+NUM_ACTIONS = GAME.num_distinct_actions()
+OBS_SIZE = GAME.observation_tensor_size()
+OBS_SHAPE = list(GAME.observation_tensor_shape())  # e.g. [5, 7, 7] = 245 dims
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Shared minimax bot with transposition table for better performance
@@ -142,6 +143,7 @@ def load_model(model_info: Dict[str, str]) -> Tuple[Any, str]:
     model_type = model_info["type"]
 
     config = Config()
+    config.obs_shape = OBS_SHAPE  # needed for correct one-hot encoding inside model
     model = ActorCritic(OBS_SIZE, NUM_ACTIONS, config).to(DEVICE)
 
     checkpoint = torch.load(model_info["path"], map_location=DEVICE, weights_only=False)
@@ -221,22 +223,27 @@ def get_board_state() -> Dict[str, Any]:
 
 
 def parse_board_positions(state) -> Dict[int, int]:
-    """Parse board to get piece positions: {position: player}."""
+    """Parse board to get piece positions: {position: player}.
+
+    Uses the same channel layout as the model's _encode_obs:
+      obs flat layout: [ch0 (n_cells), ch1 (n_cells), ...]
+        ch0 = player 0 piece presence on the 7×7 grid
+        ch1 = player 1 piece presence on the 7×7 grid
+
+    POINT_TO_COORD maps each of the 24 board positions to (row, col)
+    in the 7×7 grid, so we compute the flat index as row*7 + col.
+    """
     positions = {}
+    obs = np.array(state.observation_tensor(0))  # flat, e.g. 245 dims
 
-    # Use observation tensor from player 0's perspective
-    # Observation shape is (channels, rows, cols) - e.g. (5, 7, 7)
-    # Channel 0: Player 0's pieces (white)
-    # Channel 1: Player 1's pieces (black)
-    obs = np.array(state.observation_tensor(0)).reshape(GAME.observation_tensor_shape())
+    n_cells = OBS_SIZE // OBS_SHAPE[0]           # 245 // 5 = 49  (7×7)
+    grid_cols = OBS_SHAPE[2]                      # 7
 
-    # Iterate through board positions using POINT_TO_COORD mapping
     for pos, (row, col) in POINT_TO_COORD.items():
-        if obs[0, row, col] == 1:
-            # Player 0's piece (white)
+        flat_idx = row * grid_cols + col          # index within one channel
+        if obs[flat_idx] == 1:                    # channel 0: player 0
             positions[pos] = 0
-        elif obs[1, row, col] == 1:
-            # Player 1's piece (black)
+        elif obs[n_cells + flat_idx] == 1:        # channel 1: player 1
             positions[pos] = 1
 
     return positions

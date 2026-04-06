@@ -57,11 +57,15 @@ class MultiHeadAttention(nn.Module):
         B = x.shape[0]
         h = self.ln(x)
         qkv = self.qkv(h).reshape(B, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
-        
-        # Simplified attention using sigmoid
-        attn = torch.sigmoid((q * k).sum(dim=-1, keepdim=True) * self.scale)
-        out = (attn * v).reshape(B, -1)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # each (B, num_heads, head_dim)
+
+        # Standard scaled dot-product attention
+        # Each "head" attends to all other heads: (B, num_heads, num_heads)
+        attn = torch.bmm(q, k.transpose(1, 2)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        out = torch.bmm(attn, v)   # (B, num_heads, head_dim)
+        out = out.reshape(B, -1)   # (B, dim)
+
         out = self.dropout(self.proj(out))
         return x + out * 0.1
 
@@ -76,10 +80,29 @@ class ActorCritic(nn.Module):
         super().__init__()
         dim = config.hidden_dim
         self.value_clip = config.value_clip
-        
+        self.raw_obs_size = obs_size
+
+        # Determine encoding from obs_shape set in config at runtime.
+        # pyspiel nine_mens_morris: shape = [5, 7, 7] = 245 dims
+        #   Channel 0 (cells 0..n_cells-1)    : player 0 piece presence on the grid
+        #   Channel 1 (cells n_cells..2*n_cells): player 1 piece presence on the grid
+        #   Channels 2+ (rest)                 : game state (phase, remaining pieces, etc.)
+        # We one-hot encode channels 0+1 as [empty, p0, p1] per cell,
+        # and pass channels 2+ through unchanged.
+        obs_shape = getattr(config, 'obs_shape', None)
+        if obs_shape and len(obs_shape) >= 3:
+            self._n_total_channels = obs_shape[0]          # e.g. 5
+            self._n_cells = obs_size // obs_shape[0]       # e.g. 49 (7×7)
+            # 3 one-hot dims for the 2 piece channels + remaining channels unchanged
+            encoded_obs_size = self._n_cells * 3 + (self._n_total_channels - 2) * self._n_cells
+        else:
+            self._n_total_channels = None
+            self._n_cells = None
+            encoded_obs_size = obs_size  # fallback: raw obs passthrough
+
         # Input embedding
         self.input_embed = nn.Sequential(
-            nn.Linear(obs_size, dim),
+            nn.Linear(encoded_obs_size, dim),
             nn.LayerNorm(dim),
             nn.GELU()
         )
@@ -121,8 +144,35 @@ class ActorCritic(nn.Module):
         nn.init.orthogonal_(self.value_head.weight, gain=1.0)
         nn.init.zeros_(self.value_head.bias)
         
+    def _encode_obs(self, obs):
+        """One-hot encode the two piece-presence channels of the observation.
+
+        pyspiel nine_mens_morris flat obs layout (e.g. 245 dims = 5 × 49 cells):
+          Channel 0 [0 : n]     — player 0 piece presence on the board grid
+          Channel 1 [n : 2n]    — player 1 piece presence on the board grid
+          Channels 2+ [2n : end] — game state info (phase, remaining pieces, etc.)
+
+        The first two channels are encoded as [empty, p0, p1] per cell (one-hot),
+        making each of the three board states an explicit independent feature.
+        The remaining channels are passed through unchanged.
+
+        If obs_shape was not set in config, returns obs unchanged (safe fallback).
+        """
+        if self._n_cells is None:
+            return obs  # no shape info — raw passthrough
+
+        n = self._n_cells
+        p0    = obs[:, :n]        # (B, n_cells) — 1 where player 0 has piece
+        p1    = obs[:, n:2*n]     # (B, n_cells) — 1 where player 1 has piece
+        empty = 1.0 - p0 - p1    # (B, n_cells) — 1 where cell is empty
+
+        # Stack → (B, n_cells, 3) → flatten → (B, 3*n_cells)
+        pos_encoded = torch.stack([empty, p0, p1], dim=2).reshape(obs.shape[0], -1)
+        other = obs[:, 2*n:]      # (B, remaining channels flat)
+        return torch.cat([pos_encoded, other], dim=1)
+
     def forward(self, obs):
-        x = self.input_embed(obs)
+        x = self.input_embed(self._encode_obs(obs))
         
         for block in self.res_blocks:
             x = block(x)
