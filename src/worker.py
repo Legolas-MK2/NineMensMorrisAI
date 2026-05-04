@@ -255,18 +255,20 @@ def worker_process(
 
     # Fallback reward config used if no initial config is provided.
     default_reward_config = {
-        'win_reward_base': 1.0,
+        'win_reward_base': 2.0,
         'win_reward_speed_bonus': 1.0,
-        'loss_reward': -1.5,
-        'draw_penalty': -0.5,
+        'loss_reward': -2.0,
+        'draw_penalty': -1.5,
         'mill_reward': 0.3,
         'enemy_mill_penalty': -0.3,
         'block_mill_reward': 0.2,
         'double_mill_reward': 0.5,
-        'double_mill_extra_reward': 0.8,
         'setup_capture_reward': 0.2,
         'step_penalty': -0.003,
         'piece_advantage_reward': 0.02,
+        'mobility_reward': 0.05,
+        'max_shaping_abs': 0.20,
+        'gamma': 0.99,
     }
 
     # Current curriculum settings

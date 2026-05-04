@@ -51,10 +51,10 @@ class PhaseConfig:
     lr_end: float = 7e-5
 
     # Reward multipliers
-    win_reward_base: float = 1.0
+    win_reward_base: float = 2.0
     win_reward_speed_bonus: float = 1.0
-    loss_reward: float = -1.0
-    draw_penalty: float = -0.5
+    loss_reward: float = -2.0
+    draw_penalty: float = -1.5
 
     # Base shaping intensity per phase (further reduced by schedule)
     shaping_multiplier: float = 0.0
@@ -89,10 +89,18 @@ MIXED_CONFIG = {
     # Self-play: clone update at 85% win rate (was 90%, less aggressive)
     'selfplay_winrate_threshold': 0.85,
     'selfplay_winrate_games': 1000,  # Increased from 500 for stability
+    # Minimum episodes between clone updates. Rapid clone churn was collapsing
+    # the policy (new clones + LR spike => catastrophic updates), so require
+    # at least this many episodes since the previous clone before making a new one.
+    'selfplay_clone_cooldown_episodes': 500_000,
 
-    # Minimax depth range (random selection, no progressive)
+    # Minimax depth range — gradual unlock from D1 up to D7 based on win rate
     'minimax_min_depth': 1,
-    'minimax_max_depth': 2,  # D1-D2 for phases 2-9
+    'minimax_max_depth': 7,  # D1-D7, unlocked progressively
+
+    # Minimax depth unlock: unlock next depth when WR vs current >= 50% over 100 games
+    'minimax_depth_unlock_threshold': 0.50,
+    'minimax_depth_unlock_min_games': 100,
 
     # Stagnation detection: graduate early if model stops improving
     'stagnation_min_episodes': 1_000_000,    # Don't trigger before 1M episodes in phase
@@ -104,21 +112,21 @@ MIXED_CONFIG = {
 
 # Special config for Phase 10 (final phase with harder minimax)
 PHASE_10_CONFIG = {
-    'minimax': 0.35,   # 35% minimax (harder opponents for final phase)
+    'minimax': 0.44,   # 35% minimax (harder opponents for final phase)
     'self': 0.55,      # 55% self-play
-    'random': 0.10,    # 10% random
-    'selfplay_winrate_threshold': 0.85,
+    'random': 0.01,    # 01% random
+    'selfplay_winrate_threshold': 0.95,
     'selfplay_winrate_games': 1000,
     'minimax_min_depth': 1,
-    'minimax_max_depth': 4,  # D1-D4 for final phase
+    'minimax_max_depth': 7,  # D1-D7 for final phase
 }
 
 
 # Graduation trend detection settings
 # Sample winrate every 25k episodes, keep 40 samples = 1M episode window
 GRADUATION_CONFIG = {
-    'trend_window_samples': 40,      # Number of samples to keep for trend calculation
-    'trend_max_angle_degrees': 1.0,  # Max angle (degrees) for graduation
+    'trend_window_samples': 20,      # Number of samples to keep for trend calculation
+    'trend_max_angle_degrees': 0.0,  # Max angle (degrees) for graduation
 }
 
 
@@ -130,14 +138,14 @@ PHASE_CONFIGS = {
         opponent_type='random',
         lr_start=3e-4,
         lr_end=1e-4,
-        win_reward_base=1.0,
-        win_reward_speed_bonus=0.5,
-        loss_reward=-1.0,
-        draw_penalty=-0.8,
+        win_reward_base=2.0,
+        win_reward_speed_bonus=1.0,
+        loss_reward=-2.0,
+        draw_penalty=-1.5,
         shaping_multiplier=1.0,
-        win_rate_threshold=0.75,  # Lowered from 0.85 - 80% is sufficient for warmup
+        win_rate_threshold=0.95,  # Must dominate random before moving on
         min_games_for_graduation=2000,
-        min_episodes=100_000,  # Reduced from 200k - allow earlier graduation
+        min_episodes=100_000,
         lr_cycle_episodes=500_000,
     ),
 
@@ -147,10 +155,10 @@ PHASE_CONFIGS = {
         opponent_type='mixed',
         lr_start=1e-4,
         lr_end=5e-5,
-        win_reward_base=1.0,
-        win_reward_speed_bonus=0.5,
-        loss_reward=-1.0,
-        draw_penalty=-0.8,
+        win_reward_base=2.0,
+        win_reward_speed_bonus=1.0,
+        loss_reward=-2.0,
+        draw_penalty=-1.5,
         shaping_multiplier=0.7,
         win_rate_threshold=0.80,
         min_games_for_graduation=1000,
@@ -163,10 +171,10 @@ PHASE_CONFIGS = {
         opponent_type='mixed',
         lr_start=5e-5,
         lr_end=3e-5,
-        win_reward_base=1.0,
-        win_reward_speed_bonus=0.5,
-        loss_reward=-1.0,
-        draw_penalty=-0.8,
+        win_reward_base=2.0,
+        win_reward_speed_bonus=1.0,
+        loss_reward=-2.0,
+        draw_penalty=-1.5,
         shaping_multiplier=0.5,
         win_rate_threshold=0.75,
         min_games_for_graduation=1000,
@@ -179,10 +187,10 @@ PHASE_CONFIGS = {
         opponent_type='mixed',
         lr_start=3e-5,
         lr_end=2e-5,
-        win_reward_base=1.0,
-        win_reward_speed_bonus=0.5,
-        loss_reward=-1.0,
-        draw_penalty=-0.8,
+        win_reward_base=2.0,
+        win_reward_speed_bonus=1.0,
+        loss_reward=-2.0,
+        draw_penalty=-1.5,
         shaping_multiplier=0.3,
         win_rate_threshold=0.70,
         min_games_for_graduation=1000,
@@ -195,10 +203,10 @@ PHASE_CONFIGS = {
         opponent_type='mixed',
         lr_start=2e-5,
         lr_end=1e-5,
-        win_reward_base=1.0,
-        win_reward_speed_bonus=0.5,
-        loss_reward=-1.0,
-        draw_penalty=-0.8,
+        win_reward_base=2.0,
+        win_reward_speed_bonus=1.0,
+        loss_reward=-2.0,
+        draw_penalty=-1.5,
         shaping_multiplier=0.2,
         win_rate_threshold=0.65,
         min_games_for_graduation=1000,
@@ -211,10 +219,10 @@ PHASE_CONFIGS = {
         opponent_type='mixed',
         lr_start=1e-5,
         lr_end=7e-6,
-        win_reward_base=1.0,
-        win_reward_speed_bonus=0.5,
-        loss_reward=-1.0,
-        draw_penalty=-0.8,
+        win_reward_base=2.0,
+        win_reward_speed_bonus=1.0,
+        loss_reward=-2.0,
+        draw_penalty=-1.5,
         shaping_multiplier=0.1,
         win_rate_threshold=0.60,
         min_games_for_graduation=1000,
@@ -227,10 +235,10 @@ PHASE_CONFIGS = {
         opponent_type='mixed',
         lr_start=7e-6,
         lr_end=5e-6,
-        win_reward_base=1.0,
-        win_reward_speed_bonus=0.5,
-        loss_reward=-1.0,
-        draw_penalty=-0.8,
+        win_reward_base=2.0,
+        win_reward_speed_bonus=1.0,
+        loss_reward=-2.0,
+        draw_penalty=-1.5,
         shaping_multiplier=0.05,
         win_rate_threshold=0.55,
         min_games_for_graduation=1000,
@@ -243,10 +251,10 @@ PHASE_CONFIGS = {
         opponent_type='mixed',
         lr_start=5e-6,
         lr_end=3e-6,
-        win_reward_base=1.0,
-        win_reward_speed_bonus=0.5,
-        loss_reward=-1.0,
-        draw_penalty=-0.8,
+        win_reward_base=2.0,
+        win_reward_speed_bonus=1.0,
+        loss_reward=-2.0,
+        draw_penalty=-1.5,
         shaping_multiplier=0.0,
         win_rate_threshold=0.50,
         min_games_for_graduation=1000,
@@ -259,10 +267,10 @@ PHASE_CONFIGS = {
         opponent_type='mixed',
         lr_start=3e-6,
         lr_end=1e-6,
-        win_reward_base=1.0,
-        win_reward_speed_bonus=0.5,
-        loss_reward=-1.0,
-        draw_penalty=-0.8,
+        win_reward_base=2.0,
+        win_reward_speed_bonus=1.0,
+        loss_reward=-2.0,
+        draw_penalty=-1.5,
         shaping_multiplier=0.0,
         win_rate_threshold=0.50,
         min_games_for_graduation=1000,
@@ -275,15 +283,15 @@ PHASE_CONFIGS = {
         opponent_type='mixed',
         lr_start=1e-6,
         lr_end=5e-7,
-        win_reward_base=1.0,
-        win_reward_speed_bonus=0.5,
-        loss_reward=-1.0,
-        draw_penalty=-0.8,
+        win_reward_base=2.0,
+        win_reward_speed_bonus=1.0,
+        loss_reward=-2.0,
+        draw_penalty=-1.5,
         shaping_multiplier=0.0,  # No shaping rewards
         win_rate_threshold=0.50,
         min_games_for_graduation=1000,
         max_episodes=0,  # No fixed limit - uses trend-based graduation
-        lr_cycle_episodes=1_000_000,
+        lr_cycle_episodes=10_000_000,
     ),
 }
 
@@ -301,16 +309,16 @@ class MixedTrainingState:
     # Minimax win rate snapshots for stagnation detection: list of (total_episodes, win_rate)
     minimax_winrate_snapshots: List = field(default_factory=list)
 
-    # Minimax tracking (simplified - no progressive rounds)
-    minimax_wins_by_depth: Dict[int, int] = field(default_factory=lambda: {d: 0 for d in range(1, 7)})
+    # Minimax tracking
+    minimax_wins_by_depth: Dict[int, int] = field(default_factory=lambda: {d: 0 for d in range(1, 8)})
 
     # Per-opponent game counts
     games_vs_random: int = 0
     games_vs_minimax: int = 0
     games_vs_self: int = 0
 
-    # Active minimax depth ceiling (starts at D2, unlocks D3/D4 progressively)
-    active_minimax_max_depth: int = 2
+    # Active minimax depth ceiling (starts at D1, unlocks D2-D7 progressively via win rate)
+    active_minimax_max_depth: int = 1
 
     # Win tracking for last 500 games per opponent type
     results_vs_random: deque = field(default_factory=lambda: deque(maxlen=500))
@@ -318,11 +326,14 @@ class MixedTrainingState:
     results_vs_minimax_d2: deque = field(default_factory=lambda: deque(maxlen=500))
     results_vs_minimax_d3: deque = field(default_factory=lambda: deque(maxlen=500))
     results_vs_minimax_d4: deque = field(default_factory=lambda: deque(maxlen=500))
+    results_vs_minimax_d5: deque = field(default_factory=lambda: deque(maxlen=500))
+    results_vs_minimax_d6: deque = field(default_factory=lambda: deque(maxlen=500))
+    results_vs_minimax_d7: deque = field(default_factory=lambda: deque(maxlen=500))
     results_vs_self: deque = field(default_factory=lambda: deque(maxlen=500))
 
     # Winrate history for trend-based graduation (phases 2+)
-    # Samples combined minimax winrate every 25k episodes, keeps 40 samples (1M episode window)
-    minimax_wr_history: deque = field(default_factory=lambda: deque(maxlen=40))
+    # Samples combined minimax winrate every 25k episodes, keeps 20 samples (500k episode window)
+    minimax_wr_history: deque = field(default_factory=lambda: deque(maxlen=20))
 
     def get_selfplay_win_rate(self) -> float:
         """Get win rate from last N self-play games."""
@@ -332,9 +343,19 @@ class MixedTrainingState:
         return wins / len(self.selfplay_results)
 
     def should_update_clone(self) -> bool:
-        """Check if clone should be updated (85% WR over 1000 games)."""
+        """Check if clone should be updated (85% WR over 1000 games).
+
+        Enforces a cooldown: a new clone cannot be created if the previous
+        clone was created within the last `selfplay_clone_cooldown_episodes`
+        episodes. The very first clone in a phase (clone_generation == 0)
+        is always allowed to be created as soon as the WR threshold is met.
+        """
         if len(self.selfplay_results) < MIXED_CONFIG['selfplay_winrate_games']:
             return False
+        if self.clone_generation > 0:
+            cooldown = MIXED_CONFIG['selfplay_clone_cooldown_episodes']
+            if (self.total_episodes - self.last_clone_episode) < cooldown:
+                return False
         return self.get_selfplay_win_rate() >= MIXED_CONFIG['selfplay_winrate_threshold']
 
     def on_clone_updated(self):
@@ -358,27 +379,50 @@ class MixedTrainingState:
         wins = sum(1 for r in combined if r == 'win')
         return wins / len(combined)
 
-    def get_combined_minimax_win_rate_phase10(self) -> float:
-        """Get combined win rate vs minimax d1-d4 for phase 10 (last 500 games each)."""
-        combined = list(self.results_vs_minimax_d1) + list(self.results_vs_minimax_d2) + \
-                   list(self.results_vs_minimax_d3) + list(self.results_vs_minimax_d4)
+    def get_combined_minimax_win_rate_up_to(self, max_depth: int) -> float:
+        """Get combined win rate vs minimax D1 through max_depth (last 500 games each)."""
+        _depth_results = [
+            self.results_vs_minimax_d1,
+            self.results_vs_minimax_d2,
+            self.results_vs_minimax_d3,
+            self.results_vs_minimax_d4,
+            self.results_vs_minimax_d5,
+            self.results_vs_minimax_d6,
+            self.results_vs_minimax_d7,
+        ]
+        combined = []
+        for d in range(1, min(max_depth, 7) + 1):
+            combined += list(_depth_results[d - 1])
         if len(combined) < 20:
             return 0.0
         wins = sum(1 for r in combined if r == 'win')
         return wins / len(combined)
 
+    def get_combined_minimax_win_rate_phase10(self) -> float:
+        """Get combined win rate vs minimax d1-d4 for phase 10 (last 500 games each)."""
+        return self.get_combined_minimax_win_rate_up_to(4)
+
+    def _depth_results_deque(self, depth: int):
+        """Return the results deque for a given minimax depth (1-7)."""
+        return [
+            None,
+            self.results_vs_minimax_d1,
+            self.results_vs_minimax_d2,
+            self.results_vs_minimax_d3,
+            self.results_vs_minimax_d4,
+            self.results_vs_minimax_d5,
+            self.results_vs_minimax_d6,
+            self.results_vs_minimax_d7,
+        ][depth] if 1 <= depth <= 7 else None
+
     def get_win_rate_vs_opponent(self, opponent_type: str, depth: int = 0) -> float:
         """Get win rate vs specific opponent type from last 500 games."""
         if opponent_type == 'random':
             results = self.results_vs_random
-        elif opponent_type == 'minimax' and depth == 1:
-            results = self.results_vs_minimax_d1
-        elif opponent_type == 'minimax' and depth == 2:
-            results = self.results_vs_minimax_d2
-        elif opponent_type == 'minimax' and depth == 3:
-            results = self.results_vs_minimax_d3
-        elif opponent_type == 'minimax' and depth == 4:
-            results = self.results_vs_minimax_d4
+        elif opponent_type == 'minimax':
+            results = self._depth_results_deque(depth)
+            if results is None:
+                return 0.0
         elif opponent_type == 'self':
             results = self.results_vs_self
         else:
@@ -393,14 +437,10 @@ class MixedTrainingState:
         """Record game result for win rate tracking."""
         if opponent_type == 'random':
             self.results_vs_random.append(result_str)
-        elif opponent_type == 'minimax' and depth == 1:
-            self.results_vs_minimax_d1.append(result_str)
-        elif opponent_type == 'minimax' and depth == 2:
-            self.results_vs_minimax_d2.append(result_str)
-        elif opponent_type == 'minimax' and depth == 3:
-            self.results_vs_minimax_d3.append(result_str)
-        elif opponent_type == 'minimax' and depth == 4:
-            self.results_vs_minimax_d4.append(result_str)
+        elif opponent_type == 'minimax':
+            deq = self._depth_results_deque(depth)
+            if deq is not None:
+                deq.append(result_str)
         elif opponent_type == 'self':
             self.results_vs_self.append(result_str)
 
@@ -569,67 +609,48 @@ class CurriculumManager:
         return max(0, moves)
 
     def get_learning_rate(self) -> float:
-        """Cosine annealing that restarts at lr_start on every clone update.
+        """Cosine annealing over the whole phase.
 
-        For Phase 1 (random-only): decays over the full phase.
-        For Phase 2+ (mixed): each clone generation gets its own cosine cycle,
-        restarting from lr_start whenever a new clone is deployed.
+        Previously the cycle restarted at lr_start on every clone update in
+        mixed phases, which produced an abrupt LR spike onto a near-zero-entropy
+        policy and triggered catastrophic collapse. The cosine now decays
+        monotonically across each phase; plateau reductions (applied by the
+        RLPlateauScheduler) compose multiplicatively on top of this base.
         """
         config = self.get_config()
-
-        if config.opponent_type != 'mixed':
-            # Phase 1: one cosine cycle over the whole phase
-            eps = self.stats.episodes_in_phase
-        else:
-            # Phase 2+: restart cycle on every clone update
-            # last_clone_episode == 0 at phase start, so first cycle begins fresh
-            eps = self.mixed_state.total_episodes - self.mixed_state.last_clone_episode
-
+        eps = self.stats.episodes_in_phase
         progress = min(1.0, eps / config.lr_cycle_episodes)
         return config.lr_end + 0.5 * (config.lr_start - config.lr_end) * (1.0 + math.cos(math.pi * progress))
 
     def get_shaping_multiplier(self) -> float:
         """
-        Get current shaping multiplier based on phase and progress.
+        Monotonic decay across total training episodes (no per-phase reset).
 
-        Low-shaping schedule (intentionally conservative):
-        - Phase 1: small fixed shaping
-        - Phase 2-9: small shaping that decays to 0 at 3/4 of phase,
-                     then stays at 0 for the last 1/4. Resets each phase.
-        - Phase 10: Always 0.0 (no shaping)
-        
-        Uses trend-based graduation (not fixed episode count).
-        Shaping decays over lr_cycle_episodes to ensure it reaches 0 before
-        trend-based graduation typically occurs (~1-2M episodes).
+        Combined with PBRS, the optimal policy is preserved for any mult ≥ 0,
+        so this schedule only controls the *scale* of the dense signal, not
+        its correctness. Decaying smoothly across phases avoids the
+        value-function shock that phase-boundary resets used to cause.
+
+        - Start (episode 0): 1.0
+        - Linear decay over SHAPING_DECAY_EPISODES
+        - Final phase (PHASE_10) and COMPLETED: floor at 0.0
         """
         if self.current_phase == Phase.COMPLETED:
             return 0.0
-
         if self.current_phase == Phase.PHASE_10:
             return 0.0
 
-        cfg = self.get_config()
-        base = min(0.20, max(0.0, cfg.shaping_multiplier * 0.25))
-
-        if self.current_phase == Phase.PHASE_1:
-            return base
-
-        # Phase 2-9: Dynamic low shaping based on phase progress
-        # Use lr_cycle_episodes as the reference timescale for shaping decay
-        # This ensures shaping reaches 0 around the time plateau detection kicks in
-        decay_episodes = cfg.lr_cycle_episodes
-        progress = min(1.0, self.stats.episodes_in_phase / decay_episodes)
-
-        # First 3/4: linear decay from base to 0.0
-        # Last 1/4: stay at 0.0
-        if progress >= 0.75:
-            return 0.0
-        else:
-            # Linear interpolation: base at progress=0, 0.0 at progress=0.75
-            return base * (1.0 - (progress / 0.75))
+        SHAPING_DECAY_EPISODES = 12_000_000
+        progress = min(1.0, self.total_episodes / SHAPING_DECAY_EPISODES)
+        return max(0.0, 1.0 - progress)
 
     def get_reward_config(self) -> Dict[str, float]:
-        """Get current reward configuration."""
+        """Get current reward configuration.
+
+        Per-feature weights are scaled by the shaping multiplier. step_penalty
+        is scaled too so the final phase is genuinely sparse. Gamma is included
+        so the PBRS shaping in RewardCalculator can compute γ·Φ(s') − Φ(s).
+        """
         config = self.get_config()
         mult = self.get_shaping_multiplier()
 
@@ -642,32 +663,32 @@ class CurriculumManager:
             'enemy_mill_penalty': config.enemy_mill_penalty * mult,
             'block_mill_reward': config.block_mill_reward * mult,
             'double_mill_reward': config.double_mill_reward * mult,
-            'double_mill_extra_reward': config.double_mill_extra_reward * mult,
             'setup_capture_reward': config.setup_capture_reward * mult,
-            'step_penalty': -0.003,
+            'step_penalty': -0.003 * mult,
             'piece_advantage_reward': 0.02 * mult,
-            'mobility_reward': 0.004 * mult,
+            'mobility_reward': 0.05 * mult,
             'max_shaping_abs': 0.20,
+            'gamma': 0.99,
         }
 
     def add_game_result(self, result: float, opponent_type: str = 'random', minimax_depth: int = 0):
         """
         Add a game result.
-        result > 0.5 = win, result < -0.9 = loss, else = draw
+        result > 0.5 = win, result < -1.5 = loss, else = draw
 
-        Note: draw_penalty is typically -0.8, loss_reward is -1.0
-        So draws fall in range [-0.9, 0.5]
+        Note: draw_penalty is typically -1.5, loss_reward is -2.0
+        So draws fall in range [-1.5, 0.5]
         """
         self.total_episodes += 1
         self.stats.episodes_in_phase += 1
 
         # Convert result to string
-        # Win: typically +1.0 to +2.0 (base + speed bonus)
-        # Draw: typically -0.8 (draw_penalty)
-        # Loss: typically -1.0 (loss_reward)
+        # Win: typically +2.0 to +3.0 (base + speed bonus)
+        # Draw: typically -1.5 (draw_penalty)
+        # Loss: typically -2.0 (loss_reward)
         if result > 0.5:
             result_str = 'win'
-        elif result < -0.9:
+        elif result < -1.5:
             result_str = 'loss'
         else:
             result_str = 'draw'
@@ -780,14 +801,7 @@ class CurriculumManager:
             return
         
         active_max_depth = self.mixed_state.active_minimax_max_depth
-        
-        if active_max_depth >= 4:
-            # Phase 10 or unlocked D4 - use all depths
-            wr = self.mixed_state.get_combined_minimax_win_rate_phase10()
-        else:
-            # Phase 2-9 - use D1+D2
-            wr = self.mixed_state.get_combined_minimax_win_rate()
-        
+        wr = self.mixed_state.get_combined_minimax_win_rate_up_to(active_max_depth)
         self.mixed_state.minimax_wr_history.append(wr)
 
     def _has_plateaued(self) -> bool:
@@ -946,9 +960,8 @@ class CurriculumManager:
 
     def check_and_unlock_minimax_depth(self) -> bool:
         """
-        Progressively unlock harder minimax depths based on win rate:
-        - D3 unlocks when WR vs D1 >= 80% over last 500 games (min 100 games)
-        - D4 unlocks when WR vs D2 >= 80% over last 500 games (min 100 games)
+        Progressively unlock harder minimax depths (D1 → D7):
+        D(n+1) unlocks when WR vs D(n) >= 50% over at least 100 games.
         Returns True if a new depth was unlocked.
         """
         config = self.get_config()
@@ -956,27 +969,25 @@ class CurriculumManager:
             return False
 
         ms = self.mixed_state
-        unlocked = False
+        threshold = MIXED_CONFIG['minimax_depth_unlock_threshold']
+        min_games = MIXED_CONFIG['minimax_depth_unlock_min_games']
 
-        # Unlock D3 when WR vs D1 > 80%
-        if ms.active_minimax_max_depth < 3:
-            if len(ms.results_vs_minimax_d1) >= 100:
-                wr_d1 = ms.get_win_rate_vs_opponent('minimax', 1)
-                if wr_d1 >= 0.80:
-                    ms.active_minimax_max_depth = 3
-                    print(f"\n  [Depth Unlock] D3 minimax unlocked! (WR vs D1: {wr_d1:.0%})")
-                    unlocked = True
+        current_max = ms.active_minimax_max_depth
+        if current_max >= 7:
+            return False  # Already at maximum
 
-        # Unlock D4 when WR vs D2 > 80%
-        if ms.active_minimax_max_depth < 4:
-            if len(ms.results_vs_minimax_d2) >= 100:
-                wr_d2 = ms.get_win_rate_vs_opponent('minimax', 2)
-                if wr_d2 >= 0.80:
-                    ms.active_minimax_max_depth = 4
-                    print(f"\n  [Depth Unlock] D4 minimax unlocked! (WR vs D2: {wr_d2:.0%})")
-                    unlocked = True
+        results = ms._depth_results_deque(current_max)
+        if results is None or len(results) < min_games:
+            return False
 
-        return unlocked
+        wr = ms.get_win_rate_vs_opponent('minimax', current_max)
+        if wr >= threshold:
+            ms.active_minimax_max_depth = current_max + 1
+            print(f"\n  [Depth Unlock] D{current_max + 1} minimax unlocked! "
+                  f"(WR vs D{current_max}: {wr:.0%})")
+            return True
+
+        return False
 
     def get_opponent_win_rates(self) -> Dict[str, float]:
         """Get win rates vs each opponent type (last 500 games)."""
@@ -986,6 +997,9 @@ class CurriculumManager:
             'wr_vs_mm_d2': ms.get_win_rate_vs_opponent('minimax', 2),
             'wr_vs_mm_d3': ms.get_win_rate_vs_opponent('minimax', 3),
             'wr_vs_mm_d4': ms.get_win_rate_vs_opponent('minimax', 4),
+            'wr_vs_mm_d5': ms.get_win_rate_vs_opponent('minimax', 5),
+            'wr_vs_mm_d6': ms.get_win_rate_vs_opponent('minimax', 6),
+            'wr_vs_mm_d7': ms.get_win_rate_vs_opponent('minimax', 7),
             'wr_vs_random': ms.get_win_rate_vs_opponent('random'),
             'wr_vs_self': ms.get_win_rate_vs_opponent('self'),
             'active_mm_max_depth': ms.active_minimax_max_depth,
@@ -1023,6 +1037,9 @@ class CurriculumManager:
                 'results_vs_minimax_d2': list(self.mixed_state.results_vs_minimax_d2),
                 'results_vs_minimax_d3': list(self.mixed_state.results_vs_minimax_d3),
                 'results_vs_minimax_d4': list(self.mixed_state.results_vs_minimax_d4),
+                'results_vs_minimax_d5': list(self.mixed_state.results_vs_minimax_d5),
+                'results_vs_minimax_d6': list(self.mixed_state.results_vs_minimax_d6),
+                'results_vs_minimax_d7': list(self.mixed_state.results_vs_minimax_d7),
                 'results_vs_self': list(self.mixed_state.results_vs_self),
                 'minimax_wr_history': list(self.mixed_state.minimax_wr_history),
             },
@@ -1066,13 +1083,16 @@ class CurriculumManager:
                     games_vs_random=ms.get('games_vs_random', 0),
                     games_vs_minimax=ms.get('games_vs_minimax', 0),
                     games_vs_self=ms.get('games_vs_self', 0),
-                    active_minimax_max_depth=ms.get('active_minimax_max_depth', 2),
+                    active_minimax_max_depth=ms.get('active_minimax_max_depth', 1),
                     selfplay_results=deque(ms.get('selfplay_results', []), maxlen=MIXED_CONFIG['selfplay_winrate_games']),
                     results_vs_random=deque(ms.get('results_vs_random', []), maxlen=500),
                     results_vs_minimax_d1=deque(ms.get('results_vs_minimax_d1', []), maxlen=500),
                     results_vs_minimax_d2=deque(ms.get('results_vs_minimax_d2', []), maxlen=500),
                     results_vs_minimax_d3=deque(ms.get('results_vs_minimax_d3', []), maxlen=500),
                     results_vs_minimax_d4=deque(ms.get('results_vs_minimax_d4', []), maxlen=500),
+                    results_vs_minimax_d5=deque(ms.get('results_vs_minimax_d5', []), maxlen=500),
+                    results_vs_minimax_d6=deque(ms.get('results_vs_minimax_d6', []), maxlen=500),
+                    results_vs_minimax_d7=deque(ms.get('results_vs_minimax_d7', []), maxlen=500),
                     results_vs_self=deque(ms.get('results_vs_self', []), maxlen=500),
                 )
                 if 'minimax_wins_by_depth' in ms:
@@ -1080,11 +1100,10 @@ class CurriculumManager:
                         int(k): v for k, v in ms['minimax_wins_by_depth'].items()
                     }
                 self.mixed_state.minimax_winrate_snapshots = ms.get('minimax_winrate_snapshots', [])
-                if 'minimax_wr_history' in ms:
-                    self.mixed_state.minimax_wr_history = deque(
-                        ms['minimax_wr_history'], 
-                        maxlen=GRADUATION_CONFIG['trend_window_samples']
-                    )
+                self.mixed_state.minimax_wr_history = deque(
+                    ms.get('minimax_wr_history', []),
+                    maxlen=GRADUATION_CONFIG['trend_window_samples']
+                )
 
             print(f"  Loaded curriculum: Phase {int(self.current_phase)}, {self.total_episodes:,} episodes")
             return True

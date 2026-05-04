@@ -125,12 +125,49 @@ def _count_mills(board: Tuple[Optional[int], ...], player: int) -> int:
 
 
 def _count_potential_mills(board: Tuple[Optional[int], ...], player: int) -> int:
+    """
+    Count mills that `player` can actually close on their very next move.
+
+    Placement phase (total pieces on board < 18) or flying phase (player has
+    exactly 3 pieces on board): any mill with 2 player pieces + 1 empty counts,
+    because the player can drop/fly a stone into the empty spot.
+
+    Movement phase (player has > 3 pieces, past placement): a mill with
+    2 player pieces + 1 empty only counts if there is a player stone
+    *outside* this mill that is adjacent to the empty spot, so it can
+    be slid in to complete the mill.
+    """
+    piece_count = _count_pieces(board, player)
+    total_on_board = sum(1 for p in board if p is not None)
+
+    # Before all 18 stones have been placed, we treat it as placement phase
+    # (captures during placement are rare enough that this heuristic is fine).
+    is_placement = total_on_board < 18
+    # Flying: exactly 3 stones and placement is over.
+    is_flying = (not is_placement) and piece_count == 3
+    any_empty_counts = is_placement or is_flying
+
     count = 0
     for mill in MILLS:
-        player_count = sum(1 for p in mill if board[p] == player)
-        empty_count = sum(1 for p in mill if board[p] is None)
-        if player_count == 2 and empty_count == 1:
+        players_in_mill = [p for p in mill if board[p] == player]
+        if len(players_in_mill) != 2:
+            continue
+        empties = [p for p in mill if board[p] is None]
+        if len(empties) != 1:
+            continue
+
+        empty_pos = empties[0]
+
+        if any_empty_counts:
             count += 1
+            continue
+
+        # Movement phase: need a player piece outside this mill that is
+        # adjacent to empty_pos and can slide into it.
+        for adj in ADJACENCY[empty_pos]:
+            if board[adj] == player and adj not in players_in_mill:
+                count += 1
+                break
     return count
 
 
@@ -146,14 +183,9 @@ def _count_blocked_mills(board: Tuple[Optional[int], ...], player: int) -> int:
 
 
 def _count_unblocked_threats(board: Tuple[Optional[int], ...], player: int) -> int:
-    opponent = 1 - player
-    count = 0
-    for mill in MILLS:
-        opp_count = sum(1 for p in mill if board[p] == opponent)
-        empty_count = sum(1 for p in mill if board[p] is None)
-        if opp_count == 2 and empty_count == 1:
-            count += 1
-    return count
+    """Count mills the opponent can close on their next move (see
+    `_count_potential_mills` for the definition)."""
+    return _count_potential_mills(board, 1 - player)
 
 
 def _count_double_mills(board: Tuple[Optional[int], ...], player: int) -> int:
@@ -247,15 +279,19 @@ def count_pieces_from_state(state, player: int) -> Tuple[int, int]:
 class RewardCalculator:
     """
     Calculates rewards based on curriculum phase settings.
+
+    Shaping uses Potential-Based Reward Shaping (PBRS):
+        r_shape = γ·Φ(s') − Φ(s) + step_penalty
+    This preserves the optimal policy regardless of shaping magnitude.
     """
-    
+
     def __init__(self, reward_config: Dict[str, float]):
         self.config = reward_config
-    
+
     def update_config(self, reward_config: Dict[str, float]):
         """Update reward configuration (e.g., when phase changes)."""
         self.config = reward_config
-    
+
     def calculate_terminal_reward(
         self,
         returns: List[float],
@@ -266,59 +302,56 @@ class RewardCalculator:
         """Calculate reward for terminal game state."""
         my_return = returns[player]
         opp_return = returns[1 - player]
-        
+
         if my_return > opp_return:
-            # Win - bonus for fast wins
             base = self.config['win_reward_base']
             bonus = self.config['win_reward_speed_bonus']
-            
-            # Simple speed bonus: 1.0 down to 0.0 based on steps (0-300)
-            # Table says bonus is 0.5, curriculum says 0.5 or 1.0.
-            # We use the config value.
             speed_bonus = bonus * max(0, 1.0 - (steps / max_steps))
             return base + speed_bonus
-                
+
         elif my_return < opp_return:
-            # Loss - penalty (fixed in table)
             return self.config['loss_reward']
         else:
-            # Draw
             return self.config['draw_penalty']
-    
+
+    def calculate_potential(self, state_info: Dict[str, Any]) -> float:
+        """
+        Φ(s): scalar potential for the acting player, derived from minimax-aligned
+        board features. Weights come from the reward config (already scaled by the
+        curriculum's shaping multiplier).
+        """
+        cfg = self.config
+        phi = 0.0
+        phi += cfg.get('mill_reward', 0.0) * state_info.get('my_mills', 0.0)
+        phi -= cfg.get('mill_reward', 0.0) * state_info.get('opp_mills', 0.0)
+        phi += cfg.get('setup_capture_reward', 0.0) * state_info.get('my_potential_mills', 0.0)
+        phi -= cfg.get('block_mill_reward', 0.0) * state_info.get('opp_unblocked_threats', 0.0)
+        phi += cfg.get('double_mill_reward', 0.0) * state_info.get('my_double_mills', 0.0)
+        phi += cfg.get('piece_advantage_reward', 0.0) * (
+            state_info.get('my_pieces', 0.0) - state_info.get('opp_pieces', 0.0)
+        )
+        phi += cfg.get('mobility_reward', 0.0) * (
+            state_info.get('my_mobility', 0.0) - state_info.get('opp_mobility', 0.0)
+        )
+        return float(phi)
+
     def calculate_shaping_reward(
         self,
         prev_state_info: Dict[str, Any],
         new_state_info: Dict[str, Any],
         player: int
     ) -> float:
-        """
-        Low-intensity shaping from board-structure deltas (same primitives as minimax).
-        """
-        reward = float(self.config.get('step_penalty', -0.003))
+        """PBRS: r = γ·Φ(s') − Φ(s) + step_penalty, clipped to ±max_shaping_abs."""
+        gamma = float(self.config.get('gamma', 0.99))
+        prev_phi = self.calculate_potential(prev_state_info)
+        new_phi = self.calculate_potential(new_state_info)
 
-        def delta(key: str) -> float:
-            return float(new_state_info.get(key, 0.0)) - float(prev_state_info.get(key, 0.0))
+        reward = gamma * new_phi - prev_phi
+        reward += float(self.config.get('step_penalty', 0.0))
 
-        # Positive structure gains
-        reward += self.config.get('mill_reward', 0.0) * delta('my_mills')
-        reward += self.config.get('block_mill_reward', 0.0) * delta('my_blocked_mills')
-        reward += 0.50 * self.config.get('setup_capture_reward', 0.0) * delta('my_potential_mills')
-        reward += 0.25 * self.config.get('double_mill_reward', 0.0) * delta('my_double_mills')
+        cap = float(self.config.get('max_shaping_abs', 0.20))
+        return float(np.clip(reward, -cap, cap))
 
-        # Threat control
-        reward -= 0.50 * self.config.get('block_mill_reward', 0.0) * delta('opp_unblocked_threats')
-
-        # Gentle global pressure signals
-        old_piece_diff = float(prev_state_info.get('my_pieces', 0.0)) - float(prev_state_info.get('opp_pieces', 0.0))
-        new_piece_diff = float(new_state_info.get('my_pieces', 0.0)) - float(new_state_info.get('opp_pieces', 0.0))
-        reward += self.config.get('piece_advantage_reward', 0.0) * (new_piece_diff - old_piece_diff)
-
-        mobility_delta = delta('my_mobility') - 0.5 * delta('opp_mobility')
-        reward += self.config.get('mobility_reward', 0.0) * mobility_delta
-
-        shaping_cap = float(self.config.get('max_shaping_abs', 0.20))
-        return float(np.clip(reward, -shaping_cap, shaping_cap))
-    
     def calculate_timeout_penalty(self) -> float:
         """Penalty for game timing out (too long)."""
         return self.config['draw_penalty'] * 0.8  # Slightly better than draw
@@ -374,17 +407,16 @@ class ExperienceBatch:
 
 
 def prepare_game_state(state, random_moves: int):
-    """Play random vs random moves to prepare a mid-game board position (not recorded)."""
+    """Play random vs random moves to prepare a mid-game board position (not recorded).
+    
+    Stops early if:
+    - The game reaches a terminal state
+    - A player is reduced to 3 or fewer pieces (only checked after placement phase,
+      when all 18 pieces are on the board, since during placement pieces in hand
+      are not counted on the board)
+    """
     moves_made = 0
     while moves_made < random_moves and not state.is_terminal():
-        # Stop early if either player is down to 3 stones (about to enter jumping phase)
-        try:
-            p0_pieces, p1_pieces = count_pieces_from_state(state, 0)
-            if p0_pieces <= 3 or p1_pieces <= 3:
-                break
-        except:
-            pass
-
         legal_actions = state.legal_actions()
         if not legal_actions:
             break
@@ -392,3 +424,14 @@ def prepare_game_state(state, random_moves: int):
         action = random.choice(legal_actions)
         state.apply_action(action)
         moves_made += 1
+
+        # Stop early if either player is down to 3 stones (about to lose / enter jumping phase).
+        # Only check AFTER the placement phase: during placement, pieces on the board
+        # are misleadingly low because pieces are still "in hand". Once total pieces
+        # on board >= 18, placement is done and piece counts are meaningful.
+        try:
+            p0_pieces, p1_pieces = count_pieces_from_state(state, 0)
+            if (p0_pieces + p1_pieces) >= 18 and (p0_pieces <= 3 or p1_pieces <= 3):
+                break
+        except Exception:
+            pass

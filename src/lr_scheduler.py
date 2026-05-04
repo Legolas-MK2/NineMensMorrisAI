@@ -153,16 +153,22 @@ class RLPlateauScheduler:
     def step(self, metric: float, episode: int = 0) -> bool:
         """
         Step the scheduler with a new metric value.
-        
+
+        The scheduler does NOT write to the optimizer directly: the trainer
+        owns LR (cosine base * plateau multiplier). A reduction here simply
+        increments `reductions`, which changes what `get_plateau_multiplier`
+        returns. The trainer's `_update_learning_rate` picks this up on its
+        next call and applies it on top of the cosine base.
+
         Args:
             metric: Win rate against the hardest opponent (e.g., Minimax-2)
             episode: Current episode count (for logging)
-        
+
         Returns:
-            True if learning rate was reduced
+            True if a plateau reduction was registered this step.
         """
         lr_reduced = False
-        
+
         # Record history
         self.history.append({
             'episode': episode,
@@ -181,54 +187,71 @@ class RLPlateauScheduler:
         # Optional early-stop behavior. Disabled by default so curriculum phases
         # drive termination, not LR scheduler state.
         if self.allow_early_stop:
-            # Check for target win rate
             if metric >= self.target_win_rate:
                 self._should_stop = True
                 self.stop_reason = f"Target win rate reached: {metric:.1%} >= {self.target_win_rate:.1%}"
                 print(f"  [Scheduler] {self.stop_reason}")
                 return False
 
-            # Check if current LR is already at minimum
             if self.current_lrs[0] <= self.min_lr:
                 self._should_stop = True
                 self.stop_reason = f"LR reached minimum: {self.current_lrs[0]:.1e} <= {self.min_lr:.1e}"
                 print(f"  [Scheduler] {self.stop_reason}")
                 return False
-        
+
         # Check for improvement
         if metric > self.best_score + self.threshold:
-            # Improvement detected
             self.best_score = metric
             self.best_episode = episode
             self.wait = 0
         else:
-            # No improvement
             self.wait += 1
-            
+
             if self.wait >= self.patience:
-                # Reduce learning rate
-                new_lr = self.current_lrs[0] * self.factor
-                new_lr = max(new_lr, self.min_lr)
-                
-                if new_lr < self.current_lrs[0]:
-                    self._update_learning_rate(new_lr)
-                    self.current_lrs = [new_lr] * len(self.current_lrs)
-                    self.reductions += 1
-                    lr_reduced = True
-                    
-                    print(
-                        f"  [Scheduler] LR reduced: {self.current_lrs[0]:.1e} "
-                        f"(reduction #{self.reductions}, best {self.metric_name}={self.best_score:.1%} "
-                        f"at episode {self.best_episode:,})"
-                    )
-                
-                self.wait = 0  # Reset wait after reduction
-        
+                # Register a plateau reduction. Actual LR is applied by the
+                # trainer via get_plateau_multiplier().
+                self.reductions += 1
+                lr_reduced = True
+                mult = self.get_plateau_multiplier()
+                print(
+                    f"  [Scheduler] Plateau reduction #{self.reductions} "
+                    f"(multiplier now {mult:.3f}x, best {self.metric_name}={self.best_score:.1%} "
+                    f"at episode {self.best_episode:,})"
+                )
+                self.wait = 0
+
         return lr_reduced
-    
+
+    def get_plateau_multiplier(self) -> float:
+        """Multiplicative factor applied by plateau reductions.
+
+        The trainer composes this with the curriculum's cosine base LR:
+            final_lr = max(cosine_lr * plateau_multiplier, min_lr)
+        """
+        return self.factor ** self.reductions
+
+    def notify_current_lr(self, lr: float):
+        """Let the trainer report the effective LR back for logging parity."""
+        self.current_lrs = [lr] * max(1, len(self.current_lrs))
+
+    def reset(self):
+        """Reset scheduler state for a new phase.
+
+        Called on every phase transition so accumulated reductions from
+        previous phases (where WR ceilings were different) don't carry
+        forward and pin the new-phase LR at min_lr from the start.
+        """
+        self.best_score = -float('inf')
+        self.best_episode = 0
+        self.wait = 0
+        self.reductions = 0
+        self._should_stop = False
+        self.stop_reason = ""
+        print(f"  [Scheduler] Reset for new phase (reductions → 0, best_score → -∞)")
+
     def _update_learning_rate(self, new_lr: float):
-        """Update the optimizer's learning rate."""
-        for i, param_group in enumerate(self.optimizer.param_groups):
+        """Deprecated: kept for backward-compatible state loading paths."""
+        for param_group in self.optimizer.param_groups:
             param_group['lr'] = new_lr
     
     def should_stop(self) -> bool:

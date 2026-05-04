@@ -937,13 +937,46 @@ class OptimizedMinimaxBot:
     def _count_potential_mills(
         self, board: Tuple[Optional[int], ...], player: int
     ) -> int:
-        """Count potential mills (2 pieces + 1 empty)."""
+        """
+        Count mills `player` can actually close on their very next move.
+
+        - Placement phase (total pieces on board < 18) or flying phase
+          (player has exactly 3 pieces on board): any mill with 2 player
+          pieces + 1 empty counts, because the player can drop/fly a stone
+          into the empty spot.
+        - Movement phase (player has > 3 pieces, past placement): a mill
+          with 2 player pieces + 1 empty only counts if there is a player
+          stone outside this mill that is adjacent to the empty spot, so
+          it can be slid in to complete the mill.
+        """
+        piece_count = self._count_pieces(board, player)
+        total_on_board = sum(1 for p in board if p is not None)
+
+        is_placement = total_on_board < 18
+        is_flying = (not is_placement) and piece_count == 3
+        any_empty_counts = is_placement or is_flying
+
         count = 0
         for mill in MILLS:
-            player_count = sum(1 for p in mill if board[p] == player)
-            empty_count = sum(1 for p in mill if board[p] is None)
-            if player_count == 2 and empty_count == 1:
+            players_in_mill = [p for p in mill if board[p] == player]
+            if len(players_in_mill) != 2:
+                continue
+            empties = [p for p in mill if board[p] is None]
+            if len(empties) != 1:
+                continue
+
+            empty_pos = empties[0]
+
+            if any_empty_counts:
                 count += 1
+                continue
+
+            # Movement phase: need a player piece outside this mill
+            # that is adjacent to the empty spot.
+            for adj in ADJACENCY[empty_pos]:
+                if board[adj] == player and adj not in players_in_mill:
+                    count += 1
+                    break
         return count
 
     def _count_blocked_mills(
@@ -963,16 +996,9 @@ class OptimizedMinimaxBot:
     def _count_unblocked_threats(
         self, board: Tuple[Optional[int], ...], player: int
     ) -> int:
-        """Count opponent potential mills that we are NOT blocking (opponent has 2, spot is empty)."""
-        opponent = 1 - player
-        count = 0
-        for mill in MILLS:
-            opp_count = sum(1 for p in mill if board[p] == opponent)
-            empty_count = sum(1 for p in mill if board[p] is None)
-            # Opponent has 2 pieces and third spot is empty - immediate threat!
-            if opp_count == 2 and empty_count == 1:
-                count += 1
-        return count
+        """Count mills the opponent can actually close on their next move
+        (uses the same reachability logic as `_count_potential_mills`)."""
+        return self._count_potential_mills(board, 1 - player)
 
     def _count_double_mills(self, board: Tuple[Optional[int], ...], player: int) -> int:
         """
@@ -1518,10 +1544,6 @@ class OptimizedMinimaxBot:
             use_threading: Use parallel root search
         """
         legal_actions = state.legal_actions()
-
-        # Random move for training variety
-        if self.random_move_prob > 0 and random.random() < self.random_move_prob:
-            return random.choice(legal_actions)
 
         # Reset stats
         self.nodes_evaluated = 0

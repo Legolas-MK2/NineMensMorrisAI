@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ':*)",
+      "Bash(curl -s -X POST http://localhost:5001/api/game/move -H 'Content-Type: application/json' -d '{\"action\":3}')",
+      "Bash(curl -s -X POST http://localhost:5001/api/game/move -H 'Content-Type: application/json' -d '{\"action\":20}')",
+      "Bash(curl -s -X POST http://localhost:5001/api/game/move -H 'Content-Type: application/json' -d '{\"action\":18}')",
+      "Bash(curl -s http://localhost:5001/api/game/state)",
+      "Bash(curl -s http://localhost:5001/api/game/history)",
+      "Bash(python3 -c \"import sys,json; print\\(len\\(json.load\\(sys.stdin\\)\\), 'models'\\)\")",
+      "Bash(python -m ai_engine.benchmark)",
+      "Bash(python -c \"from ai_engine.trainer import Trainer; from ai_engine.self_play import generate_games_vs_opponent; from ai_engine.mcts import batched_vs_opponent; print\\('All imports OK'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(ls -t \"/Project/Nine Mens Morris/src/logs/\"*_curriculum.csv)"
+    ]
+  }
+}

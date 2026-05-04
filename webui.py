@@ -22,8 +22,8 @@ import numpy as np
 import torch
 from flask import Flask, render_template_string, jsonify, request
 
-# Add claude directory to path
-sys.path.insert(0, str(Path(__file__).parent / "claude"))
+# Add model directory to path
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from model import ActorCritic
 from config import Config
@@ -31,6 +31,7 @@ from utils import get_legal_mask
 from minimax import MinimaxBot
 import pyspiel
 from game_wrapper import load_game as load_game_fixed
+
 
 app = Flask(__name__)
 
@@ -103,24 +104,24 @@ def get_available_models() -> List[Dict[str, str]]:
     """Scan for available trained models."""
     models = []
 
-    # Check claude/models directory
-    claude_models_dir = Path(__file__).parent / "claude" / "models"
-    if claude_models_dir.exists():
-        for pt_file in sorted(claude_models_dir.glob("*.pt"), reverse=True):
+    # Check src/models directory
+    src_models_dir = Path(__file__).parent / "src" / "models"
+    if src_models_dir.exists():
+        for pt_file in sorted(src_models_dir.glob("*.pt"), reverse=True):
             models.append({
-                "name": f"claude/{pt_file.name}",
+                "name": f"src/{pt_file.name}",
                 "path": str(pt_file),
-                "type": "claude"
+                "type": "src"
             })
 
-    # Check claude/checkpoints directory
-    claude_checkpoints_dir = Path(__file__).parent / "claude" / "checkpoints"
-    if claude_checkpoints_dir.exists():
-        for pt_file in sorted(claude_checkpoints_dir.glob("*.pt"), reverse=True):
+    # Check src/checkpoints directory
+    src_checkpoints_dir = Path(__file__).parent / "src" / "checkpoints"
+    if src_checkpoints_dir.exists():
+        for pt_file in sorted(src_checkpoints_dir.glob("*.pt"), reverse=True):
             models.append({
-                "name": f"claude/checkpoints/{pt_file.name}",
+                "name": f"src/checkpoints/{pt_file.name}",
                 "path": str(pt_file),
-                "type": "claude"
+                "type": "src"
             })
 
     # Check models directory
@@ -132,28 +133,46 @@ def get_available_models() -> List[Dict[str, str]]:
                 models.append({
                     "name": f"models/{pt_file.name}",
                     "path": str(pt_file),
-                    "type": "claude"
+                    "type": "src"
                 })
+
+    # Check root checkpoints directory
+    checkpoints_dir = Path(__file__).parent / "checkpoints"
+    if checkpoints_dir.exists():
+        for pt_file in sorted(checkpoints_dir.glob("*.pt"), reverse=True):
+            models.append({
+                "name": f"checkpoints/{pt_file.name}",
+                "path": str(pt_file),
+                "type": "src"
+            })
+
+    # Check src/checkpoints directory
+    src_checkpoints_dir = Path(__file__).parent / "src" / "checkpoints"
+    if src_checkpoints_dir.exists():
+        for pt_file in sorted(src_checkpoints_dir.glob("*.pt"), reverse=True):
+            models.append({
+                "name": f"src/checkpoints/{pt_file.name}",
+                "path": str(pt_file),
+                "type": "src"
+            })
 
     return models
 
 
-def load_model(model_info: Dict[str, str]) -> Tuple[Any, str]:
-    """Load a model from disk."""
-    model_type = model_info["type"]
+def load_model(model_info: Dict[str, str]) -> Any:
+    """Load a model from disk. Returns (model, 'src')."""
+    checkpoint = torch.load(model_info["path"], map_location=DEVICE, weights_only=False)
 
     config = Config()
-    config.obs_shape = OBS_SHAPE  # needed for correct one-hot encoding inside model
+    config.obs_shape = OBS_SHAPE
     model = ActorCritic(OBS_SIZE, NUM_ACTIONS, config).to(DEVICE)
-
-    checkpoint = torch.load(model_info["path"], map_location=DEVICE, weights_only=False)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
     else:
         model.load_state_dict(checkpoint)
 
     model.eval()
-    return model, model_info["type"]
+    return model, 'src'
 
 
 def decode_action(action: int, is_capture_phase: bool = False) -> Dict[str, Any]:
@@ -729,6 +748,11 @@ HTML_TEMPLATE = '''
                 </div>
             </div>
 
+            <div class="minimax-options">
+                <label for="prepare-moves">Prepare Moves (random moves before play)</label>
+                <input type="number" id="prepare-moves" min="0" max="150" value="30" step="1">
+            </div>
+
             <button class="btn-primary" onclick="newGame()">New Game</button>
             <button class="btn-secondary" onclick="makeAIMove()">AI Move / Next Step</button>
 
@@ -822,6 +846,7 @@ HTML_TEMPLATE = '''
         let currentPlayer = 0;
         let gamePhase = 'placement';
         let isTerminal = false;
+        let modelList = [];  // cached model list with type info
 
         // Board coordinates (matching Python POINT_TO_COORD) - (row, col) format
         // Row-by-row numbering: top-to-bottom, left-to-right
@@ -1128,14 +1153,16 @@ HTML_TEMPLATE = '''
                 const modelSelect = document.getElementById(`player${currentPlayer}-model`);
                 const modelPath = modelSelect?.value || '';
 
+                const reqBody = {
+                    player_type: playerType,
+                    model_path: modelPath,
+                    minimax_depth: parseInt(depth)
+                };
+
                 const response = await fetch('/api/ai_move', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        player_type: playerType,
-                        model_path: modelPath,
-                        minimax_depth: parseInt(depth)
-                    })
+                    body: JSON.stringify(reqBody)
                 });
                 const data = await response.json();
 
@@ -1239,13 +1266,13 @@ HTML_TEMPLATE = '''
         async function loadModels() {
             try {
                 const response = await fetch('/api/models');
-                const models = await response.json();
+                modelList = await response.json();
 
                 for (let player = 0; player < 2; player++) {
                     const select = document.getElementById(`player${player}-model`);
-                    select.innerHTML = models.map(m =>
-                        `<option value="${m.path}">${m.name}</option>`
-                    ).join('');
+                    select.innerHTML = modelList.map(m => {
+                        return `<option value="${m.path}">${m.name}</option>`;
+                    }).join('');
                 }
             } catch (err) {
                 console.error('Error loading models:', err);
@@ -1262,7 +1289,8 @@ HTML_TEMPLATE = '''
                     player0_depth: parseInt(document.getElementById('player0-depth').value),
                     player1_type: document.getElementById('player1-type').value,
                     player1_model: document.getElementById('player1-model').value,
-                    player1_depth: parseInt(document.getElementById('player1-depth').value)
+                    player1_depth: parseInt(document.getElementById('player1-depth').value),
+                    prepare_moves: parseInt(document.getElementById('prepare-moves').value) || 0
                 };
 
                 const response = await fetch('/api/new_game', {
@@ -1335,6 +1363,20 @@ def api_new_game():
     game_state.player_types[1] = config.get('player1_type', 'ai')
     game_state.player_minimax_depth[0] = config.get('player0_depth', 3)
     game_state.player_minimax_depth[1] = config.get('player1_depth', 3)
+
+    # Prepare board with random moves to produce a mid-game position.
+    # Note: src/utils.prepare_game_state bails at the start because both
+    # players have 0 board pieces, so we roll our own.
+    prepare_moves = int(config.get('prepare_moves', 0) or 0)
+    if prepare_moves > 0:
+        state = game_state.state
+        for _ in range(prepare_moves):
+            if state.is_terminal():
+                break
+            legal = state.legal_actions()
+            if not legal:
+                break
+            state.apply_action(random.choice(legal))
 
     # Load AI models if needed
     models = get_available_models()
@@ -1440,7 +1482,7 @@ def api_ai_move():
                     break
 
         if model_data:
-            model, model_type = model_data
+            model, _ = model_data
             action, probabilities = get_ai_move_with_probs(model, game_state.state, current_player)
         else:
             # Fallback to random

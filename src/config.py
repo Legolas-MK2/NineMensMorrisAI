@@ -40,7 +40,7 @@ class Config:
     dropout: float = 0.05
     
     # PPO hyperparameters
-    gamma: float = 0.99
+    gamma: float = 0.9
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.12
     max_grad_norm: float = 0.5

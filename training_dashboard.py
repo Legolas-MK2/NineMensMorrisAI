@@ -11,7 +11,7 @@ from flask import Flask, render_template_string, jsonify, request
 
 app = Flask(__name__)
 
-LOGS_DIR = Path(__file__).parent / "claude" / "logs"
+LOGS_DIR = Path(__file__).parent / "src" / "logs"
 
 # ─────────────────────────────────────────────
 # Data helpers
@@ -79,8 +79,11 @@ def summarise(rows):
             prev_clone_gen = cg
 
     # Best win rates
-    best_wr_mm4 = max((r.get("wr_vs_mm_d4", 0) for r in rows), default=0)
-    best_wr_mm3 = max((r.get("wr_vs_mm_d3", 0) for r in rows), default=0)
+    best_wr_mm3 = max((r.get("wr_vs_mm_d3", 0) or 0 for r in rows), default=0)
+    best_wr_mm4 = max((r.get("wr_vs_mm_d4", 0) or 0 for r in rows), default=0)
+    best_wr_mm5 = max((r.get("wr_vs_mm_d5", 0) or 0 for r in rows), default=0)
+    best_wr_mm6 = max((r.get("wr_vs_mm_d6", 0) or 0 for r in rows), default=0)
+    best_wr_mm7 = max((r.get("wr_vs_mm_d7", 0) or 0 for r in rows), default=0)
 
     # Downsample rows for chart (max 400 points to keep response small)
     step = max(1, len(rows) // 400)
@@ -102,14 +105,21 @@ def summarise(rows):
         "minimax_depth_beaten": last.get("minimax_depth_beaten"),
         "clone_gen": last.get("clone_gen"),
         "active_mm_depth": last.get("active_mm_max_depth"),
+        "shaping_mult": last.get("shaping_mult"),
         "wr_vs_mm_d1": last.get("wr_vs_mm_d1"),
         "wr_vs_mm_d2": last.get("wr_vs_mm_d2"),
         "wr_vs_mm_d3": last.get("wr_vs_mm_d3"),
         "wr_vs_mm_d4": last.get("wr_vs_mm_d4"),
+        "wr_vs_mm_d5": last.get("wr_vs_mm_d5"),
+        "wr_vs_mm_d6": last.get("wr_vs_mm_d6"),
+        "wr_vs_mm_d7": last.get("wr_vs_mm_d7"),
         "wr_vs_random": last.get("wr_vs_random"),
         "wr_vs_self": last.get("wr_vs_self"),
         "best_wr_mm3": best_wr_mm3,
         "best_wr_mm4": best_wr_mm4,
+        "best_wr_mm5": best_wr_mm5,
+        "best_wr_mm6": best_wr_mm6,
+        "best_wr_mm7": best_wr_mm7,
         "total_rows": len(rows),
         "phase_transitions": phase_transitions,
         "depth_milestones": depth_milestones,
@@ -362,21 +372,28 @@ function destroyChart(id) {
 
 function applySyncZoom(chart, skipChartId) {
   const xScale = chart.scales.x;
-  
+
   const newZoomState = {
     xMin: xScale.min,
     xMax: xScale.max
   };
-  
+
   // Update global sync state
   syncZoomState = newZoomState;
   updateZoomLevelDisplay();
-  
-  // Apply to all other charts (x-axis only)
+
+  // Recalc y-axis on source chart to match the new visible x-range
+  if (chart._recalcYAxis) {
+    chart._recalcYAxis();
+    chart.update('none');
+  }
+
+  // Apply to all other charts (x-axis), then recompute their y-axis
   isSyncingZoom = true;
   Object.entries(chartInstances).forEach(([id, otherChart]) => {
     if (id !== skipChartId && otherChart) {
       otherChart.zoomScale('x', { min: newZoomState.xMin, max: newZoomState.xMax }, 'none');
+      if (otherChart._recalcYAxis) otherChart._recalcYAxis();
       otherChart.update('none');
     }
   });
@@ -433,16 +450,17 @@ function makeLineChart(id, labels, datasets, yLabel = '', yMin = null, yMax = nu
   
   chartPanel.querySelector('h2').insertAdjacentElement('afterend', legendDiv);
   
-  // Calculate y-axis bounds from visible datasets
-  function calcYBounds() {
+  // Calculate y-axis bounds from visible datasets, optionally filtered by x-range
+  function calcYBounds(xRangeMin, xRangeMax) {
     let min = Infinity, max = -Infinity;
-    originalDatasets.forEach((d, idx) => {
+    originalDatasets.forEach((d) => {
       if (d.visible) {
         d.data.forEach(pt => {
-          if (pt.y != null && isFinite(pt.y)) {
-            min = Math.min(min, pt.y);
-            max = Math.max(max, pt.y);
-          }
+          if (pt.y == null || !isFinite(pt.y)) return;
+          if (xRangeMin != null && pt.x < xRangeMin) return;
+          if (xRangeMax != null && pt.x > xRangeMax) return;
+          min = Math.min(min, pt.y);
+          max = Math.max(max, pt.y);
         });
       }
     });
@@ -450,33 +468,47 @@ function makeLineChart(id, labels, datasets, yLabel = '', yMin = null, yMax = nu
       min = yMin ?? 0;
       max = yMax ?? 1;
     }
-    // Add 5% padding
+    // Add 5% padding (fall back to abs value for a flat line)
     const range = max - min;
     if (range > 0) {
       min -= range * 0.05;
       max += range * 0.05;
+    } else {
+      const pad = Math.abs(min) * 0.05 || 0.5;
+      min -= pad;
+      max += pad;
     }
     return { min, max };
   }
-  
+
+  // Recompute y-axis based on the chart's currently visible x-range
+  function recalcYAxis() {
+    const chart = chartInstances[id];
+    if (!chart) return;
+    const anyVisible = originalDatasets.some(d => d.visible);
+    if (!anyVisible) {
+      chart.options.scales.y.min = yMin ?? 0;
+      chart.options.scales.y.max = yMax ?? 1;
+      return;
+    }
+    const xScale = chart.scales.x;
+    const bounds = calcYBounds(xScale.min, xScale.max);
+    chart.options.scales.y.min = bounds.min;
+    chart.options.scales.y.max = bounds.max;
+  }
+
   // Update chart visibility and rescale
   function updateChartVisibility() {
     const chart = chartInstances[id];
     if (!chart) return;
-    
-    const anyVisible = originalDatasets.some(d => d.visible);
-    
+
     chart.data.datasets.forEach((ds, idx) => {
       ds.hidden = !originalDatasets[idx].visible;
     });
-    
-    // Recalculate y-axis bounds
-    const bounds = calcYBounds();
-    chart.options.scales.y.min = anyVisible ? bounds.min : 0;
-    chart.options.scales.y.max = anyVisible ? bounds.max : 1;
-    
+
+    recalcYAxis();
     chart.update('none');
-    
+
     // Sync zoom to other charts
     if (!isSyncingZoom) {
       applySyncZoom(chart, id);
@@ -555,6 +587,11 @@ function makeLineChart(id, labels, datasets, yLabel = '', yMin = null, yMax = nu
             enabled: true,
             mode: 'x',
             modifierKey: null,
+            onPanComplete: (ctx) => {
+              if (!isSyncingZoom) {
+                applySyncZoom(ctx.chart, id);
+              }
+            },
           },
           zoom: {
             wheel: {
@@ -581,6 +618,8 @@ function makeLineChart(id, labels, datasets, yLabel = '', yMin = null, yMax = nu
       scales
     }
   });
+
+  chartInstances[id]._recalcYAxis = recalcYAxis;
 }
 
 // ─── Load list of log files ───
@@ -704,6 +743,10 @@ function render(d) {
         <div class="chart-wrap"><canvas id="chartLR"></canvas></div>
       </div>
       <div class="chart-panel">
+        <h2>Shaping Multiplier</h2>
+        <div class="chart-wrap"><canvas id="chartShaping"></canvas></div>
+      </div>
+      <div class="chart-panel">
         <h2>Win Rate &amp; Draw Rate (Overall)</h2>
         <div class="chart-wrap"><canvas id="chartWRDraw"></canvas></div>
       </div>
@@ -725,6 +768,9 @@ function render(d) {
     { label: 'vs MM-D2', data: rows.map(r => r.wr_vs_mm_d2), color: '#66bb6a' },
     { label: 'vs MM-D3', data: rows.map(r => r.wr_vs_mm_d3), color: '#ffb74d' },
     { label: 'vs MM-D4', data: rows.map(r => r.wr_vs_mm_d4), color: '#ef5350' },
+    { label: 'vs MM-D5', data: rows.map(r => r.wr_vs_mm_d5), color: '#ec407a' },
+    { label: 'vs MM-D6', data: rows.map(r => r.wr_vs_mm_d6), color: '#7e57c2' },
+    { label: 'vs MM-D7', data: rows.map(r => r.wr_vs_mm_d7), color: '#26a69a' },
     { label: 'vs Random', data: rows.map(r => r.wr_vs_random), color: '#ab47bc' },
   ], 'Win Rate', 0, 1, cloneGenAnnotations);
 
@@ -762,6 +808,11 @@ function render(d) {
   makeLineChart('chartLR', labels, [
     { label: 'Learning Rate', data: rows.map(r => clamp(r.lr, 0, 1e-3)), color: '#26c6da', fill: true },
   ], 'LR', null, null, cloneGenAnnotations);
+
+  // Shaping Multiplier
+  makeLineChart('chartShaping', labels, [
+    { label: 'Shaping Mult', data: rows.map(r => r.shaping_mult), color: '#ab47bc', fill: true },
+  ], 'Multiplier', 0, null, cloneGenAnnotations);
 
   // Overall Win Rate + Draw Rate
   makeLineChart('chartWRDraw', labels, [
@@ -812,6 +863,11 @@ function renderCards(s) {
       <div class="value">${s.clone_gen ?? '—'}</div>
       <div class="sub">opponent clones</div>
     </div>
+    <div class="card">
+      <div class="label">Shaping Mult</div>
+      <div class="value">${s.shaping_mult != null ? s.shaping_mult.toFixed(3) : '—'}</div>
+      <div class="sub">reward shaping</div>
+    </div>
     <div class="card green">
       <div class="label">vs Random</div>
       <div class="value">${pct(s.wr_vs_random)}</div>
@@ -846,6 +902,9 @@ function renderWinRates(s) {
     { label: 'vs Minimax Depth 2', val: s.wr_vs_mm_d2, color: '#66bb6a' },
     { label: 'vs Minimax Depth 3', val: s.wr_vs_mm_d3, color: '#ffb74d' },
     { label: 'vs Minimax Depth 4', val: s.wr_vs_mm_d4, color: '#ef5350' },
+    { label: 'vs Minimax Depth 5', val: s.wr_vs_mm_d5, color: '#ec407a' },
+    { label: 'vs Minimax Depth 6', val: s.wr_vs_mm_d6, color: '#7e57c2' },
+    { label: 'vs Minimax Depth 7', val: s.wr_vs_mm_d7, color: '#26a69a' },
     { label: 'vs Random',          val: s.wr_vs_random, color: '#ab47bc' },
     { label: 'vs Self-Play',       val: s.wr_vs_self,  color: '#26c6da' },
   ];
@@ -882,11 +941,23 @@ function renderMilestones(s) {
   const bestItems = `
     <div class="ms-item">
       <div class="ms-label">Best WR vs MM-D3 (all time)</div>
-      <div class="ms-val" style="color:#66bb6a">${(s.best_wr_mm3 * 100).toFixed(1)}%</div>
+      <div class="ms-val" style="color:#66bb6a">${((s.best_wr_mm3 || 0) * 100).toFixed(1)}%</div>
     </div>
     <div class="ms-item">
       <div class="ms-label">Best WR vs MM-D4 (all time)</div>
-      <div class="ms-val" style="color:#ef5350">${(s.best_wr_mm4 * 100).toFixed(1)}%</div>
+      <div class="ms-val" style="color:#ef5350">${((s.best_wr_mm4 || 0) * 100).toFixed(1)}%</div>
+    </div>
+    <div class="ms-item">
+      <div class="ms-label">Best WR vs MM-D5 (all time)</div>
+      <div class="ms-val" style="color:#ec407a">${((s.best_wr_mm5 || 0) * 100).toFixed(1)}%</div>
+    </div>
+    <div class="ms-item">
+      <div class="ms-label">Best WR vs MM-D6 (all time)</div>
+      <div class="ms-val" style="color:#7e57c2">${((s.best_wr_mm6 || 0) * 100).toFixed(1)}%</div>
+    </div>
+    <div class="ms-item">
+      <div class="ms-label">Best WR vs MM-D7 (all time)</div>
+      <div class="ms-val" style="color:#26a69a">${((s.best_wr_mm7 || 0) * 100).toFixed(1)}%</div>
     </div>`;
 
   return `<div class="milestone-section"><h2>Milestones</h2><div class="ms-grid">${items}${bestItems}</div></div>`;
@@ -910,6 +981,10 @@ function resetAllZoom() {
   Object.values(chartInstances).forEach(chart => {
     if (chart) {
       chart.resetZoom('none');
+      if (chart._recalcYAxis) {
+        chart._recalcYAxis();
+        chart.update('none');
+      }
     }
   });
   isSyncingZoom = false;
@@ -992,3 +1067,6 @@ if __name__ == '__main__':
     print("=" * 60)
 
     app.run(host='0.0.0.0', port=7860, debug=False)
+
+
+#AXSIWOkDrzSgENojGzLywCqRL14OoHRITzGqBAqyL5MhVVY8#whAa2xh4tpNpLyBwFEYDpifW0skCtrCMUe6A6VWt9XU
