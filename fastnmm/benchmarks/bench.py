@@ -99,7 +99,6 @@ def main():
     ot, oa = bench_openspiel(args.games)
     fmt(args.games, ot, oa, "openspiel")
 
-    speedup_actions = (oa / ot) / (fa / ft) * (fa / ft) / (oa / ot)  # placeholder
     print()
     print(f"  Speedup (actions/s): fastnmm is "
           f"{(fa / ft) / (oa / ot):.2f}x openspiel")

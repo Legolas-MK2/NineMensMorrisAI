@@ -28,12 +28,7 @@ from utils import (
 import fastnmm
 from fastnmm import MinimaxBot
 
-
-DEFAULT_MIXED_OPPONENT_MIX: Dict[str, float] = {
-    'minimax': 0.37,
-    'self': 0.60,
-    'random': 0.03,
-}
+from curriculum import MIXED_CONFIG
 
 
 _DEFAULT_TT_BYTES_PER_BOT = 128 * 1024 * 1024  # matches Config default
@@ -340,16 +335,17 @@ def worker_process(
         mass freed by dominated depths shifts to self-play, leaving the
         random share unchanged.
         """
-        mix = current_opponent_mix or DEFAULT_MIXED_OPPONENT_MIX
-        minimax_prob = max(0.0, float(mix.get('minimax', DEFAULT_MIXED_OPPONENT_MIX['minimax'])))
-        self_prob = max(0.0, float(mix.get('self', DEFAULT_MIXED_OPPONENT_MIX['self'])))
-        random_prob = max(0.0, float(mix.get('random', DEFAULT_MIXED_OPPONENT_MIX['random'])))
+        default_mix = MIXED_CONFIG['opponent_mix']
+        mix = current_opponent_mix or default_mix
+        minimax_prob = max(0.0, float(mix.get('minimax', default_mix['minimax'])))
+        self_prob = max(0.0, float(mix.get('self', default_mix['self'])))
+        random_prob = max(0.0, float(mix.get('random', default_mix['random'])))
 
         total = minimax_prob + self_prob + random_prob
         if total <= 1e-8:
-            minimax_prob = DEFAULT_MIXED_OPPONENT_MIX['minimax']
-            self_prob = DEFAULT_MIXED_OPPONENT_MIX['self']
-            random_prob = DEFAULT_MIXED_OPPONENT_MIX['random']
+            minimax_prob = default_mix['minimax']
+            self_prob = default_mix['self']
+            random_prob = default_mix['random']
             total = minimax_prob + self_prob + random_prob
 
         minimax_prob /= total

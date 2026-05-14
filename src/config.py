@@ -153,3 +153,13 @@ class Config:
     checkpoint_dir: str = "checkpoints"
     curriculum_dir: str = "curriculum"
 
+    # Once WR vs random/minimax-Dn exceeds these, those games are dropped
+    # from PPO training (still played + counted for stats / depth-unlock).
+    random_train_cutoff: float = 0.90
+    minimax_train_cutoff: float = 0.90
+
+    # Webserver model file size limit (bytes). Files larger than this in
+    # the auto-discovered model directories are ignored as likely
+    # incomplete or corrupted.
+    max_model_file_bytes: int = 200 * 1024 * 1024
+

@@ -36,14 +36,9 @@ from curriculum import (
     PHASE_1_CONFIG, PHASE_10_CONFIG,
 )
 from lr_scheduler import WarmRestartLRScheduler
+from logging_setup import get_logger
 
-# Once WR vs random exceeds this, random-game experiences are dropped from PPO training
-# (games still run for stats/logging purposes)
-RANDOM_TRAIN_CUTOFF = 0.90
-
-# Same idea for minimax: once WR vs minimax-D{n} >= this, those depth-n games are
-# dropped from PPO training (still played + counted for stats/depth-unlock).
-MINIMAX_TRAIN_CUTOFF = 0.90
+logger = get_logger(__name__)
 
 
 class PPOTrainer:
@@ -207,7 +202,7 @@ class PPOTrainer:
         self.clone_model.load_state_dict(self.model.state_dict())
         self.clone_model.eval()
 
-        print(f"  Clone model updated")
+        logger.info("Clone model updated")
 
         self._broadcast_clone_update()
 
@@ -289,66 +284,73 @@ class PPOTrainer:
         progress = min(1.0, self.episode_count / cfg.entropy_decay_episodes)
         return cfg.entropy_coef_start + progress * (cfg.entropy_coef_end - cfg.entropy_coef_start)
 
+    def _setup_cpu_affinity(self) -> None:
+        """Pin the trainer process to the worker core range, leaving the
+        reserved tail for the display server / IDE."""
+        reserved = int(getattr(self.config, "reserved_display_cores", 0))
+        if reserved <= 0:
+            return
+        try:
+            available = sorted(os.sched_getaffinity(0))
+            worker_cores = [c for c in available if c < (len(available) - reserved)]
+            if worker_cores:
+                os.sched_setaffinity(0, set(worker_cores))
+                print(f"  Trainer pinned to cores {worker_cores[0]}-"
+                      f"{worker_cores[-1]} ({reserved} reserved for display)")
+        except (AttributeError, OSError) as e:
+            print(f"  WARN: could not set trainer CPU affinity: {e!r}")
+
+    def _setup_move_cache(self) -> None:
+        """Create the cross-process SharedMoveCache (POSIX shm). Stores the
+        creator handle on `self._move_cache` so the segment outlives workers
+        and we can `unlink()` it on shutdown. Disabled if move_cache_bytes<=0."""
+        self._move_cache = None
+        cache_name = getattr(self.config, "move_cache_name", "")
+        cache_bytes = int(getattr(self.config, "move_cache_bytes", 0))
+        if not (cache_name and cache_bytes > 0):
+            return
+        try:
+            self._move_cache = fastnmm.SharedMoveCache.create(cache_name, cache_bytes)
+            gib = self._move_cache.bytes / (1024 ** 3)
+            print(f"  SharedMoveCache: {gib:.2f} GiB "
+                  f"({self._move_cache.num_entries:,} slots) at "
+                  f"'{cache_name}'")
+        except Exception as e:
+            print(f"  WARN: could not create SharedMoveCache "
+                  f"'{cache_name}' ({cache_bytes/1024**3:.1f} GiB): "
+                  f"{e!r}\n  Training will continue without it. "
+                  f"(Hint: /dev/shm may be too small; check "
+                  f"`df -h /dev/shm` and consider "
+                  f"`mount -o remount,size=128G /dev/shm`.)")
+            self._move_cache = None
+
+    def _build_worker_shared_state(self) -> Dict:
+        """Construct the `shared_state` dict workers bootstrap from."""
+        curr_cfg = self.curriculum.get_config()
+        return {
+            'initial_starting_stones': self.curriculum.get_starting_stones_for_phase(),
+            'initial_opponent_type': curr_cfg.opponent_type,
+            'initial_minimax_depth': 1,
+            'initial_reward_config': self.curriculum.get_reward_config(),
+            'initial_opponent_mix': (
+                self._opponent_mix_for_phase()
+                if curr_cfg.opponent_type == 'mixed'
+                else None
+            ),
+            'initial_minimax_min_depth': 1,
+            'initial_minimax_max_depth': self.curriculum.get_active_minimax_max_depth(),
+        }
+
     def start_workers(self):
         """Start worker processes."""
-        # Pin the trainer process to the worker core range too — it does
-        # IPC + GPU work, the display still gets the reserved cores.
-        reserved = int(getattr(self.config, "reserved_display_cores", 0))
-        if reserved > 0:
-            try:
-                available = sorted(os.sched_getaffinity(0))
-                worker_cores = [c for c in available if c < (len(available) - reserved)]
-                if worker_cores:
-                    os.sched_setaffinity(0, set(worker_cores))
-                    print(f"  Trainer pinned to cores {worker_cores[0]}-"
-                          f"{worker_cores[-1]} ({reserved} reserved for display)")
-            except (AttributeError, OSError) as e:
-                print(f"  WARN: could not set trainer CPU affinity: {e!r}")
-
+        self._setup_cpu_affinity()
         print(f"Starting {self.config.num_workers} workers...")
 
         self.request_queue = mp.Queue()
         self.experience_queue = mp.Queue()
+        self._setup_move_cache()
 
-        # Cross-process best-move cache: one POSIX shm segment that all
-        # workers attach to. Disabled if move_cache_bytes <= 0. We hold
-        # the creator handle here so the segment outlives the workers
-        # and we can unlink() it on shutdown.
-        self._move_cache = None
-        cache_name = getattr(self.config, "move_cache_name", "")
-        cache_bytes = int(getattr(self.config, "move_cache_bytes", 0))
-        if cache_name and cache_bytes > 0:
-            try:
-                self._move_cache = fastnmm.SharedMoveCache.create(
-                    cache_name, cache_bytes,
-                )
-                gib = self._move_cache.bytes / (1024 ** 3)
-                print(f"  SharedMoveCache: {gib:.2f} GiB "
-                      f"({self._move_cache.num_entries:,} slots) at "
-                      f"'{cache_name}'")
-            except Exception as e:
-                print(f"  WARN: could not create SharedMoveCache "
-                      f"'{cache_name}' ({cache_bytes/1024**3:.1f} GiB): "
-                      f"{e!r}\n  Training will continue without it. "
-                      f"(Hint: /dev/shm may be too small; check "
-                      f"`df -h /dev/shm` and consider "
-                      f"`mount -o remount,size=128G /dev/shm`.)")
-                self._move_cache = None
-
-        curr_cfg = self.curriculum.get_config()
-        curr_reward_cfg = self.curriculum.get_reward_config()
-        curr_starting_stones = self.curriculum.get_starting_stones_for_phase()
-        curr_active_mm_max = self.curriculum.get_active_minimax_max_depth()
-
-        shared_state = {
-            'initial_starting_stones': curr_starting_stones,
-            'initial_opponent_type': curr_cfg.opponent_type,
-            'initial_minimax_depth': 1,
-            'initial_reward_config': curr_reward_cfg,
-            'initial_opponent_mix': self._opponent_mix_for_phase() if curr_cfg.opponent_type == 'mixed' else None,
-            'initial_minimax_min_depth': 1,
-            'initial_minimax_max_depth': curr_active_mm_max,
-        }
+        shared_state = self._build_worker_shared_state()
 
         for i in range(self.config.num_workers):
             response_q = mp.Queue()
@@ -544,13 +546,13 @@ class PPOTrainer:
                     if curr_cfg.opponent_type == 'mixed':
                         if batch.opponent_type == 'random':
                             wr_random = self.curriculum.mixed_state.get_win_rate_vs_opponent('random')
-                            if wr_random >= RANDOM_TRAIN_CUTOFF:
+                            if wr_random >= self.config.random_train_cutoff:
                                 continue  # play counted for stats, but not for training
                         elif batch.opponent_type == 'minimax':
                             wr_mm = self.curriculum.mixed_state.get_win_rate_vs_opponent(
                                 'minimax', minimax_depth
                             )
-                            if wr_mm >= MINIMAX_TRAIN_CUTOFF:
+                            if wr_mm >= self.config.minimax_train_cutoff:
                                 continue  # dominated this depth — skip for PPO
 
                     all_experiences.append(batch)
@@ -570,7 +572,7 @@ class PPOTrainer:
 
             non_random_games = opp_counts.get('minimax', 0) + opp_counts.get('self', 0)
             if non_random_games == 0:
-                print("  Warning: mixed phase batch had 0 minimax/self games; rebroadcasting curriculum.")
+                logger.warning("Mixed phase batch had 0 minimax/self games; rebroadcasting curriculum.")
                 self._broadcast_curriculum_update()
                 active_max = self.curriculum.get_active_minimax_max_depth()
                 self._broadcast_minimax_range(min_depth=1, max_depth=active_max)
@@ -802,7 +804,7 @@ class PPOTrainer:
             key = f'wr_vs_mm_d{d}'
             if active_max >= d:
                 wr = opp_wr.get(key, 0.0)
-                note = "*" if wr >= MINIMAX_TRAIN_CUTOFF else ""
+                note = "*" if wr >= self.config.minimax_train_cutoff else ""
                 return f" D{d}:{wr:.0%}{note}"
             return f" D{d}:locked"
 
@@ -810,7 +812,7 @@ class PPOTrainer:
         print(f"  Minimax: {minimax_str}")
         if config.opponent_type == 'mixed':
             wr_random = opp_wr['wr_vs_random']
-            rnd_train_note = " (no-train)" if wr_random >= RANDOM_TRAIN_CUTOFF else ""
+            rnd_train_note = " (no-train)" if wr_random >= self.config.random_train_cutoff else ""
             print(f"  WR(500):{depth_str} [MaxD:{active_max}] "
                   f"Rnd:{wr_random:.0%}{rnd_train_note} Self:{opp_wr['wr_vs_self']:.0%}")
         else:
@@ -1030,8 +1032,8 @@ class PPOTrainer:
         if self.scaler and ckpt.get('scaler_state_dict'):
             try:
                 self.scaler.load_state_dict(ckpt['scaler_state_dict'])
-            except:
-                pass
+            except Exception as e:
+                logger.warning("Could not restore GradScaler state from checkpoint: %r", e)
 
         self.episode_count = ckpt['episode']
         self.total_steps = ckpt.get('total_steps', 0)

@@ -21,6 +21,10 @@ from collections import deque
 from enum import IntEnum
 import numpy as np
 
+from logging_setup import get_logger
+
+logger = get_logger(__name__)
+
 
 class Phase(IntEnum):
     """Training phases."""
@@ -524,13 +528,19 @@ class MixedTrainingState:
             if not self.minimax_depth_dominated[d]:
                 if wr >= threshold:
                     self.minimax_depth_dominated[d] = True
-                    print(f"  [Depth Dominated] D{d} sampling collapsed "
-                          f"(WR {wr:.0%} >= {threshold:.0%}); freed mass -> self-play")
+                    logger.info(
+                        "Depth dominated: D%d sampling collapsed "
+                        "(WR %.0f%% >= %.0f%%); freed mass -> self-play",
+                        d, wr * 100, threshold * 100,
+                    )
             else:
                 if wr < recover:
                     self.minimax_depth_dominated[d] = False
-                    print(f"  [Depth Recovered] D{d} sampling restored "
-                          f"(WR {wr:.0%} < {recover:.0%})")
+                    logger.info(
+                        "Depth recovered: D%d sampling restored "
+                        "(WR %.0f%% < %.0f%%)",
+                        d, wr * 100, recover * 100,
+                    )
         return dict(self.minimax_depth_dominated)
 
 
@@ -777,7 +787,7 @@ class CurriculumManager:
         """Called when clone is updated."""
         self.mixed_state.on_clone_updated()
         gen = self.mixed_state.clone_generation
-        print(f"  Clone updated to generation {gen}")
+        logger.info("Clone updated to generation %d", gen)
 
         for callback in self.on_clone_update_callbacks:
             callback()

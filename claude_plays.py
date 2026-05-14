@@ -44,6 +44,12 @@ from model import ActorCritic
 from config import Config
 from utils import get_legal_mask
 from minimax import MinimaxBot
+from board_utils import (
+    POINT_TO_COORD, POSITION_NAMES, MILLS,
+    parse_board_positions as _parse_board_positions,
+    decode_action as _decode_action,
+)
+from model_loader import discover_models, load_actor_critic
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Game constants
@@ -55,50 +61,12 @@ OBS_SIZE    = GAME.observation_tensor_size()
 OBS_SHAPE   = list(GAME.observation_tensor_shape())   # [5, 7, 7]
 DEVICE      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-POINT_TO_COORD = {
-    0: (0,0), 1: (0,3), 2: (0,6),
-    3: (1,1), 4: (1,3), 5: (1,5),
-    6: (2,2), 7: (2,3), 8: (2,4),
-    9: (3,0),10: (3,1),11: (3,2),
-   12: (3,4),13: (3,5),14: (3,6),
-   15: (4,2),16: (4,3),17: (4,4),
-   18: (5,1),19: (5,3),20: (5,5),
-   21: (6,0),22: (6,3),23: (6,6),
-}
-
-POSITION_NAMES = {
-     0:"outer top-left",  1:"outer top-mid",   2:"outer top-right",
-     3:"mid top-left",    4:"mid top-mid",      5:"mid top-right",
-     6:"inner top-left",  7:"inner top-mid",    8:"inner top-right",
-     9:"outer left-mid", 10:"mid left-mid",    11:"inner left-mid",
-    12:"inner right-mid",13:"mid right-mid",   14:"outer right-mid",
-    15:"inner bot-left", 16:"inner bot-mid",   17:"inner bot-right",
-    18:"mid bot-left",   19:"mid bot-mid",     20:"mid bot-right",
-    21:"outer bot-left", 22:"outer bot-mid",   23:"outer bot-right",
-}
-
-MILLS = (
-    (0,1,2),(0,9,21),(2,14,23),(21,22,23),
-    (3,4,5),(3,10,18),(5,13,20),(18,19,20),
-    (6,7,8),(6,11,15),(8,12,17),(15,16,17),
-    (1,4,7),(9,10,11),(12,13,14),(16,19,22),
-)
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Board utilities
 # ──────────────────────────────────────────────────────────────────────────────
 
 def parse_board_positions(state) -> Dict[int, int]:
-    """Return {board_position: player_id} from the observation tensor."""
-    obs     = np.array(state.observation_tensor(0))
-    n_cells = OBS_SIZE // OBS_SHAPE[0]   # 49
-    cols    = OBS_SHAPE[2]               # 7
-    out = {}
-    for pos, (row, col) in POINT_TO_COORD.items():
-        idx = row * cols + col
-        if   obs[idx]           == 1: out[pos] = 0
-        elif obs[n_cells + idx] == 1: out[pos] = 1
-    return out
+    return _parse_board_positions(state, OBS_SIZE, OBS_SHAPE)
 
 
 def render_board_ascii(positions: Dict[int, int], agent_player: int) -> str:
@@ -133,10 +101,7 @@ def detect_phase(state) -> str:
 
 
 def decode_action(action: int, is_capture: bool = False) -> Dict[str, Any]:
-    if action < 24:
-        return {"type": "capture" if is_capture else "place", "position": action}
-    offset = action - 24
-    return {"type": "move", "from": offset // 24, "to": offset % 24}
+    return _decode_action(action, is_capture_phase=is_capture)
 
 
 def describe_action(action: int, is_capture: bool = False) -> str:
@@ -262,27 +227,15 @@ def build_state_response(state, agent_player: int,
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_available_models() -> List[Dict[str, str]]:
-    out = []
-    for d in [SRC_DIR / "models", SRC_DIR / "checkpoints",
-              Path(__file__).parent / "checkpoints"]:
-        if d.exists():
-            for pt in sorted(d.glob("*.pt"), reverse=True):
-                if pt.stat().st_size < 200_000_000:
-                    out.append({"name": pt.name, "path": str(pt)})
-    return out
+    return discover_models(Path(__file__).parent, max_bytes=Config().max_model_file_bytes)
 
 
 _model_cache: Dict[str, Any] = {}
 
 def load_model(path: str):
-    if path not in _model_cache:
-        cfg = Config(); cfg.obs_shape = OBS_SHAPE
-        model = ActorCritic(OBS_SIZE, NUM_ACTIONS, cfg).to(DEVICE)
-        ckpt  = torch.load(path, map_location=DEVICE, weights_only=False)
-        model.load_state_dict(ckpt.get('model_state_dict', ckpt))
-        model.eval()
-        _model_cache[path] = model
-    return _model_cache[path]
+    return load_actor_critic(
+        path, OBS_SIZE, NUM_ACTIONS, OBS_SHAPE, DEVICE, cache=_model_cache,
+    )
 
 
 _minimax_bots: Dict[int, MinimaxBot] = {}
