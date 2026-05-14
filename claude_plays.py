@@ -38,17 +38,18 @@ from flask import Flask, jsonify, request, render_template_string
 SRC_DIR = Path(__file__).parent / "src"
 sys.path.insert(0, str(SRC_DIR))
 
+import fastnmm
+
 from model import ActorCritic
 from config import Config
 from utils import get_legal_mask
 from minimax import MinimaxBot
-from game_wrapper import load_game as load_game_fixed
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Game constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-GAME = load_game_fixed("nine_mens_morris")
+GAME = fastnmm.load_game("nine_mens_morris")
 NUM_ACTIONS = GAME.num_distinct_actions()
 OBS_SIZE    = GAME.observation_tensor_size()
 OBS_SHAPE   = list(GAME.observation_tensor_shape())   # [5, 7, 7]

@@ -98,10 +98,14 @@ BOARD_POS_TO_GRID: Tuple[Tuple[int, int], ...] = (
 
 
 def parse_board_from_state(state) -> Tuple[Optional[int], ...]:
-    """Parse absolute board (0=player0, 1=player1, None=empty) from state."""
+    """Parse absolute board (0=player0, 1=player1, None=empty) from state.
+
+    Uses fastnmm's `observation_tensor_numpy` for a direct (5,7,7) float32
+    array, avoiding the list-allocation that the OpenSpiel-compatible
+    `observation_tensor` performs.
+    """
     try:
-        obs = state.observation_tensor(0)
-        obs_array = np.asarray(obs).reshape(5, 7, 7)
+        obs_array = state.observation_tensor_numpy(0)  # shape (5, 7, 7), float32
         board = []
         for pos in range(24):
             r, c = BOARD_POS_TO_GRID[pos]
@@ -406,32 +410,3 @@ class ExperienceBatch:
     minimax_depth: int = 0  # Depth if opponent is minimax
 
 
-def prepare_game_state(state, random_moves: int):
-    """Play random vs random moves to prepare a mid-game board position (not recorded).
-    
-    Stops early if:
-    - The game reaches a terminal state
-    - A player is reduced to 3 or fewer pieces (only checked after placement phase,
-      when all 18 pieces are on the board, since during placement pieces in hand
-      are not counted on the board)
-    """
-    moves_made = 0
-    while moves_made < random_moves and not state.is_terminal():
-        legal_actions = state.legal_actions()
-        if not legal_actions:
-            break
-
-        action = random.choice(legal_actions)
-        state.apply_action(action)
-        moves_made += 1
-
-        # Stop early if either player is down to 3 stones (about to lose / enter jumping phase).
-        # Only check AFTER the placement phase: during placement, pieces on the board
-        # are misleadingly low because pieces are still "in hand". Once total pieces
-        # on board >= 18, placement is done and piece counts are meaningful.
-        try:
-            p0_pieces, p1_pieces = count_pieces_from_state(state, 0)
-            if (p0_pieces + p1_pieces) >= 18 and (p0_pieces <= 3 or p1_pieces <= 3):
-                break
-        except Exception:
-            pass

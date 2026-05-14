@@ -25,18 +25,18 @@ from flask import Flask, render_template_string, jsonify, request
 # Add model directory to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
+import fastnmm
+
 from model import ActorCritic
 from config import Config
 from utils import get_legal_mask
 from minimax import MinimaxBot
-import pyspiel
-from game_wrapper import load_game as load_game_fixed
 
 
 app = Flask(__name__)
 
-# Game constants - using pyspiel with position 0 bug fix
-GAME = load_game_fixed("nine_mens_morris")
+# Game constants - fastnmm fixes the OpenSpiel position-0 bug natively.
+GAME = fastnmm.load_game("nine_mens_morris")
 NUM_ACTIONS = GAME.num_distinct_actions()
 OBS_SIZE = GAME.observation_tensor_size()
 OBS_SHAPE = list(GAME.observation_tensor_shape())  # e.g. [5, 7, 7] = 245 dims
@@ -214,9 +214,9 @@ def get_board_state() -> Dict[str, Any]:
     # Get legal actions to understand board state
     legal = state.legal_actions()
 
-    # Count pieces - 'o'/'O' for player 0, 'x'/'X' for player 1
-    p0_pieces = state_str.count('o') + state_str.count('O')
-    p1_pieces = state_str.count('x') + state_str.count('X')
+    # Count pieces on the board via the engine (fastnmm renders W/B in str()).
+    p0_pieces = state.men_on_board(0)
+    p1_pieces = state.men_on_board(1)
 
     # Determine phase by checking the state string for capture indicator
     # and by analyzing legal actions
@@ -349,8 +349,7 @@ def get_minimax_move(state, depth: int) -> int:
         # Update depth if needed
         _minimax_bot.max_depth = depth
 
-    # Use iterative deepening for best move quality
-    return _minimax_bot.get_action(state, use_iterative=True)
+    return _minimax_bot.get_action(state)
 
 
 # HTML Template with embedded CSS and JavaScript
@@ -1349,10 +1348,9 @@ def api_new_game():
 
     config = request.json or {}
 
-    # Clear minimax transposition table for new game
-    if _minimax_bot is not None:
-        _minimax_bot.tt.clear()
-        _minimax_bot.move_orderer.clear()
+    # Drop any cached minimax bot so the next move builds a fresh one;
+    # fastnmm manages its own search state internally.
+    _minimax_bot = None
 
     # Initialize new game
     game_state = GameState()
@@ -1365,8 +1363,6 @@ def api_new_game():
     game_state.player_minimax_depth[1] = config.get('player1_depth', 3)
 
     # Prepare board with random moves to produce a mid-game position.
-    # Note: src/utils.prepare_game_state bails at the start because both
-    # players have 0 board pieces, so we roll our own.
     prepare_moves = int(config.get('prepare_moves', 0) or 0)
     if prepare_moves > 0:
         state = game_state.state

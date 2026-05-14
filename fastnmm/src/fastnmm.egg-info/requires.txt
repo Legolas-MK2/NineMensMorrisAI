@@ -1,0 +1,7 @@
+
+[openspiel]
+open_spiel>=1.5
+
+[test]
+pytest>=7
+numpy>=1.20

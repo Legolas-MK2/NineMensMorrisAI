@@ -1,8 +1,9 @@
-
+# fastnmm is installed from the local ./fastnmm/ package:
+#   pip install -e ./fastnmm
 Flask
 Jinja2
 MarkupSafe
 Werkzeug
 numpy
-open_spiel
+pygame
 torch

@@ -32,12 +32,11 @@ The original code trained against mixed opponents (random + minimax + self-play)
 ## Installation
 
 ```bash
-# Install dependencies
-pip install torch pyspiel numpy
+# Install Python dependencies
+pip install -r ../requirements.txt
 
-# Or with conda
-conda install pytorch -c pytorch
-pip install open_spiel
+# Install the local fastnmm game engine
+pip install -e ../fastnmm
 ```
 
 ## Usage

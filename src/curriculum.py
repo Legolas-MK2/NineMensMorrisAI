@@ -46,10 +46,6 @@ class PhaseConfig:
     # Opponent settings for Phase 1 (random only)
     opponent_type: str = 'random'  # 'random' for Phase 1, 'mixed' for Phase 2+
 
-    # Learning rate
-    lr_start: float = 3e-4
-    lr_end: float = 7e-5
-
     # Reward multipliers
     win_reward_base: float = 2.0
     win_reward_speed_bonus: float = 1.0
@@ -74,7 +70,6 @@ class PhaseConfig:
     # Duration limits
     min_episodes: int = 0  # Minimum episodes before graduation allowed
     max_episodes: int = 0  # 0 means no limit
-    lr_cycle_episodes: int = 500_000  # Cosine cycle length per clone generation
 
 
 # Mixed opponent configuration for Phase 2+
@@ -87,12 +82,12 @@ MIXED_CONFIG = {
     },
 
     # Self-play: clone update at 85% win rate (was 90%, less aggressive)
-    'selfplay_winrate_threshold': 0.85,
-    'selfplay_winrate_games': 1000,  # Increased from 500 for stability
+    'selfplay_winrate_threshold': 0.98,
+    'selfplay_winrate_games': 25000,  # Increased from 500 for stability
     # Minimum episodes between clone updates. Rapid clone churn was collapsing
-    # the policy (new clones + LR spike => catastrophic updates), so require
-    # at least this many episodes since the previous clone before making a new one.
-    'selfplay_clone_cooldown_episodes': 500_000,
+    # the policy, so require at least this many episodes since the previous
+    # clone before making a new one.
+    'selfplay_clone_cooldown_episodes': 200_000,
 
     # Minimax depth range — gradual unlock from D1 up to D7 based on win rate
     'minimax_min_depth': 1,
@@ -108,6 +103,23 @@ MIXED_CONFIG = {
     'stagnation_snapshot_interval': 100_000, # Take minimax WR snapshot every 100k episodes
     'stagnation_snapshot_window': 5,         # Compare last 5 snapshots (= 500k episodes)
     'stagnation_threshold': 0.03,            # Must improve combined d1+d2 WR by 3%
+
+    # Per-depth sampling dampening with hysteresis. When WR vs depth d crosses
+    # `dominate_threshold`, the depth is "dominated" and its sampling weight
+    # collapses to `dominate_weight` (~1% of normal). The freed probability
+    # mass shifts to self-play. The depth recovers (weight 1.0) only after WR
+    # falls below `dominate_recover` — the gap prevents flapping at the edge.
+    'minimax_depth_dominate_threshold': 0.90,
+    'minimax_depth_dominate_recover': 0.85,
+    'minimax_depth_dominate_min_games': 100,
+    'minimax_depth_dominate_weight': 0.01,
+}
+
+# Special config for Phase 1 (warmup: self-play + random, no minimax yet)
+PHASE_1_CONFIG = {
+    'minimax': 0.0,
+    'self':    0.70,
+    'random':  0.30,
 }
 
 # Special config for Phase 10 (final phase with harder minimax)
@@ -116,17 +128,32 @@ PHASE_10_CONFIG = {
     'self': 0.55,      # 55% self-play
     'random': 0.01,    # 01% random
     'selfplay_winrate_threshold': 0.95,
-    'selfplay_winrate_games': 1000,
+    'selfplay_winrate_games': 25000,
     'minimax_min_depth': 1,
     'minimax_max_depth': 7,  # D1-D7 for final phase
 }
 
 
-# Graduation trend detection settings
-# Sample winrate every 25k episodes, keep 40 samples = 1M episode window
+# Graduation criteria (Phase 2-10, mixed opponents).
+#
+# Each WR sampling tick fills a per-depth window (20 samples = 500k-episode
+# lookback). A phase graduates only when ALL of the following hold for every
+# currently-unlocked minimax depth:
+#   1. clone_generations_in_phase >= min_clone_generations
+#   2. episodes_in_phase >= min_episodes
+#   3. WR vs the top unlocked depth >= min_wr_top_depth
+#   4. slope angle of WR vs depth d < trend_max_angle_degrees, for every d
+#   5. samples_in_window for depth d >= min_samples_per_depth, for every d
+#
+# Combined-WR is no longer used to drive graduation (it inflated easy depths
+# and hid weakness on top depths). It may still be logged for dashboards.
 GRADUATION_CONFIG = {
-    'trend_window_samples': 20,      # Number of samples to keep for trend calculation
-    'trend_max_angle_degrees': 0.0,  # Max angle (degrees) for graduation
+    'trend_window_samples': 20,        # samples per depth window (per-depth + legacy combined)
+    'trend_max_angle_degrees': 0.0,    # condition 4: no measurable improvement
+    'min_episodes': 2_500_000,         # condition 2
+    'min_wr_top_depth': 0.70,          # condition 3
+    'min_samples_per_depth': 20,       # condition 5
+    'min_clone_generations': 5,        # condition 1
 }
 
 
@@ -134,10 +161,8 @@ GRADUATION_CONFIG = {
 PHASE_CONFIGS = {
     Phase.PHASE_1: PhaseConfig(
         phase=Phase.PHASE_1,
-        description="Warmup: 0-150 random pre-moves, vs random",
-        opponent_type='random',
-        lr_start=3e-4,
-        lr_end=1e-4,
+        description="Warmup: 0-150 random pre-moves, 70% self / 30% random",
+        opponent_type='mixed',
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
         loss_reward=-2.0,
@@ -146,15 +171,12 @@ PHASE_CONFIGS = {
         win_rate_threshold=0.95,  # Must dominate random before moving on
         min_games_for_graduation=2000,
         min_episodes=100_000,
-        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_2: PhaseConfig(
         phase=Phase.PHASE_2,
         description="150 random pre-moves, vs mixed",
         opponent_type='mixed',
-        lr_start=1e-4,
-        lr_end=5e-5,
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
         loss_reward=-2.0,
@@ -162,15 +184,12 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.7,
         win_rate_threshold=0.80,
         min_games_for_graduation=1000,
-        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_3: PhaseConfig(
         phase=Phase.PHASE_3,
         description="~129 random pre-moves, vs mixed",
         opponent_type='mixed',
-        lr_start=5e-5,
-        lr_end=3e-5,
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
         loss_reward=-2.0,
@@ -178,15 +197,12 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.5,
         win_rate_threshold=0.75,
         min_games_for_graduation=1000,
-        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_4: PhaseConfig(
         phase=Phase.PHASE_4,
         description="~107 random pre-moves, vs mixed",
         opponent_type='mixed',
-        lr_start=3e-5,
-        lr_end=2e-5,
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
         loss_reward=-2.0,
@@ -194,15 +210,12 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.3,
         win_rate_threshold=0.70,
         min_games_for_graduation=1000,
-        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_5: PhaseConfig(
         phase=Phase.PHASE_5,
         description="~86 random pre-moves, vs mixed",
         opponent_type='mixed',
-        lr_start=2e-5,
-        lr_end=1e-5,
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
         loss_reward=-2.0,
@@ -210,15 +223,12 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.2,
         win_rate_threshold=0.65,
         min_games_for_graduation=1000,
-        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_6: PhaseConfig(
         phase=Phase.PHASE_6,
         description="~64 random pre-moves, vs mixed",
         opponent_type='mixed',
-        lr_start=1e-5,
-        lr_end=7e-6,
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
         loss_reward=-2.0,
@@ -226,15 +236,12 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.1,
         win_rate_threshold=0.60,
         min_games_for_graduation=1000,
-        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_7: PhaseConfig(
         phase=Phase.PHASE_7,
         description="~43 random pre-moves, vs mixed",
         opponent_type='mixed',
-        lr_start=7e-6,
-        lr_end=5e-6,
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
         loss_reward=-2.0,
@@ -242,15 +249,12 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.05,
         win_rate_threshold=0.55,
         min_games_for_graduation=1000,
-        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_8: PhaseConfig(
         phase=Phase.PHASE_8,
         description="~21 random pre-moves, vs mixed",
         opponent_type='mixed',
-        lr_start=5e-6,
-        lr_end=3e-6,
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
         loss_reward=-2.0,
@@ -258,15 +262,12 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.0,
         win_rate_threshold=0.50,
         min_games_for_graduation=1000,
-        lr_cycle_episodes=500_000,
     ),
 
     Phase.PHASE_9: PhaseConfig(
         phase=Phase.PHASE_9,
         description="Full game from start (0 pre-moves), vs mixed",
         opponent_type='mixed',
-        lr_start=3e-6,
-        lr_end=1e-6,
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
         loss_reward=-2.0,
@@ -274,15 +275,12 @@ PHASE_CONFIGS = {
         shaping_multiplier=0.0,
         win_rate_threshold=0.50,
         min_games_for_graduation=1000,
-        lr_cycle_episodes=5_000_000,
     ),
 
     Phase.PHASE_10: PhaseConfig(
         phase=Phase.PHASE_10,
         description="Full game, 0-150 random pre-moves, vs harder minimax",
         opponent_type='mixed',
-        lr_start=1e-6,
-        lr_end=5e-7,
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
         loss_reward=-2.0,
@@ -291,7 +289,6 @@ PHASE_CONFIGS = {
         win_rate_threshold=0.50,
         min_games_for_graduation=1000,
         max_episodes=0,  # No fixed limit - uses trend-based graduation
-        lr_cycle_episodes=10_000_000,
     ),
 }
 
@@ -331,9 +328,25 @@ class MixedTrainingState:
     results_vs_minimax_d7: deque = field(default_factory=lambda: deque(maxlen=500))
     results_vs_self: deque = field(default_factory=lambda: deque(maxlen=500))
 
-    # Winrate history for trend-based graduation (phases 2+)
+    # Combined-WR history (legacy — logged only, not used for graduation).
     # Samples combined minimax winrate every 25k episodes, keeps 20 samples (500k episode window)
     minimax_wr_history: deque = field(default_factory=lambda: deque(maxlen=20))
+
+    # Per-depth WR sliding windows for graduation. One deque per minimax depth
+    # (D1..D7), each maxlen = trend_window_samples (20) so the lookback is
+    # 500k episodes. Locked depths simply never receive samples — graduation
+    # logic only inspects unlocked depths.
+    minimax_wr_history_by_depth: Dict[int, deque] = field(
+        default_factory=lambda: {d: deque(maxlen=20) for d in range(1, 8)}
+    )
+
+    # Per-depth "dominated" flags driving the sampling-weight dampener.
+    # Sticky: set when WR(d) >= dominate_threshold over min_games games,
+    # cleared when WR(d) drops below dominate_recover. Persisted with
+    # the rest of mixed_state so resumes pick up where training left off.
+    minimax_depth_dominated: Dict[int, bool] = field(
+        default_factory=lambda: {d: False for d in range(1, 8)}
+    )
 
     def get_selfplay_win_rate(self) -> float:
         """Get win rate from last N self-play games."""
@@ -444,46 +457,81 @@ class MixedTrainingState:
         elif opponent_type == 'self':
             self.results_vs_self.append(result_str)
 
-    def calculate_winrate_trend(self, active_max_depth: int) -> float:
+    @staticmethod
+    def _slope_per_episode(history) -> float:
+        """Least-squares slope of WR-vs-sample-index, converted to WR-per-episode.
+        Returns +inf if too few samples.
         """
-        Calculate the trend (slope) of combined minimax winrate using linear regression.
-        
-        Uses least-squares regression on the winrate history.
-        Returns the slope as winrate change per episode.
-        
-        For phase 2-9: uses D1+D2 combined winrate
-        For phase 10: uses D1+D2+D3+D4 combined winrate
-        """
-        if len(self.minimax_wr_history) < 10:
-            # Not enough samples for reliable trend
-            return float('inf')  # Don't graduate yet
-        
-        # Convert deque to list for indexing
-        history = list(self.minimax_wr_history)
-        
-        # Use linear regression: y = mx + b, we want m (slope)
+        if len(history) < 10:
+            return float('inf')
         n = len(history)
-        x = np.arange(n)  # Sample indices (0, 1, 2, ...)
-        y = np.array(history)  # Winrate values
-        
-        # Least squares: m = (n*sum(xy) - sum(x)*sum(y)) / (n*sum(x^2) - (sum(x))^2)
+        x = np.arange(n)
+        y = np.array(history)
         sum_x = np.sum(x)
         sum_y = np.sum(y)
         sum_xy = np.sum(x * y)
         sum_x2 = np.sum(x ** 2)
-        
-        denominator = n * sum_x2 - sum_x ** 2
-        if abs(denominator) < 1e-10:
+        denom = n * sum_x2 - sum_x ** 2
+        if abs(denom) < 1e-10:
             return 0.0
-        
-        slope_per_sample = (n * sum_xy - sum_x * sum_y) / denominator
-        
-        # Convert slope from "per sample" to "per episode"
-        # Each sample is 25,000 episodes apart (log_interval)
+        slope_per_sample = (n * sum_xy - sum_x * sum_y) / denom
         episodes_per_sample = 25000
-        slope_per_episode = slope_per_sample / episodes_per_sample
-        
-        return slope_per_episode
+        return slope_per_sample / episodes_per_sample
+
+    def calculate_winrate_trend(self, active_max_depth: int) -> float:
+        """Slope (WR per episode) of combined-minimax history (legacy / dashboards)."""
+        return self._slope_per_episode(list(self.minimax_wr_history))
+
+    def calculate_winrate_trend_for_depth(self, depth: int) -> float:
+        """Slope (WR per episode) of WR-vs-depth-d history. +inf if too few samples."""
+        history = self.minimax_wr_history_by_depth.get(depth)
+        if history is None:
+            return float('inf')
+        return self._slope_per_episode(list(history))
+
+    def get_slope_angle_for_depth(self, depth: int) -> float:
+        """Slope of WR vs depth d, expressed as degrees over a 1M-episode horizon.
+        Returns +inf if too few samples.
+        """
+        slope_per_episode = self.calculate_winrate_trend_for_depth(depth)
+        if slope_per_episode == float('inf'):
+            return float('inf')
+        slope_per_million = slope_per_episode * 1_000_000
+        return math.degrees(math.atan(slope_per_million))
+
+    def get_window_size_for_depth(self, depth: int) -> int:
+        """How many WR samples are currently in the depth-d window."""
+        history = self.minimax_wr_history_by_depth.get(depth)
+        return 0 if history is None else len(history)
+
+    def update_minimax_dominated_state(self) -> Dict[int, bool]:
+        """Refresh per-depth `minimax_depth_dominated` flags using hysteresis.
+
+        A depth d becomes dominated once WR(d) >= dominate_threshold over at
+        least dominate_min_games games. It stays dominated until WR(d) drops
+        below dominate_recover; the gap prevents flapping at the boundary.
+        Depths with too few games to judge keep their previous flag.
+        """
+        threshold = MIXED_CONFIG['minimax_depth_dominate_threshold']
+        recover = MIXED_CONFIG['minimax_depth_dominate_recover']
+        min_games = MIXED_CONFIG['minimax_depth_dominate_min_games']
+        for d in range(1, 8):
+            deq = self._depth_results_deque(d)
+            n_games = len(deq) if deq is not None else 0
+            if n_games < min_games:
+                continue
+            wr = self.get_win_rate_vs_opponent('minimax', d)
+            if not self.minimax_depth_dominated[d]:
+                if wr >= threshold:
+                    self.minimax_depth_dominated[d] = True
+                    print(f"  [Depth Dominated] D{d} sampling collapsed "
+                          f"(WR {wr:.0%} >= {threshold:.0%}); freed mass -> self-play")
+            else:
+                if wr < recover:
+                    self.minimax_depth_dominated[d] = False
+                    print(f"  [Depth Recovered] D{d} sampling restored "
+                          f"(WR {wr:.0%} < {recover:.0%})")
+        return dict(self.minimax_depth_dominated)
 
 
 @dataclass
@@ -561,66 +609,51 @@ class CurriculumManager:
         self.on_clone_update_callbacks = []
         self.on_game_settings_change_callbacks = []
 
+        # Snapshot of per-depth state captured at the moment of graduation.
+        # Populated by graduate() before mixed_state is reset; consumed by the
+        # trainer's phase-change callback for logging.
+        self.last_graduation_snapshot: Optional[Dict[str, Any]] = None
+
     def get_config(self) -> PhaseConfig:
         """Get current phase configuration."""
         if self.current_phase == Phase.COMPLETED:
             return PHASE_CONFIGS[Phase.PHASE_9]
         return PHASE_CONFIGS[self.current_phase]
 
-    def get_random_moves_for_phase(self) -> int:
+    def get_starting_stones_for_phase(self) -> int:
         """
-        Get the number of random moves to prepare the board for current phase.
+        Get the per-player starting-stone count for the current phase.
 
-        - Phase 1-2: 150 random moves
-        - Phase 3-8: Linear decrease from 150 to 0
-          Phase 3: ~129, Phase 4: ~107, Phase 5: ~86, Phase 6: ~64, Phase 7: ~43, Phase 8: ~21
-        - Phase 9: 0 random moves
-        - Phase 10: Random between 0 and 150 (returned as -1 to signal random)
+        Boards are initialized via fastnmm's `starting_stones` engine option
+        instead of preparing positions with random moves.
+
+        - Phase 1, 10: -1 sentinel — each player gets random stones in [3, 9]
+          per game (resampled at every env reset)
+        - Phase 2: 3 stones
+        - Phase 3: 4 stones
+        - Phase 4: 5 stones
+        - Phase 5: 6 stones
+        - Phase 6: 7 stones
+        - Phase 7: 8 stones
+        - Phase 8: 9 stones
+        - Phase 9: 9 stones (full game)
 
         Returns:
-            Number of random moves, or -1 for Phase 10 (meaning pick random 0-150)
+            Stone count in [1, 9], or -1 for randomize-per-game phases.
         """
         if self.current_phase == Phase.COMPLETED:
-            return 0
+            return 9
 
         phase_num = int(self.current_phase)
 
-        # Phase 1: random between 0 and 150 (signal with -1)
-        if phase_num == 1:
+        if phase_num in (1, 10):
             return -1
 
-        # Phase 2: 150 random moves
-        if phase_num == 2:
-            return 150
-
-        # Phase 9: 0 random moves
         if phase_num == 9:
-            return 0
+            return 9
 
-        # Phase 10: Random between 0 and 150 (signal with -1)
-        if phase_num == 10:
-            return -1
-
-        # Phase 3-8: Linear decrease from 150 to 0
-        # Phase 3 starts at ~129, Phase 8 ends at ~21
-        # Linear interpolation: phase 3 -> 150*(6/7), phase 8 -> 150*(1/7)
-        # Formula: 150 * (9 - phase) / 7
-        moves = int(150 * (9 - phase_num) / 7)
-        return max(0, moves)
-
-    def get_learning_rate(self) -> float:
-        """Cosine annealing over the whole phase.
-
-        Previously the cycle restarted at lr_start on every clone update in
-        mixed phases, which produced an abrupt LR spike onto a near-zero-entropy
-        policy and triggered catastrophic collapse. The cosine now decays
-        monotonically across each phase; plateau reductions (applied by the
-        RLPlateauScheduler) compose multiplicatively on top of this base.
-        """
-        config = self.get_config()
-        eps = self.stats.episodes_in_phase
-        progress = min(1.0, eps / config.lr_cycle_episodes)
-        return config.lr_end + 0.5 * (config.lr_start - config.lr_end) * (1.0 + math.cos(math.pi * progress))
+        stones = phase_num + 1  # Phase 2 → 3, Phase 8 → 9
+        return max(1, min(9, stones))
 
     def get_shaping_multiplier(self) -> float:
         """
@@ -790,51 +823,59 @@ class CurriculumManager:
 
     def sample_minimax_winrate(self):
         """
-        Sample combined minimax winrate for trend-based graduation.
+        Sample minimax win rates for trend-based graduation.
         Call this at log_interval (every 25,000 episodes).
-        
-        For Phase 2-9: samples D1+D2 combined winrate
-        For Phase 10: samples D1+D2+D3+D4 combined winrate
+
+        - Combined WR (D1..D7) is appended to `minimax_wr_history` for
+          dashboards/legacy logging — it does NOT drive graduation.
+        - Per unlocked depth d in [1, active_max], current WR vs that depth is
+          appended to `minimax_wr_history_by_depth[d]`. Graduation reads from
+          these per-depth windows so weakness on the top depth can't be hidden
+          by easy depths.
         """
         config = self.get_config()
         if config.opponent_type != 'mixed':
             return
-        
-        active_max_depth = self.mixed_state.active_minimax_max_depth
-        wr = self.mixed_state.get_combined_minimax_win_rate_up_to(active_max_depth)
-        self.mixed_state.minimax_wr_history.append(wr)
+
+        ms = self.mixed_state
+
+        # Legacy combined sample (logging only)
+        wr_combined = ms.get_combined_minimax_win_rate_up_to(7)
+        ms.minimax_wr_history.append(wr_combined)
+
+        # Per-depth samples (graduation signal)
+        active_max = ms.active_minimax_max_depth
+        for d in range(1, active_max + 1):
+            wr_d = ms.get_win_rate_vs_opponent('minimax', d)
+            ms.minimax_wr_history_by_depth[d].append(wr_d)
 
     def _has_plateaued(self) -> bool:
         """
-        Check if the model has plateaued based on winrate trend.
-        
-        Returns True if the trend slope is < tan(1°) ≈ 0.0175 per 1M episodes
-        (i.e., learning has plateaued or is declining).
+        Check whether every unlocked minimax depth has plateaued.
+
+        Returns True iff, for every unlocked depth d:
+          - the per-depth window has at least `min_samples_per_depth` samples
+          - the slope angle of WR-vs-depth-d (over a 1M-episode horizon) is
+            below `trend_max_angle_degrees` (i.e., flat or declining).
+
+        If any depth is still climbing, the phase is still making progress.
         """
         config = self.get_config()
         if config.opponent_type != 'mixed':
             return False
-        
-        # Need enough samples for reliable trend
-        if len(self.mixed_state.minimax_wr_history) < GRADUATION_CONFIG['trend_window_samples']:
-            return False
-        
-        # Calculate trend (slope per episode)
-        slope_per_episode = self.mixed_state.calculate_winrate_trend(
-            self.mixed_state.active_minimax_max_depth
-        )
-        
-        # Convert to angle: slope over 1M episodes
-        # tan(angle) = slope * 1_000_000
-        # angle = atan(slope * 1_000_000)
-        slope_per_million = slope_per_episode * 1_000_000
-        angle_degrees = math.degrees(math.atan(slope_per_million))
-        
-        # Graduate if angle < 1 degree (trend is flat or declining)
+
+        ms = self.mixed_state
+        active_max = ms.active_minimax_max_depth
+        min_samples = GRADUATION_CONFIG['min_samples_per_depth']
         max_angle = GRADUATION_CONFIG['trend_max_angle_degrees']
-        plateaued = angle_degrees < max_angle
-        
-        return plateaued
+
+        for d in range(1, active_max + 1):
+            if ms.get_window_size_for_depth(d) < min_samples:
+                return False
+            angle = ms.get_slope_angle_for_depth(d)
+            if angle == float('inf') or angle >= max_angle:
+                return False
+        return True
 
     def should_graduate(self) -> bool:
         """Check if ready to move to next phase."""
@@ -852,12 +893,35 @@ class CurriculumManager:
         if config.min_episodes > 0 and stats.episodes_in_phase < config.min_episodes:
             return False
 
-        # Phase 1: Need win rate threshold vs random AND min_episodes
-        if config.opponent_type == 'random':
-            return stats.get_win_rate() >= config.win_rate_threshold
+        # Phase 1: graduate when WR vs random >= win_rate_threshold.
+        # We measure against random specifically because Phase 1 mixes in
+        # self-play (70/30), and self-play caps overall WR at ~50% by
+        # symmetry, so aggregate WR can never reach the threshold.
+        if self.current_phase == Phase.PHASE_1:
+            return self.mixed_state.get_win_rate_vs_opponent('random') >= config.win_rate_threshold
 
-        # Phase 2-10: Trend-based graduation only
-        # Advance strictly when minimax trend angle is below threshold.
+        # Phase 2-10 graduation: per-depth saturation + competence at top depth.
+        # All five conditions must hold simultaneously.
+        ms = self.mixed_state
+
+        # Condition 1: enough clone generations have happened in this phase
+        # (so the agent has actually faced progressively harder snapshots,
+        # not just its frozen initial clone).
+        if ms.clone_generation < GRADUATION_CONFIG['min_clone_generations']:
+            return False
+
+        # Condition 2: minimum time-in-phase floor.
+        if stats.episodes_in_phase < GRADUATION_CONFIG['min_episodes']:
+            return False
+
+        # Condition 3: competence at the hardest currently-unlocked opponent.
+        top_depth = ms.active_minimax_max_depth
+        wr_top = ms.get_win_rate_vs_opponent('minimax', top_depth)
+        if wr_top < GRADUATION_CONFIG['min_wr_top_depth']:
+            return False
+
+        # Conditions 4 & 5: every unlocked depth has plateaued and has enough
+        # samples in its window.
         return self._has_plateaued()
 
     def graduate(self) -> bool:
@@ -868,9 +932,41 @@ class CurriculumManager:
         # Determine graduation reason for logging
         config = self.get_config()
         if config.opponent_type == 'mixed':
-            graduation_reason = 'plateau (trend < 1°)'
+            graduation_reason = 'per-depth saturation + WR-vs-top-depth threshold'
         else:
             graduation_reason = f"win rate >= {config.win_rate_threshold:.0%}"
+
+        # Per-depth snapshot at the moment of graduation. Captured BEFORE the
+        # mixed_state reset so trainer callbacks (and the phase_history entry)
+        # can dump it for diagnostics.
+        ms = self.mixed_state
+        active_max = ms.active_minimax_max_depth if config.opponent_type == 'mixed' else 0
+        per_depth_wr_snapshot = {
+            d: ms.get_win_rate_vs_opponent('minimax', d)
+            for d in range(1, max(active_max, 0) + 1)
+        }
+        per_depth_slope_angle = {
+            d: ms.get_slope_angle_for_depth(d)
+            for d in range(1, max(active_max, 0) + 1)
+        }
+        per_depth_samples = {
+            d: ms.get_window_size_for_depth(d)
+            for d in range(1, max(active_max, 0) + 1)
+        }
+        wr_top_depth = (
+            ms.get_win_rate_vs_opponent('minimax', active_max) if active_max >= 1 else 0.0
+        )
+        self.last_graduation_snapshot = {
+            'phase_id': int(self.current_phase),
+            'episodes_in_phase': self.stats.episodes_in_phase,
+            'wr_vs_top_depth_at_graduation': wr_top_depth,
+            'per_depth_wr': per_depth_wr_snapshot,
+            'per_depth_slope_angle': per_depth_slope_angle,
+            'per_depth_samples': per_depth_samples,
+            'top_depth': active_max,
+            'clone_generations_in_phase': ms.clone_generation,
+            'graduation_reason': graduation_reason,
+        }
 
         # Save phase history
         self.phase_history.append({
@@ -881,9 +977,11 @@ class CurriculumManager:
             'losses': self.stats.losses,
             'draws': self.stats.draws,
             'best_win_rate': self.stats.best_win_rate,
-            'clone_generations': self.mixed_state.clone_generation,
+            'clone_generations': ms.clone_generation,
             'graduation_reason': graduation_reason,
             'duration_seconds': time.time() - self.stats.phase_start_time,
+            'wr_vs_top_depth_at_graduation': wr_top_depth,
+            'per_depth_wr_at_graduation': per_depth_wr_snapshot,
         })
 
         old_phase = self.current_phase
@@ -932,12 +1030,12 @@ class CurriculumManager:
         stats = self.stats
         wr = stats.get_win_rate()
         shaping_mult = self.get_shaping_multiplier()
-        random_moves = self.get_random_moves_for_phase()
-        pre = f"{random_moves}pre" if random_moves >= 0 else "0-150pre"
+        stones = self.get_starting_stones_for_phase()
+        stones_str = f"{stones}st" if stones >= 0 else "rand-st"
 
         parts = [
             f"Phase {int(self.current_phase)}/10",
-            pre,
+            stones_str,
             f"WR:{wr:.0%}",
             f"Shape:{shaping_mult:.2f}",
         ]
@@ -988,6 +1086,27 @@ class CurriculumManager:
             return True
 
         return False
+
+    def get_minimax_depth_weights(self) -> Dict[int, float]:
+        """Per-depth sampling weights for minimax opponents (Phase 2+).
+
+        Updates the dominated-state hysteresis, then maps each depth to:
+          - `minimax_depth_dominate_weight` (default 0.01) when dominated
+          - 1.0 otherwise
+
+        Workers receive this dict and redistribute the freed probability mass
+        from dominated depths to self-play; the random share is unchanged.
+        Outside mixed phases this returns all 1.0s (no-op).
+        """
+        config = self.get_config()
+        if config.opponent_type != 'mixed':
+            return {d: 1.0 for d in range(1, 8)}
+        self.mixed_state.update_minimax_dominated_state()
+        dominated_weight = MIXED_CONFIG['minimax_depth_dominate_weight']
+        return {
+            d: (dominated_weight if self.mixed_state.minimax_depth_dominated[d] else 1.0)
+            for d in range(1, 8)
+        }
 
     def get_opponent_win_rates(self) -> Dict[str, float]:
         """Get win rates vs each opponent type (last 500 games)."""
@@ -1042,6 +1161,10 @@ class CurriculumManager:
                 'results_vs_minimax_d7': list(self.mixed_state.results_vs_minimax_d7),
                 'results_vs_self': list(self.mixed_state.results_vs_self),
                 'minimax_wr_history': list(self.mixed_state.minimax_wr_history),
+                'minimax_wr_history_by_depth': {
+                    d: list(dq) for d, dq in self.mixed_state.minimax_wr_history_by_depth.items()
+                },
+                'minimax_depth_dominated': dict(self.mixed_state.minimax_depth_dominated),
             },
         }
 
@@ -1104,6 +1227,21 @@ class CurriculumManager:
                     ms.get('minimax_wr_history', []),
                     maxlen=GRADUATION_CONFIG['trend_window_samples']
                 )
+                # Per-depth WR windows (graduation signal). Missing keys default
+                # to empty deques — the windows refill organically as training
+                # continues, so old checkpoints simply re-warm.
+                window_max = GRADUATION_CONFIG['trend_window_samples']
+                hist_by_depth_raw = ms.get('minimax_wr_history_by_depth', {})
+                self.mixed_state.minimax_wr_history_by_depth = {
+                    d: deque(hist_by_depth_raw.get(str(d), hist_by_depth_raw.get(d, [])),
+                             maxlen=window_max)
+                    for d in range(1, 8)
+                }
+                dominated_raw = ms.get('minimax_depth_dominated', {})
+                if dominated_raw:
+                    self.mixed_state.minimax_depth_dominated = {
+                        int(k): bool(v) for k, v in dominated_raw.items()
+                    }
 
             print(f"  Loaded curriculum: Phase {int(self.current_phase)}, {self.total_episodes:,} episodes")
             return True

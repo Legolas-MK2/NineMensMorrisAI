@@ -20,3 +20,10 @@ logs/
 
 # IDE
 .idea/
+
+# Archives & screenshots
+*.zip
+*.png
+
+# Per-checkpoint sidecar files
+*.curriculum.json

@@ -24,22 +24,26 @@ import torch
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 
-from game_wrapper import load_game as load_game_fixed
+import fastnmm
 
 from config import Config
 from model import ActorCritic
-from utils import get_legal_mask, ExperienceBatch, prepare_game_state
+from utils import get_legal_mask, ExperienceBatch
 from minimax import evaluate_vs_minimax, format_minimax_results
 from worker import worker_process
 from curriculum import (
     CurriculumManager, Phase, PHASE_CONFIGS, MIXED_CONFIG,
+    PHASE_1_CONFIG, PHASE_10_CONFIG,
 )
-from shared_cache import SharedMoveCache
-from lr_scheduler import RLPlateauScheduler
+from lr_scheduler import WarmRestartLRScheduler
 
 # Once WR vs random exceeds this, random-game experiences are dropped from PPO training
 # (games still run for stats/logging purposes)
-RANDOM_TRAIN_CUTOFF = 0.95
+RANDOM_TRAIN_CUTOFF = 0.90
+
+# Same idea for minimax: once WR vs minimax-D{n} >= this, those depth-n games are
+# dropped from PPO training (still played + counted for stats/depth-unlock).
+MINIMAX_TRAIN_CUTOFF = 0.90
 
 
 class PPOTrainer:
@@ -50,8 +54,8 @@ class PPOTrainer:
         self.device = torch.device(config.device)
         self.resume_mode = resume_mode  # Track if we're resuming
 
-        # Initialize game engine using pyspiel with position 0 bug fix
-        game = load_game_fixed("nine_mens_morris")
+        # Initialize game engine using the fastnmm C++ engine
+        game = fastnmm.load_game("nine_mens_morris")
 
         self.obs_size = game.observation_tensor_size()
         self.num_actions = game.num_distinct_actions()
@@ -73,23 +77,26 @@ class PPOTrainer:
             else:
                 policy_params.append(param)
 
-        initial_lr = PHASE_CONFIGS[Phase.PHASE_1].lr_start
+        # Initial optimizer LR will be overwritten immediately by the scheduler
+        # (warmup starts at LR ~ 0). Set to lr_peak just for parameter-group setup.
         self.optimizer = torch.optim.AdamW([
-            {'params': policy_params, 'lr': initial_lr},
-            {'params': value_params, 'lr': initial_lr}
+            {'params': policy_params, 'lr': config.lr_peak},
+            {'params': value_params, 'lr': config.lr_peak}
         ], weight_decay=0.01, eps=1e-5)
 
-        # RL Plateau Scheduler - tracks win rate against hardest opponent (Minimax-2)
-        # This prevents premature LR drop when agent beats easy opponents but not hard ones
-        self.lr_scheduler = RLPlateauScheduler(
+        # Warmup + warm-restart cosine, driven by PPO updates.
+        # Convert the episode-based config knobs to updates via episodes_per_update.
+        eps_per_update = max(1, config.episodes_per_update)
+        warmup_updates = max(1, config.lr_warmup_episodes // eps_per_update)
+        cycle_t_max_updates = max(1, config.lr_cycle_t_max_episodes // eps_per_update)
+        self.lr_scheduler = WarmRestartLRScheduler(
             self.optimizer,
-            factor=config.scheduler_factor,       # LR multiplier when reducing
-            patience=config.scheduler_patience,   # Evaluation steps before reducing
-            min_lr=config.scheduler_min_lr,       # Minimum LR
-            threshold=config.scheduler_threshold, # Minimum improvement to reset patience
-            target_win_rate=config.scheduler_target_wr, # Track WR target (no hard stop)
-            metric_name="wr_vs_mm_d2",
-            allow_early_stop=False
+            lr_peak=config.lr_peak,
+            lr_min=config.lr_min,
+            warmup_updates=warmup_updates,
+            cycle_t_max_updates=cycle_t_max_updates,
+            phase_reset_factor=config.lr_phase_reset_factor,
+            clone_bump_factor=config.lr_clone_bump_factor,
         )
 
         # Mixed precision
@@ -113,6 +120,7 @@ class PPOTrainer:
         # Statistics
         self.episode_count = 0
         self.update_count = 0
+        self.update_count_at_phase_start = 0  # for updates_in_phase logging
         self.total_steps = 0
         self.ema_return = None
         self.best_win_rate = 0.0
@@ -135,15 +143,15 @@ class PPOTrainer:
 
     def _on_phase_change(self, old_phase: Phase, new_phase: Phase):
         """Callback when curriculum phase changes."""
+        # Log per-depth graduation snapshot (captured by curriculum before reset).
+        self._log_phase_graduation(old_phase, new_phase)
+
+        # Notify LR scheduler: shrink peak by phase_reset_factor and restart cycle.
+        self.lr_scheduler.notify_phase_graduated()
+        self.update_count_at_phase_start = self.update_count
+
         # Save checkpoint at phase transition
         self.save_checkpoint(f"phase{int(old_phase)}_complete")
-
-        # Reset plateau scheduler so prior-phase reductions and best_score
-        # (achieved under different game conditions) don't carry forward.
-        self.lr_scheduler.reset()
-
-        # Apply new phase's cosine LR with a clean plateau multiplier.
-        self._update_learning_rate()
 
         # Broadcast new game settings and curriculum to workers
         self._broadcast_game_settings()
@@ -156,6 +164,9 @@ class PPOTrainer:
                 self._update_clone_model()
                 # New mixed phase starts at D1 only; D2-D7 unlock progressively via win rate
                 self._broadcast_minimax_range(min_depth=1, max_depth=1)
+                # mixed_state was reset by the curriculum, so all dominated
+                # flags are False — push fresh weights (1.0 across the board).
+                self._broadcast_minimax_weights()
 
     def _broadcast_minimax_range(self, min_depth: int, max_depth: int):
         """Send minimax depth range to all workers."""
@@ -163,6 +174,24 @@ class PPOTrainer:
             'type': 'update_minimax_range',
             'min_depth': min_depth,
             'max_depth': max_depth,
+        }
+        for q in self.control_queues:
+            try:
+                q.put(msg)
+            except:
+                pass
+
+    def _broadcast_minimax_weights(self):
+        """Send per-depth sampling weights to all workers.
+
+        Dominated depths (WR >= 0.90 with 0.85 hysteresis) get weight ~0.01;
+        the freed probability mass shifts to self-play in the worker. Called
+        after each PPO update so the dampener tracks current WR snapshots.
+        """
+        weights = self.curriculum.get_minimax_depth_weights()
+        msg = {
+            'type': 'update_minimax_weights',
+            'weights': weights,
         }
         for q in self.control_queues:
             try:
@@ -185,9 +214,8 @@ class PPOTrainer:
     def _on_clone_update(self):
         """Callback when clone should be updated (85% WR over 1000 games, cooldown-gated)."""
         self._update_clone_model()
-        # Refresh effective LR. Cosine does NOT restart here; the old behavior
-        # (lr_start spike on every clone) was the main trigger of policy collapse.
-        self._update_learning_rate()
+        # Bump LR slightly to help adapt to the harder snapshot, then restart cycle.
+        self.lr_scheduler.notify_clone_replaced()
 
     def _broadcast_clone_update(self):
         """Send updated clone weights to workers."""
@@ -208,10 +236,10 @@ class PPOTrainer:
 
     def _broadcast_game_settings(self):
         """Send game settings to all workers."""
-        random_moves = self.curriculum.get_random_moves_for_phase()
+        starting_stones = self.curriculum.get_starting_stones_for_phase()
         msg = {
             'type': 'update_game_settings',
-            'random_moves': random_moves,
+            'starting_stones': starting_stones,
         }
 
         for q in self.control_queues:
@@ -219,25 +247,6 @@ class PPOTrainer:
                 q.put(msg)
             except:
                 pass
-
-    def _update_learning_rate(self):
-        """Apply the effective LR: cosine base * plateau multiplier.
-
-        The curriculum provides a cosine schedule (monotonic across a phase).
-        The RLPlateauScheduler contributes a multiplicative reduction every
-        time the hard-opponent WR plateaus. Composing both avoids the old
-        bug where cosine silently clobbered plateau reductions on every loop.
-        """
-        base_lr = self.curriculum.get_learning_rate()
-        config = self.curriculum.get_config()
-        base_lr = max(min(base_lr, config.lr_start), config.lr_end)
-
-        plateau_mult = self.lr_scheduler.get_plateau_multiplier()
-        lr = max(base_lr * plateau_mult, self.lr_scheduler.min_lr)
-
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-        self.lr_scheduler.notify_current_lr(lr)
 
     def _broadcast_curriculum_update(self):
         """Send curriculum update to all workers."""
@@ -251,15 +260,28 @@ class PPOTrainer:
             'reward_config': reward_config,
         }
 
-        # For mixed mode, include opponent mix
+        # For mixed mode, include opponent mix (per-phase)
         if config.opponent_type == 'mixed':
-            msg['opponent_mix'] = MIXED_CONFIG['opponent_mix']
+            msg['opponent_mix'] = self._opponent_mix_for_phase()
 
         for q in self.control_queues:
             try:
                 q.put(msg)
             except:
                 pass
+
+    def _opponent_mix_for_phase(self) -> Dict[str, float]:
+        """Return the opponent mix to use for the current phase."""
+        phase = self.curriculum.current_phase
+        if phase == Phase.PHASE_1:
+            return dict(PHASE_1_CONFIG)
+        if phase == Phase.PHASE_10:
+            return {
+                'minimax': PHASE_10_CONFIG['minimax'],
+                'self':    PHASE_10_CONFIG['self'],
+                'random':  PHASE_10_CONFIG['random'],
+            }
+        return dict(MIXED_CONFIG['opponent_mix'])
 
     def get_entropy_coef(self) -> float:
         """Get current entropy coefficient with gradual decay."""
@@ -269,33 +291,61 @@ class PPOTrainer:
 
     def start_workers(self):
         """Start worker processes."""
+        # Pin the trainer process to the worker core range too — it does
+        # IPC + GPU work, the display still gets the reserved cores.
+        reserved = int(getattr(self.config, "reserved_display_cores", 0))
+        if reserved > 0:
+            try:
+                available = sorted(os.sched_getaffinity(0))
+                worker_cores = [c for c in available if c < (len(available) - reserved)]
+                if worker_cores:
+                    os.sched_setaffinity(0, set(worker_cores))
+                    print(f"  Trainer pinned to cores {worker_cores[0]}-"
+                          f"{worker_cores[-1]} ({reserved} reserved for display)")
+            except (AttributeError, OSError) as e:
+                print(f"  WARN: could not set trainer CPU affinity: {e!r}")
+
         print(f"Starting {self.config.num_workers} workers...")
 
         self.request_queue = mp.Queue()
         self.experience_queue = mp.Queue()
 
-        # Shared move cache: 20 GB lock-free shared memory hash table (D1/D2 only)
-        # TT budget: 130 GB split across workers for alpha-beta search (D1-D4)
-        MOVE_CACHE_GB = 20.0
-        TT_BUDGET_MB = 130 * 1024
-        self.shared_move_cache = SharedMoveCache(size_gb=MOVE_CACHE_GB, create=True)
-        tt_budget_per_worker = TT_BUDGET_MB // max(1, self.config.num_workers)
+        # Cross-process best-move cache: one POSIX shm segment that all
+        # workers attach to. Disabled if move_cache_bytes <= 0. We hold
+        # the creator handle here so the segment outlives the workers
+        # and we can unlink() it on shutdown.
+        self._move_cache = None
+        cache_name = getattr(self.config, "move_cache_name", "")
+        cache_bytes = int(getattr(self.config, "move_cache_bytes", 0))
+        if cache_name and cache_bytes > 0:
+            try:
+                self._move_cache = fastnmm.SharedMoveCache.create(
+                    cache_name, cache_bytes,
+                )
+                gib = self._move_cache.bytes / (1024 ** 3)
+                print(f"  SharedMoveCache: {gib:.2f} GiB "
+                      f"({self._move_cache.num_entries:,} slots) at "
+                      f"'{cache_name}'")
+            except Exception as e:
+                print(f"  WARN: could not create SharedMoveCache "
+                      f"'{cache_name}' ({cache_bytes/1024**3:.1f} GiB): "
+                      f"{e!r}\n  Training will continue without it. "
+                      f"(Hint: /dev/shm may be too small; check "
+                      f"`df -h /dev/shm` and consider "
+                      f"`mount -o remount,size=128G /dev/shm`.)")
+                self._move_cache = None
+
         curr_cfg = self.curriculum.get_config()
         curr_reward_cfg = self.curriculum.get_reward_config()
-        curr_random_moves = self.curriculum.get_random_moves_for_phase()
+        curr_starting_stones = self.curriculum.get_starting_stones_for_phase()
         curr_active_mm_max = self.curriculum.get_active_minimax_max_depth()
 
         shared_state = {
-            'shm_cache_size_gb': MOVE_CACHE_GB,
-            'tt_budget_mb': tt_budget_per_worker,
-            # Seed workers with current curriculum at process start to avoid
-            # spending whole batches in fallback random mode if first control
-            # messages are delayed or dropped.
-            'initial_random_moves': curr_random_moves,
+            'initial_starting_stones': curr_starting_stones,
             'initial_opponent_type': curr_cfg.opponent_type,
             'initial_minimax_depth': 1,
             'initial_reward_config': curr_reward_cfg,
-            'initial_opponent_mix': dict(MIXED_CONFIG['opponent_mix']) if curr_cfg.opponent_type == 'mixed' else None,
+            'initial_opponent_mix': self._opponent_mix_for_phase() if curr_cfg.opponent_type == 'mixed' else None,
             'initial_minimax_min_depth': 1,
             'initial_minimax_max_depth': curr_active_mm_max,
         }
@@ -338,6 +388,8 @@ class PPOTrainer:
         # Set initial minimax range from curriculum state (D1 on fresh start, unlocked depth on resume)
         active_max = self.curriculum.get_active_minimax_max_depth()
         self._broadcast_minimax_range(min_depth=1, max_depth=max(1, active_max))
+        # On resume, dominated flags carry over from the checkpoint.
+        self._broadcast_minimax_weights()
 
         # Initialize clone for mixed phases
         config = self.curriculum.get_config()
@@ -357,13 +409,25 @@ class PPOTrainer:
             if p.is_alive():
                 p.terminate()
 
-        # Clean up shared memory move cache
-        if hasattr(self, 'shared_move_cache'):
+        # Tear down the shared move cache (creator's responsibility).
+        if getattr(self, "_move_cache", None) is not None:
             try:
-                self.shared_move_cache.close()
-                self.shared_move_cache.unlink()
+                p = self._move_cache.probes
+                h = self._move_cache.hits
+                rate = (h / p) if p else 0.0
+                print(f"  SharedMoveCache stats from trainer: "
+                      f"probes={p:,} hits={h:,} hit_rate={rate:.1%}")
             except Exception:
                 pass
+            try:
+                self._move_cache.close()
+            except Exception:
+                pass
+            try:
+                self._move_cache.unlink()
+            except Exception:
+                pass
+            self._move_cache = None
 
     def pause_workers(self):
         """Pause all workers for PPO update."""
@@ -473,15 +537,21 @@ class PPOTrainer:
                         minimax_depth=minimax_depth
                     )
 
-                    # Drop random-game experiences from PPO training once WR vs random
+                    # Drop dominated-opponent experiences from PPO training once WR
                     # is at or above the cutoff (games still run for stats above).
                     # In Phase 1 (random-only) we always train; filter only in mixed phases.
                     curr_cfg = self.curriculum.get_config()
-                    if (batch.opponent_type == 'random'
-                            and curr_cfg.opponent_type == 'mixed'):
-                        wr_random = self.curriculum.mixed_state.get_win_rate_vs_opponent('random')
-                        if wr_random >= RANDOM_TRAIN_CUTOFF:
-                            continue  # play counted for stats, but not for training
+                    if curr_cfg.opponent_type == 'mixed':
+                        if batch.opponent_type == 'random':
+                            wr_random = self.curriculum.mixed_state.get_win_rate_vs_opponent('random')
+                            if wr_random >= RANDOM_TRAIN_CUTOFF:
+                                continue  # play counted for stats, but not for training
+                        elif batch.opponent_type == 'minimax':
+                            wr_mm = self.curriculum.mixed_state.get_win_rate_vs_opponent(
+                                'minimax', minimax_depth
+                            )
+                            if wr_mm >= MINIMAX_TRAIN_CUTOFF:
+                                continue  # dominated this depth — skip for PPO
 
                     all_experiences.append(batch)
 
@@ -622,21 +692,20 @@ class PPOTrainer:
 
     def evaluate_vs_random(self, num_games: int = 200) -> float:
         """Evaluate model against random opponent."""
-        game = load_game_fixed("nine_mens_morris")
-        random_moves = self.curriculum.get_random_moves_for_phase()
-        if random_moves < 0:
-            random_moves = 75  # Use average for evaluation
+        game = fastnmm.load_game("nine_mens_morris")
+        stones = self.curriculum.get_starting_stones_for_phase()
         wins, draws = 0, 0
 
         self.model.eval()
         with torch.no_grad():
             for i in range(num_games):
-                state = game.new_initial_state()
+                if stones < 0:
+                    eval_stones = (random.randint(3, 9), random.randint(3, 9))
+                else:
+                    eval_stones = (stones, stones)
+                state = game.new_initial_state(starting_stones=eval_stones)
 
-                # Prepare board with random moves
-                prepare_game_state(state, random_moves)
-
-                # Skip if game ended during preparation
+                # Skip if engine returns an already-terminal state for these stones
                 if state.is_terminal():
                     continue
 
@@ -647,10 +716,8 @@ class PPOTrainer:
                     pid = state.current_player()
 
                     if pid == our_player:
-                        obs = torch.tensor(
-                            state.observation_tensor(pid),
-                            dtype=torch.float32, device=self.device
-                        ).unsqueeze(0)
+                        obs_arr = state.observation_tensor_numpy(pid).reshape(-1)
+                        obs = torch.from_numpy(obs_arr).to(self.device).unsqueeze(0)
                         mask = torch.tensor(
                             get_legal_mask(state, self.num_actions),
                             dtype=torch.float32, device=self.device
@@ -679,14 +746,12 @@ class PPOTrainer:
 
     def evaluate_vs_minimax_progressive(self) -> Tuple[int, str]:
         """Test AI against progressively harder minimax bots."""
-        random_moves = self.curriculum.get_random_moves_for_phase()
-        if random_moves < 0:
-            random_moves = 75  # Use average for evaluation
+        stones = self.curriculum.get_starting_stones_for_phase()
         max_depth_beaten, results = evaluate_vs_minimax(
             self.model, self.device, self.num_actions,
             max_depth=6, games_per_depth=10, max_steps=150,
             use_mixed_precision=self.config.use_mixed_precision,
-            random_moves=random_moves,
+            starting_stones=stones,
         )
         result_str = format_minimax_results(results)
         return max_depth_beaten, result_str
@@ -723,31 +788,22 @@ class PPOTrainer:
                 'active_mm_max_depth': 0,
             }
 
-        # Get scheduler status
-        scheduler_best = self.lr_scheduler.get_best_score() if config.opponent_type == 'mixed' else 0.0
-        scheduler_lr = self.lr_scheduler.get_current_lr() if config.opponent_type == 'mixed' else metrics.get('lr', 0)
-        
         # Main progress line - matches original format
         print(
             f"[Phase {int(self.curriculum.current_phase)}] Ep {self.episode_count:,} | {curriculum_status} | "
             f"Ret: {avg_return:+.3f} | PL: {metrics.get('policy_loss', 0):+.4f} | VL: {metrics.get('value_loss', 0):.3f} | "
             f"LR: {metrics.get('lr', 0):.1e} | {eps_per_sec:.0f}/s"
         )
-        
-        # Print scheduler status in mixed phases (Phase 2+)
-        if config.opponent_type == 'mixed':
-            print(
-                f"  [Scheduler] Best WR(D2): {scheduler_best:.1%} | Current LR: {scheduler_lr:.1e} | "
-                f"Reductions: {self.lr_scheduler.reductions} | Wait: {self.lr_scheduler.wait}/{self.lr_scheduler.patience}"
-            )
-        
+
         # Minimax evaluation results
         active_max = opp_wr['active_mm_max_depth']
 
         def _d_str(d: int) -> str:
             key = f'wr_vs_mm_d{d}'
             if active_max >= d:
-                return f" D{d}:{opp_wr.get(key, 0.0):.0%}"
+                wr = opp_wr.get(key, 0.0)
+                note = "*" if wr >= MINIMAX_TRAIN_CUTOFF else ""
+                return f" D{d}:{wr:.0%}{note}"
             return f" D{d}:locked"
 
         depth_str = "".join(_d_str(d) for d in range(1, 8))
@@ -778,31 +834,53 @@ class PPOTrainer:
                         self.existing_log_path = path
                         file_mode = 'a'
                         write_header = False
-                
+
                 if path is None:
                     path = os.path.join(self.config.log_dir, f"{time.strftime('%Y%m%d_%H%M%S')}_curriculum.csv")
                     file_mode = 'w'
                     write_header = True
-            
+
             self.log_file = open(path, file_mode, newline='')
-            self.log_writer = csv.DictWriter(self.log_file, fieldnames=[
-                'episode', 'phase', 'random_moves', 'steps', 'avg_return', 'ema_return',
+            fieldnames = [
+                'episode', 'phase', 'starting_stones', 'steps', 'avg_return', 'ema_return',
                 'win_rate', 'draw_rate', 'policy_loss', 'value_loss', 'entropy', 'kl_div',
-                'clip_frac', 'grad_norm', 'lr', 'minimax_depth_beaten', 'clone_gen',
+                'clip_frac', 'grad_norm', 'lr', 'cycle_step', 'last_reset_event',
+                'minimax_depth_beaten', 'clone_gen',
                 'active_mm_max_depth', 'shaping_mult',
                 'wr_vs_mm_d1', 'wr_vs_mm_d2', 'wr_vs_mm_d3', 'wr_vs_mm_d4',
                 'wr_vs_mm_d5', 'wr_vs_mm_d6', 'wr_vs_mm_d7',
                 'wr_vs_random', 'wr_vs_self',
-                # RL Plateau Scheduler metrics
-                'scheduler_best_wr_d2', 'scheduler_current_lr', 'scheduler_reductions', 'scheduler_wait'
-            ])
+                # Per-depth graduation diagnostics — slope angle (deg) over a 1M
+                # episode horizon, and current samples in the per-depth window.
+                'slope_angle_d1', 'slope_angle_d2', 'slope_angle_d3', 'slope_angle_d4',
+                'slope_angle_d5', 'slope_angle_d6', 'slope_angle_d7',
+                'samples_in_window_d1', 'samples_in_window_d2', 'samples_in_window_d3',
+                'samples_in_window_d4', 'samples_in_window_d5', 'samples_in_window_d6',
+                'samples_in_window_d7',
+                # Training throughput
+                'eps_per_sec',
+            ]
+            self.log_writer = csv.DictWriter(self.log_file, fieldnames=fieldnames, extrasaction='ignore')
             if write_header:
                 self.log_writer.writeheader()
 
-        self.log_writer.writerow({
+        ms = self.curriculum.mixed_state
+        is_mixed = (config.opponent_type == 'mixed')
+
+        def _slope_angle(d: int) -> float:
+            if not is_mixed:
+                return 0.0
+            angle = ms.get_slope_angle_for_depth(d)
+            # CSV-friendly: clamp +inf (insufficient samples) to NaN-equivalent.
+            return float('nan') if angle == float('inf') else angle
+
+        def _samples(d: int) -> int:
+            return ms.get_window_size_for_depth(d) if is_mixed else 0
+
+        row = {
             'episode': self.episode_count,
             'phase': int(self.curriculum.current_phase),
-            'random_moves': self.curriculum.get_random_moves_for_phase(),
+            'starting_stones': self.curriculum.get_starting_stones_for_phase(),
             'steps': self.total_steps,
             'avg_return': avg_return,
             'ema_return': self.ema_return,
@@ -815,8 +893,10 @@ class PPOTrainer:
             'clip_frac': metrics.get('clip_frac', 0),
             'grad_norm': metrics.get('grad_norm', 0),
             'lr': metrics.get('lr', 0),
+            'cycle_step': metrics.get('cycle_step', self.lr_scheduler.cycle_step),
+            'last_reset_event': metrics.get('last_reset_event', self.lr_scheduler.last_reset_event),
             'minimax_depth_beaten': max_depth_beaten,
-            'clone_gen': self.curriculum.mixed_state.clone_generation,
+            'clone_gen': ms.clone_generation,
             'active_mm_max_depth': opp_wr['active_mm_max_depth'],
             'shaping_mult': self.curriculum.get_shaping_multiplier(),
             'wr_vs_mm_d1': opp_wr['wr_vs_mm_d1'],
@@ -828,13 +908,82 @@ class PPOTrainer:
             'wr_vs_mm_d7': opp_wr.get('wr_vs_mm_d7', 0.0),
             'wr_vs_random': opp_wr['wr_vs_random'],
             'wr_vs_self': opp_wr['wr_vs_self'],
-            # RL Plateau Scheduler metrics
-            'scheduler_best_wr_d2': scheduler_best,
-            'scheduler_current_lr': scheduler_lr,
-            'scheduler_reductions': self.lr_scheduler.reductions,
-            'scheduler_wait': self.lr_scheduler.wait,
-        })
+            'eps_per_sec': eps_per_sec,
+        }
+        for d in range(1, 8):
+            row[f'slope_angle_d{d}'] = _slope_angle(d)
+            row[f'samples_in_window_d{d}'] = _samples(d)
+
+        self.log_writer.writerow(row)
         self.log_file.flush()
+
+    def _log_phase_graduation(self, old_phase: Phase, new_phase: Phase):
+        """Emit a one-line graduation snapshot to a sidecar CSV plus stdout.
+
+        Captures the per-depth WR/slope/samples state at graduation, alongside
+        episodes/updates-in-phase, clone generations, and current LR. This is
+        the diagnostic record for whether a phase graduated cleanly under the
+        new criteria. Writing to a separate file (vs. the main per-update CSV)
+        keeps the schemas clean.
+        """
+        snapshot = self.curriculum.last_graduation_snapshot
+        if snapshot is None:
+            return  # Phase 1's win-rate-driven graduation also lands here; no per-depth data.
+
+        episodes_in_phase = snapshot.get('episodes_in_phase', 0)
+        updates_in_phase = self.update_count - self.update_count_at_phase_start
+        per_depth_wr = snapshot.get('per_depth_wr', {})
+        per_depth_slope = snapshot.get('per_depth_slope_angle', {})
+        per_depth_samples = snapshot.get('per_depth_samples', {})
+
+        # Stdout: human-readable summary
+        depths_str = " ".join(
+            f"D{d}:{per_depth_wr.get(d, 0.0):.0%}({per_depth_slope.get(d, float('inf')):.2f}°,n={per_depth_samples.get(d, 0)})"
+            for d in sorted(per_depth_wr.keys())
+        )
+        print(
+            f"  [Graduation] Phase {int(old_phase)} → {int(new_phase)} | "
+            f"eps_in_phase={episodes_in_phase:,} updates_in_phase={updates_in_phase:,} | "
+            f"wr_top={snapshot.get('wr_vs_top_depth_at_graduation', 0.0):.0%} | "
+            f"clone_gen={snapshot.get('clone_generations_in_phase', 0)} | "
+            f"lr={self.lr_scheduler.get_lr():.2e} | {depths_str}"
+        )
+
+        # CSV sidecar
+        path = os.path.join(self.config.log_dir, "phase_graduations.csv")
+        write_header = not os.path.exists(path)
+        fieldnames = [
+            'episode', 'old_phase', 'new_phase',
+            'episodes_in_phase', 'updates_in_phase',
+            'wr_vs_top_depth_at_graduation', 'top_depth',
+            'clone_generations_in_phase', 'graduation_reason',
+            'lr_before_reset',
+        ] + [f'wr_d{d}' for d in range(1, 8)] \
+          + [f'slope_angle_d{d}' for d in range(1, 8)] \
+          + [f'samples_d{d}' for d in range(1, 8)]
+
+        with open(path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            if write_header:
+                writer.writeheader()
+            row = {
+                'episode': self.episode_count,
+                'old_phase': int(old_phase),
+                'new_phase': int(new_phase),
+                'episodes_in_phase': episodes_in_phase,
+                'updates_in_phase': updates_in_phase,
+                'wr_vs_top_depth_at_graduation': snapshot.get('wr_vs_top_depth_at_graduation', 0.0),
+                'top_depth': snapshot.get('top_depth', 0),
+                'clone_generations_in_phase': snapshot.get('clone_generations_in_phase', 0),
+                'graduation_reason': snapshot.get('graduation_reason', ''),
+                'lr_before_reset': self.lr_scheduler.get_lr(),
+            }
+            for d in range(1, 8):
+                row[f'wr_d{d}'] = per_depth_wr.get(d, '')
+                slope = per_depth_slope.get(d, float('inf'))
+                row[f'slope_angle_d{d}'] = '' if slope == float('inf') else slope
+                row[f'samples_d{d}'] = per_depth_samples.get(d, '')
+            writer.writerow(row)
 
     def save_checkpoint(self, prefix="checkpoint"):
         """Save model checkpoint."""
@@ -843,11 +992,11 @@ class PPOTrainer:
             f"{time.strftime('%Y%m%d_%H%M%S')}_{prefix}_ep{self.episode_count}.pt"
         )
         curriculum_state = self.curriculum.to_state_dict()
-        lr_scheduler_state = self.lr_scheduler.get_state_dict()
         torch.save({
             'episode': self.episode_count,
             'total_steps': self.total_steps,
             'update_count': self.update_count,
+            'update_count_at_phase_start': self.update_count_at_phase_start,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
@@ -855,7 +1004,7 @@ class PPOTrainer:
             'best_win_rate': self.best_win_rate,
             'curriculum_phase': int(self.curriculum.current_phase),
             'curriculum_state': curriculum_state,
-            'lr_scheduler_state': lr_scheduler_state,
+            'lr_scheduler_state': self.lr_scheduler.get_state_dict(),
         }, path)
         print(f"  Saved: {path}")
 
@@ -887,13 +1036,26 @@ class PPOTrainer:
         self.episode_count = ckpt['episode']
         self.total_steps = ckpt.get('total_steps', 0)
         self.update_count = ckpt.get('update_count', 0)
+        # Older checkpoints don't carry phase-start update count. Fall back to
+        # current update_count so updates_in_phase resets to 0 on resume; it
+        # will report correctly from the next phase graduation onward.
+        self.update_count_at_phase_start = ckpt.get('update_count_at_phase_start', self.update_count)
         self.ema_return = ckpt.get('ema_return')
         self.best_win_rate = ckpt.get('best_win_rate', 0.0)
 
-        # Load LR scheduler state
-        if 'lr_scheduler_state' in ckpt:
-            self.lr_scheduler.load_state_dict(ckpt['lr_scheduler_state'])
-            print(f"  LR scheduler restored: best_score={self.lr_scheduler.get_best_score():.1%}, reductions={self.lr_scheduler.reductions}")
+        # Load LR scheduler state. Falls back gracefully if the checkpoint
+        # was produced by an older single-cosine scheduler.
+        if 'lr_scheduler_state' in ckpt and ckpt['lr_scheduler_state']:
+            try:
+                self.lr_scheduler.load_state_dict(ckpt['lr_scheduler_state'])
+                print(
+                    f"  LR scheduler restored: update={self.lr_scheduler.global_update}, "
+                    f"cycle_step={self.lr_scheduler.cycle_step}, "
+                    f"in_warmup={self.lr_scheduler.in_warmup}, "
+                    f"lr={self.lr_scheduler.get_lr():.1e}"
+                )
+            except Exception as e:
+                print(f"  Warning: could not restore LR scheduler state ({e}); continuing from fresh state.")
 
         curriculum_loaded = False
         if ckpt.get('curriculum_state') is not None:
@@ -919,15 +1081,21 @@ class PPOTrainer:
         print(f"Workers: {cfg.num_workers} x {cfg.envs_per_worker} envs = {cfg.num_workers * cfg.envs_per_worker} parallel")
         print()
 
-        print("Training Phases (with random board preparation):")
+        print("Training Phases (engine-configured starting stones):")
         for phase, phase_cfg in PHASE_CONFIGS.items():
-            print(f"  Phase {int(phase)}: "
-                  f"LR {phase_cfg.lr_start:.0e}→{phase_cfg.lr_end:.0e} cosine | {phase_cfg.description[:30]}")
+            print(f"  Phase {int(phase)}: {phase_cfg.description[:60]}")
         print()
 
-        print(f"LR schedule: RL Plateau Scheduler based on Win Rate vs Minimax-2")
-        print(f"  Cosine annealing per phase, restarts on clone update")
-        print(f"  No scheduler auto-stop (phase completion drives termination)")
+        eps_per_update = max(1, cfg.episodes_per_update)
+        warmup_updates = max(1, cfg.lr_warmup_episodes // eps_per_update)
+        cycle_updates = max(1, cfg.lr_cycle_t_max_episodes // eps_per_update)
+        print(
+            f"LR schedule: warmup 0 → {cfg.lr_peak:.1e} over "
+            f"{cfg.lr_warmup_episodes:,} eps (~{warmup_updates} updates), then "
+            f"cosine → {cfg.lr_min:.1e} cycles of {cfg.lr_cycle_t_max_episodes:,} eps "
+            f"(~{cycle_updates} updates). "
+            f"Phase grad ×{cfg.lr_phase_reset_factor}, clone bump ×{cfg.lr_clone_bump_factor}."
+        )
         print()
 
         print(f"Mixed Training (Phase 2-9):")
@@ -943,9 +1111,9 @@ class PPOTrainer:
         print()
 
         config = self.curriculum.get_config()
-        random_moves = self.curriculum.get_random_moves_for_phase()
+        stones = self.curriculum.get_starting_stones_for_phase()
         print(f"Starting Phase {int(self.curriculum.current_phase)}: {config.description}")
-        print(f"  Random moves for board prep: {random_moves if random_moves >= 0 else '0-150 (random)'}")
+        print(f"  Starting stones per player: {stones if stones >= 0 else 'random 3-9 per game'}")
         print("=" * 70)
 
         self.start_time = time.time()
@@ -964,8 +1132,15 @@ class PPOTrainer:
                 # and get served on the next collect_experiences call.
                 metrics = self.update_policy(experiences)
 
-                # Apply cosine * plateau multiplier every loop.
-                self._update_learning_rate()
+                # Step the warm-restart cosine ONLY when the PPO update actually
+                # ran (update_policy returns {} for an empty batch). This keeps
+                # the LR schedule aligned with real gradient steps.
+                if metrics:
+                    self.lr_scheduler.step()
+                # Decorate metrics with current scheduler state for CSV logging.
+                metrics['lr'] = self.lr_scheduler.get_lr()
+                metrics['cycle_step'] = self.lr_scheduler.cycle_step
+                metrics['last_reset_event'] = self.lr_scheduler.last_reset_event
 
                 # Check for clone update (85% WR over 1000 self-play games)
                 if self.curriculum.should_update_clone():
@@ -977,22 +1152,16 @@ class PPOTrainer:
                     self._broadcast_minimax_range(min_depth=1, max_depth=new_max)
                     self.save_checkpoint(f"depth{new_max}_unlocked")
 
-                # Logging + plateau scheduler step.
-                # The scheduler is intentionally stepped here (every log_interval
-                # episodes, ~25k) rather than every PPO loop (~8k). patience=10
-                # therefore means 10 × 25k = 250k episodes without improvement
-                # before a reduction fires — matching the original design intent.
-                # Calling it every loop caused 90+ spurious reductions in Phase 2-9.
-                if self.episode_count % cfg.log_interval < cfg.episodes_per_update:
-                    if config.opponent_type == 'mixed':
-                        opp_wr = self.curriculum.get_opponent_win_rates()
-                        hard_opponent_wr = opp_wr.get('wr_vs_mm_d2', 0.0)
-                        self.lr_scheduler.step(hard_opponent_wr, episode=self.episode_count)
-                        self._update_learning_rate()  # re-apply if a reduction just fired
+                # Refresh per-depth sampling weights (dominated depths get 0.01,
+                # freed probability mass goes to self-play).
+                if self.curriculum.get_config().opponent_type == 'mixed':
+                    self._broadcast_minimax_weights()
 
-                    self.log_progress(returns, metrics)
-                    # Sample minimax winrate for trend-based graduation (phases 2+)
+                if self.episode_count % cfg.log_interval < cfg.episodes_per_update:
+                    # Sample first so the logged per-depth slope/samples reflect
+                    # the freshest tick, not the prior one.
                     self.curriculum.sample_minimax_winrate()
+                    self.log_progress(returns, metrics)
 
                 # Check graduation
                 if self.episode_count % cfg.graduation_check_interval < cfg.episodes_per_update:

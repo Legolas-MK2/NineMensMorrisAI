@@ -24,12 +24,9 @@ from utils import (
     get_legal_mask, count_pieces_from_state, extract_state_features,
     compute_gae, ExperienceBatch, RewardCalculator
 )
-from minimax import MinimaxBot
-from shared_cache import SharedMoveCache
 
-# Import pyspiel with bug fix wrapper
-import pyspiel
-from game_wrapper import load_game as load_game_fixed
+import fastnmm
+from fastnmm import MinimaxBot
 
 
 DEFAULT_MIXED_OPPONENT_MIX: Dict[str, float] = {
@@ -39,99 +36,59 @@ DEFAULT_MIXED_OPPONENT_MIX: Dict[str, float] = {
 }
 
 
-class CachedMinimaxBot:
+_DEFAULT_TT_BYTES_PER_BOT = 128 * 1024 * 1024  # matches Config default
+
+
+class _RandomizedMinimaxBot:
+    """fastnmm.MinimaxBot with a per-call `random_move_prob` exploration roll.
+
+    Wraps the C++ bot so we can keep the curriculum's "30% random override"
+    behaviour without modifying fastnmm. The wrapped bot owns a persistent
+    per-process TT and optionally consults a cross-process SharedMoveCache
+    for root-move-ordering hints.
     """
-    Wrapper around MinimaxBot that caches (hash → action) for D1/D2.
 
-    Two-level cache:
-      1. local_cache: per-process dict, zero overhead
-      2. shared_cache: SharedMoveCache in shared memory, zero-copy across workers
-    """
+    def __init__(self, depth: int, random_move_prob: float = 0.3,
+                 player_id: int = 0,
+                 tt_bytes: int = _DEFAULT_TT_BYTES_PER_BOT,
+                 root_cache=None):
+        self.depth = int(depth)
+        self.random_move_prob = float(random_move_prob)
+        self._bot = MinimaxBot(
+            player_id=player_id, depth=self.depth, tt_bytes=int(tt_bytes),
+            root_cache=root_cache,
+        )
 
-    def __init__(self, bot: MinimaxBot, depth: int,
-                 shared_cache: Optional[SharedMoveCache] = None):
-        self.bot = bot
-        self.depth = depth
-        self.random_move_prob = bot.random_move_prob
-        self.bot.random_move_prob = 0.0  # handled here to avoid double roll
-        self.shared_cache = shared_cache
-        self.local_cache: Dict[int, int] = {}
-
-    def get_action(self, state) -> int:
-        if self.random_move_prob > 0 and random.random() < self.random_move_prob:
+    def step(self, state) -> int:
+        if self.random_move_prob > 0.0 and random.random() < self.random_move_prob:
             return random.choice(state.legal_actions())
+        return self._bot.step(state)
 
-        if self.depth > 2:
-            return self.bot.get_action(state)
-
-        h = self.bot._get_hash(state, state.current_player())
-        cache_key = h ^ (self.depth * 0x9E3779B97F4A7C15)
-
-        legal = state.legal_actions()
-
-        # 1. local cache (fastest)
-        cached = self.local_cache.get(cache_key)
-        if cached is not None and cached in legal:
-            return cached
-
-        # 2. shared memory cache (zero-copy, no IPC)
-        if self.shared_cache is not None:
-            cached = self.shared_cache.get(cache_key)
-            if cached is not None and cached in legal:
-                self.local_cache[cache_key] = cached
-                return cached
-
-        # cache miss — run minimax
-        action = self.bot.get_action(state)
-        self.local_cache[cache_key] = action
-        if self.shared_cache is not None:
-            self.shared_cache[cache_key] = action
-
-        return action
+    # Legacy alias used elsewhere in the codebase.
+    get_action = step
 
 
 class MinimaxBotPool:
-    """
-    Pool of persistent MinimaxBot instances keyed by depth.
-    Reuses bots (and their transposition tables) across games.
-    D1/D2 bots are wrapped with CachedMinimaxBot for move caching.
+    """Pool of persistent fastnmm MinimaxBots keyed by depth.
 
-    TT budget is split depth-aware: D1/D2 get small fixed allocations
-    (their search trees are tiny); D3/D4 share the remaining budget.
+    `tt_bytes` is forwarded to each lazily-created bot. `root_cache`, if
+    provided, is shared across every bot in the pool so they all read
+    from / write to the same SharedMoveCache.
     """
 
-    # Fixed TT for shallow depths — their search trees are tiny
-    _FIXED_TT_MB = {1: 64, 2: 256}
+    def __init__(self, tt_bytes: int = _DEFAULT_TT_BYTES_PER_BOT,
+                 root_cache=None):
+        self._bots: Dict[int, _RandomizedMinimaxBot] = {}
+        self._tt_bytes = int(tt_bytes)
+        self._root_cache = root_cache
 
-    def __init__(self, tt_budget_mb: int = 6000,
-                 shared_cache: Optional[SharedMoveCache] = None):
-        self._bots = {}
-        self._tt_budget_mb = tt_budget_mb
-        self._shared_cache = shared_cache
-        # MB already committed to fixed-depth bots
-        self._fixed_used_mb = sum(self._FIXED_TT_MB.values())
-
-    def _tt_for_depth(self, depth: int) -> int:
-        if depth in self._FIXED_TT_MB:
-            return self._FIXED_TT_MB[depth]
-        # Remaining budget split equally among D3+ bots (usually 2: D3 and D4)
-        remaining = max(64, self._tt_budget_mb - self._fixed_used_mb)
-        higher_depths_expected = 2  # D3 and D4
-        return max(64, remaining // higher_depths_expected)
-
-    def get(self, depth: int):
+    def get(self, depth: int) -> _RandomizedMinimaxBot:
         if depth not in self._bots:
-            tt_mb = self._tt_for_depth(depth)
-            bot = MinimaxBot(
-                max_depth=depth, random_move_prob=0.3,
-                tt_size_mb=tt_mb,
+            self._bots[depth] = _RandomizedMinimaxBot(
+                depth=depth, random_move_prob=0.3,
+                tt_bytes=self._tt_bytes,
+                root_cache=self._root_cache,
             )
-            if depth <= 2:
-                self._bots[depth] = CachedMinimaxBot(
-                    bot, depth, shared_cache=self._shared_cache,
-                )
-            else:
-                self._bots[depth] = bot
         return self._bots[depth]
 
 
@@ -143,11 +100,16 @@ class EnvState:
         self.reward_calculator = reward_calculator
         self.reset()
 
-    def reset(self):
-        self.state = self.game.new_initial_state()
+    def reset(self, starting_stones: Optional[Tuple[int, int]] = None):
+        if starting_stones is None:
+            self.state = self.game.new_initial_state()
+            init_pieces = (9, 9)
+        else:
+            self.state = self.game.new_initial_state(starting_stones=starting_stones)
+            init_pieces = starting_stones
         self.step_count = 0
         self.experiences = {0: [], 1: []}
-        self.pieces = {0: 9, 1: 9}
+        self.pieces = {0: init_pieces[0], 1: init_pieces[1]}
 
         # Opponent settings (set by worker based on curriculum)
         self.opponent_type = 'random'
@@ -168,7 +130,9 @@ class EnvState:
         if opponent_type == 'minimax' and bot_pool is not None:
             self.minimax_bot = bot_pool.get(minimax_depth)
         elif opponent_type == 'minimax':
-            self.minimax_bot = MinimaxBot(max_depth=minimax_depth, random_move_prob=0.3)
+            self.minimax_bot = _RandomizedMinimaxBot(
+                depth=minimax_depth, random_move_prob=0.3,
+            )
         else:
             self.minimax_bot = None
 
@@ -181,7 +145,7 @@ def get_opponent_action(env: EnvState, state, num_actions: int, clone_model: Opt
     elif env.opponent_type == 'minimax':
         if env.minimax_bot is None:
             return random.choice(state.legal_actions())
-        return env.minimax_bot.get_action(state)
+        return env.minimax_bot.step(state)
 
     elif env.opponent_type == 'self' and clone_model is not None:
         return get_clone_action(state, num_actions, clone_model)
@@ -195,10 +159,8 @@ def get_clone_action(state, num_actions: int, clone_model: ActorCritic) -> int:
     legal_actions = state.legal_actions()
     current_player = state.current_player()
 
-    obs = torch.tensor(
-        state.observation_tensor(current_player),
-        dtype=torch.float32
-    ).unsqueeze(0)
+    obs_arr = state.observation_tensor_numpy(current_player).reshape(-1)
+    obs = torch.from_numpy(obs_arr).unsqueeze(0)
     mask = torch.tensor(
         get_legal_mask(state, num_actions),
         dtype=torch.float32
@@ -230,16 +192,37 @@ def worker_process(
     """
     Worker process that collects experiences with curriculum-based opponents.
 
-    Game settings (random_moves for board preparation) are received via control queue.
+    Game settings (starting_stones for engine board init) are received via control queue.
     """
     np.random.seed(worker_id + int(time.time() * 1000) % 2**31)
     random.seed(worker_id + int(time.time() * 1000) % 2**31)
+
+    # Restrict workers to a sub-range of cores so the X/VNC server keeps
+    # CPU available and the desktop stays responsive. Without this, 16+
+    # workers each running C++ minimax on a multi-thread executor saturate
+    # all cores and the VNC framebuffer stops updating.
+    reserved = int(getattr(config, "reserved_display_cores", 0))
+    if reserved > 0:
+        try:
+            available = sorted(os.sched_getaffinity(0))
+            worker_cores = [c for c in available if c < (len(available) - reserved)]
+            if worker_cores:
+                os.sched_setaffinity(0, set(worker_cores))
+        except (AttributeError, OSError):
+            pass
+
+    nice_level = int(getattr(config, "worker_nice", 0))
+    if nice_level > 0:
+        try:
+            os.nice(nice_level)
+        except OSError:
+            pass
 
     num_envs = config.envs_per_worker
 
     # Bootstrap settings from trainer so workers start in the correct mode
     # even before first control-queue updates are processed.
-    initial_random_moves = int(shared_state.get('initial_random_moves', 150))
+    initial_starting_stones = int(shared_state.get('initial_starting_stones', 9))
     initial_opponent_type = str(shared_state.get('initial_opponent_type', 'random'))
     initial_minimax_depth = int(shared_state.get('initial_minimax_depth', 1))
     initial_minimax_min_depth = int(shared_state.get('initial_minimax_min_depth', 1))
@@ -247,11 +230,13 @@ def worker_process(
     initial_opponent_mix_raw = shared_state.get('initial_opponent_mix')
     initial_reward_config_raw = shared_state.get('initial_reward_config')
 
-    # Current game settings (updated via control queue)
-    current_random_moves = initial_random_moves
+    # Current game settings (updated via control queue).
+    # Positive int N → both players start with N stones.
+    # -1 sentinel       → randomize per game; each player gets random.randint(3, 9).
+    current_starting_stones = initial_starting_stones
 
-    # Create game using pyspiel with position 0 bug fix
-    game = load_game_fixed("nine_mens_morris")
+    # Create game using the fastnmm C++ engine
+    game = fastnmm.load_game("nine_mens_morris")
 
     # Fallback reward config used if no initial config is provided.
     default_reward_config = {
@@ -286,79 +271,75 @@ def worker_process(
     current_minimax_min_depth = initial_minimax_min_depth
     current_minimax_max_depth = initial_minimax_max_depth
 
+    # Per-depth sampling weights (replaced by trainer via control queue).
+    # Default 1.0 = uniform within the minimax bucket. Dominated depths get
+    # ~0.01; the freed probability mass shifts to self-play in
+    # select_mixed_opponent().
+    current_minimax_weights: Dict[int, float] = {d: 1.0 for d in range(1, 8)}
+
     reward_calculator = RewardCalculator(current_reward_config)
     envs = [EnvState(game, reward_calculator) for _ in range(num_envs)]
 
     # Clone model for self-play
     clone_model: Optional[ActorCritic] = None
 
-    # Attach to the shared memory move cache created by the trainer
-    shm_size_gb = shared_state.get('shm_cache_size_gb', 20.0)
-    shared_move_cache = None
-    try:
-        shared_move_cache = SharedMoveCache.attach(size_gb=shm_size_gb)
-    except Exception as e:
-        print(f"  Worker {worker_id}: shared cache unavailable ({e}), using local only")
+    # Cross-process best-move cache: one POSIX shm segment created by the
+    # trainer, attached here. Failure to attach is non-fatal (e.g. cache
+    # disabled by setting move_cache_bytes <= 0 in Config).
+    root_cache = None
+    cache_name = getattr(config, "move_cache_name", "")
+    cache_bytes = int(getattr(config, "move_cache_bytes", 0))
+    if cache_name and cache_bytes > 0:
+        try:
+            root_cache = fastnmm.SharedMoveCache.attach(cache_name)
+        except Exception as e:
+            print(f"[worker {worker_id}] could not attach move cache "
+                  f"'{cache_name}': {e!r} -- continuing without it")
+            root_cache = None
 
-    # Persistent minimax bot pool — depth-aware TT, 130 GB total / num_workers
-    tt_budget_mb = shared_state.get('tt_budget_mb', max(256, (130 * 1024) // max(1, config.num_workers)))
+    # Persistent fastnmm minimax bot pool (one C++ bot per depth).
+    # Each bot owns its own transposition table sized via Config and
+    # shares the root_cache (when attached) for cross-worker move hints.
     bot_pool = MinimaxBotPool(
-        tt_budget_mb=tt_budget_mb,
-        shared_cache=shared_move_cache,
+        tt_bytes=int(getattr(config, "minimax_tt_bytes_per_bot",
+                             _DEFAULT_TT_BYTES_PER_BOT)),
+        root_cache=root_cache,
     )
 
     ready_event.set()
     running = True
     request_counter = 0
 
-    def count_stones(state) -> Tuple[int, int]:
-        """Count stones for each player from the parsed absolute board."""
-        try:
-            return count_pieces_from_state(state, 0)
-        except:
-            return 9, 9  # Default if parsing fails
+    def sample_starting_stones() -> Tuple[int, int]:
+        """Resolve current_starting_stones into a concrete (a, b) pair.
 
-    def play_random_moves(state, num_moves: int):
+        For randomize-per-game phases (-1 sentinel) each player independently
+        gets random.randint(3, 9) so positions stay diverse but never start
+        in the immediate-loss range.
         """
-        Play random moves to prepare the board for training.
-        Stops early if a player reaches 3 stones (about to lose).
-
-        Args:
-            state: Initial game state
-            num_moves: Target number of random moves
-
-        Returns:
-            The state after random moves (modified in place)
-        """
-        moves_made = 0
-        while moves_made < num_moves and not state.is_terminal():
-            # Check if either player has only 3 stones - stop early
-            p0_stones, p1_stones = count_stones(state)
-            if p0_stones <= 3 or p1_stones <= 3:
-                # One player is about to lose, stop random moves
-                break
-
-            legal_actions = state.legal_actions()
-            if not legal_actions:
-                break
-
-            action = random.choice(legal_actions)
-            state.apply_action(action)
-            moves_made += 1
-
-        return state
+        if current_starting_stones < 0:
+            return (random.randint(3, 9), random.randint(3, 9))
+        s = max(1, min(9, int(current_starting_stones)))
+        return (s, s)
 
     def recreate_game():
         """Recreate game with current settings."""
         nonlocal game, envs
-        game = load_game_fixed("nine_mens_morris")
+        game = fastnmm.load_game("nine_mens_morris")
         # Reinitialize all environments with new game
         envs = [EnvState(game, reward_calculator) for _ in range(num_envs)]
         for env in envs:
             setup_new_game(env)
 
     def select_mixed_opponent() -> Tuple[str, int]:
-        """Select opponent for mixed training mode with random minimax depth."""
+        """Select opponent for mixed training mode with weighted minimax depth.
+
+        Within the minimax bucket each depth's natural share is
+        `minimax_prob / num_unlocked_depths`. `current_minimax_weights[d]`
+        scales that share (1.0 = full, ~0.01 = dominated). The probability
+        mass freed by dominated depths shifts to self-play, leaving the
+        random share unchanged.
+        """
         mix = current_opponent_mix or DEFAULT_MIXED_OPPONENT_MIX
         minimax_prob = max(0.0, float(mix.get('minimax', DEFAULT_MIXED_OPPONENT_MIX['minimax'])))
         self_prob = max(0.0, float(mix.get('self', DEFAULT_MIXED_OPPONENT_MIX['self'])))
@@ -373,41 +354,36 @@ def worker_process(
 
         minimax_prob /= total
         self_prob /= total
+        random_prob /= total
+
+        depths = list(range(current_minimax_min_depth, current_minimax_max_depth + 1))
+        if not depths:
+            denom = self_prob + random_prob
+            if denom <= 1e-8 or random.random() < self_prob / denom:
+                return ('self', 0)
+            return ('random', 0)
+
+        depth_weights = [max(0.0, current_minimax_weights.get(d, 1.0)) for d in depths]
+        natural_share = minimax_prob / len(depths)
+        per_depth_share = [w * natural_share for w in depth_weights]
+        effective_minimax = sum(per_depth_share)
+        freed_mass = minimax_prob - effective_minimax  # >= 0
+        effective_self = self_prob + freed_mass
 
         roll = random.random()
-
-        if roll < minimax_prob:
-            # Random depth selection (no progressive rounds)
-            depth = random.randint(current_minimax_min_depth, current_minimax_max_depth)
+        if roll < effective_minimax and effective_minimax > 1e-12:
+            depth = random.choices(depths, weights=per_depth_share)[0]
             return ('minimax', depth)
-        elif roll < minimax_prob + self_prob:
+        if roll < effective_minimax + effective_self:
             return ('self', 0)
-        else:
-            return ('random', 0)
+        return ('random', 0)
 
     def setup_new_game(env: EnvState):
         """Set up a new game with current curriculum settings."""
         nonlocal game
 
         env.game = game
-        env.reset()
-
-        # Determine number of random moves to prepare the board
-        num_random = current_random_moves
-        if num_random < 0:
-            # Random between 0 and 150 (used by Phase 1 and Phase 10)
-            num_random = random.randint(0, 150)
-
-        # Play random moves to prepare the board (not recorded in training)
-        if num_random > 0 and not env.state.is_terminal():
-            play_random_moves(env.state, num_random)
-
-        # If the random moves resulted in terminal state, reset and try again
-        if env.state.is_terminal():
-            env.reset()
-            # Try with fewer random moves
-            if num_random > 50:
-                play_random_moves(env.state, num_random // 2)
+        env.reset(starting_stones=sample_starting_stones())
 
         if current_opponent_type == 'mixed':
             opp_type, depth = select_mixed_opponent()
@@ -421,8 +397,10 @@ def worker_process(
     for env in envs:
         setup_new_game(env)
 
-    # Thread pool for async minimax (2 threads — minimax is CPU-heavy)
-    minimax_executor = ThreadPoolExecutor(max_workers=12)
+    # Thread pool for async minimax. Sized via Config: too many threads
+    # across all workers saturates the box and starves the display server.
+    minimax_thread_count = max(1, int(getattr(config, "minimax_threads_per_worker", 2)))
+    minimax_executor = ThreadPoolExecutor(max_workers=minimax_thread_count)
 
     def apply_opponent_action(env: EnvState, player: int, action: int):
         """Apply an opponent action and track shaping penalties."""
@@ -534,9 +512,9 @@ def worker_process(
                 continue
 
             if msg['type'] == 'update_game_settings':
-                new_random_moves = msg.get('random_moves', current_random_moves)
-                if new_random_moves != current_random_moves:
-                    current_random_moves = new_random_moves
+                new_starting_stones = msg.get('starting_stones', current_starting_stones)
+                if new_starting_stones != current_starting_stones:
+                    current_starting_stones = new_starting_stones
                     recreate_after_control = True
                 continue
 
@@ -553,6 +531,14 @@ def worker_process(
                 current_minimax_max_depth = msg.get('max_depth', 4)
                 if current_opponent_type == 'mixed':
                     recreate_after_control = True
+                continue
+
+            if msg['type'] == 'update_minimax_weights':
+                raw = msg.get('weights') or {}
+                # Coerce keys/values in case the dict round-tripped through JSON.
+                current_minimax_weights = {
+                    int(k): max(0.0, float(v)) for k, v in raw.items()
+                }
                 continue
 
         if not running:
@@ -590,7 +576,7 @@ def worker_process(
             if env.opponent_type == 'self' and clone_model is not None:
                 is_ai_turn = (current_player == env.ai_player)
                 if is_ai_turn:
-                    obs = np.array(state.observation_tensor(current_player), dtype=np.float32)
+                    obs = state.observation_tensor_numpy(current_player).reshape(-1)
                     mask = get_legal_mask(state, num_actions)
                     inference_requests.append({
                         'env_idx': env_idx,
@@ -603,7 +589,7 @@ def worker_process(
                     action = get_clone_action(state, num_actions, clone_model)
                     apply_opponent_action(env, current_player, action)
             elif env.opponent_type == 'self':
-                obs = np.array(state.observation_tensor(current_player), dtype=np.float32)
+                obs = state.observation_tensor_numpy(current_player).reshape(-1)
                 mask = get_legal_mask(state, num_actions)
                 inference_requests.append({
                     'env_idx': env_idx,
@@ -613,7 +599,7 @@ def worker_process(
                     'is_ai_player': current_player == env.ai_player
                 })
             elif current_player == env.ai_player:
-                obs = np.array(state.observation_tensor(current_player), dtype=np.float32)
+                obs = state.observation_tensor_numpy(current_player).reshape(-1)
                 mask = get_legal_mask(state, num_actions)
                 inference_requests.append({
                     'env_idx': env_idx,
@@ -628,7 +614,7 @@ def worker_process(
                     # Submit minimax to thread pool — don't block
                     state_clone = state.clone()
                     bot = env.minimax_bot
-                    env.pending_minimax = minimax_executor.submit(bot.get_action, state_clone)
+                    env.pending_minimax = minimax_executor.submit(bot.step, state_clone)
                 else:
                     action = get_opponent_action(env, state, num_actions, clone_model)
                     apply_opponent_action(env, current_player, action)

@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+setup.py
+src/fastnmm/__init__.py
+src/fastnmm/bots.py
+src/fastnmm.egg-info/PKG-INFO
+src/fastnmm.egg-info/SOURCES.txt
+src/fastnmm.egg-info/dependency_links.txt
+src/fastnmm.egg-info/requires.txt
+src/fastnmm.egg-info/top_level.txt
+src/fastnmm/_core/bindings.cpp
+src/fastnmm/_core/nine_mens_morris.cpp
+tests/test_basic.py
+tests/test_engine_and_play_until.py
+tests/test_game_flow.py
+tests/test_openspiel_parity.py
+tests/test_training.py

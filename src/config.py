@@ -26,8 +26,51 @@ class Config:
     mini_batch_size: int = 8192
     
     # Parallelism (optimized for Threadripper 3960X + RTX 3090)
-    num_workers: int = 22
+    num_workers: int = 16
     envs_per_worker: int = 48
+
+    # Per-worker async-minimax thread pool.
+    # Total concurrent minimax searches = num_workers * minimax_threads_per_worker.
+    # Keep this product <= (physical_cores - reserved_display_cores) or the
+    # X/VNC server starves and the desktop freezes during training.
+    # Default 2 -> 16*2 = 32 threads, fits a 48-core box leaving 4 for display.
+    minimax_threads_per_worker: int = 2
+
+    # CPU isolation for desktop responsiveness when running in a VNC
+    # or VSCodium container. Workers pin to cores [0, ncpu - reserved)
+    # and run with `worker_nice` niceness. The display server keeps
+    # cores [ncpu - reserved, ncpu) for itself.
+    # Set reserved_display_cores=0 to disable on bare-metal setups.
+    reserved_display_cores: int = 4
+    worker_nice: int = 10  # niceness offset; 0 = same priority as parent
+
+    # Minimax transposition-table size, per (worker, depth) bot.
+    # The natural per-search hit rate in this game is ~16-30% (bounded
+    # by transposition density, not table size) and plateaus past
+    # ~64 MiB. Measured at depth=5 across 200 mid-game states:
+    #   64 MiB: 19.8% hits, 11k collisions / 1.7M nodes (0.7%)
+    #   256 MiB - 2 GiB: 19.9% hits, identical wall-clock.
+    # We default to 128 MiB (safely past the knee, low waste).
+    # Worst-case process budget = num_workers * max_active_depths *
+    # tt_bytes => 22 * 7 * 128 MiB = ~19.7 GiB. Bigger sizes give
+    # essentially zero training speedup, so don't push higher unless
+    # you observe high collision rates.
+    minimax_tt_bytes_per_bot: int = 128 * 1024 * 1024
+
+    # Cross-worker SharedMoveCache (POSIX shm). One segment, attached by
+    # all 22 workers + the trainer. Stores Zobrist key -> last best
+    # action chosen at that position. Used for move-ordering hints at
+    # the search root: if any worker has searched this position before,
+    # the cached move is tried first (alpha-beta benefits when the
+    # first move is the best one).
+    #
+    # 16 bytes/entry. Tradeoff: bigger = more positions remembered, but
+    # /dev/shm must accommodate it (typically 50% of physical RAM by
+    # default; raise via `mount -o remount,size=128G /dev/shm`).
+    #
+    # Set move_cache_bytes <= 0 to disable.
+    move_cache_name: str = "/nmm_shared_move_cache"
+    move_cache_bytes: int = 4 * 1024 * 1024 * 1024  # 4 GiB -> ~256 M entries
     
     # Observation shape from pyspiel (set at runtime, e.g. [5, 7, 7] for nine_mens_morris)
     # Channel 0 = player 0 pieces, Channel 1 = player 1 pieces, rest = game state
@@ -40,7 +83,7 @@ class Config:
     dropout: float = 0.05
     
     # PPO hyperparameters
-    gamma: float = 0.9
+    gamma: float = 0.96
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.12
     max_grad_norm: float = 0.5
@@ -81,16 +124,29 @@ class Config:
     eval_interval: int = 50_000
     eval_games: int = 200
     graduation_check_interval: int = 5_000  # Check graduation/promotion every N episodes
-    
-    # RL Plateau Scheduler - Automatic LR management based on hard opponent win rate
-    # This scheduler prevents premature LR drop when agent beats easy opponents
-    # but hasn't yet learned to beat strong opponents (Minimax-2)
-    scheduler_factor: float = 0.5        # LR multiplier when reducing (0.5 = halve)
-    scheduler_patience: int = 10         # Evaluation steps before reducing (10 * log_interval)
-    scheduler_min_lr: float = 1e-6       # Minimum learning rate
-    scheduler_threshold: float = 0.02    # Minimum improvement to reset patience (2%)
-    scheduler_target_wr: float = 0.95    # Stop training at this win rate vs Minimax-2
-    
+
+    # LR scheduler — warmup + warm-restart cosine, driven by PPO updates.
+    # Peak LR after warmup. Cosine each cycle anneals from this down to lr_min.
+    lr_peak: float = 3e-4
+    lr_min: float = 1e-6
+    # Linear warmup from 0 -> lr_peak over this many episodes from training start.
+    lr_warmup_episodes: int = 5_000_000
+    # Cosine cycle length (in episodes). Once cycle hits lr_min it stays there
+    # until a phase-graduation or clone-replacement reset event.
+    lr_cycle_t_max_episodes: int = 40_000_000
+    # On phase graduation: peak <- peak * lr_phase_reset_factor, fresh cycle.
+    lr_phase_reset_factor: float = 0.7
+    # On clone replacement: lr <- min(lr_peak, current_lr * lr_clone_bump_factor),
+    # fresh cycle from the bumped lr.
+    lr_clone_bump_factor: float = 1.3
+
+    # Phase graduation thresholds (Phase 2-10, mixed opponents).
+    # All conditions must hold simultaneously to graduate.
+    graduation_min_episodes: int = 2_500_000
+    graduation_min_wr_top_depth: float = 0.70
+    graduation_min_samples_per_depth: int = 20
+    graduation_min_clone_generations: int = 5
+
     # Directories
     model_dir: str = "models"
     log_dir: str = "logs"

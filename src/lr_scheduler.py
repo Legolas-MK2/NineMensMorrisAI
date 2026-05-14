@@ -1,454 +1,158 @@
 """
-Nine Men's Morris - RL Plateau Learning Rate Scheduler
+Nine Men's Morris - Warmup + Warm-Restart Cosine LR Scheduler
 
-This module provides a custom learning rate scheduler designed specifically for
-reinforcement learning training in Nine Men's Morris.
+Driven by PPO update steps (not episodes). Behavior:
 
-Key Features:
-- Tracks win rate against the HARDEST opponent (Minimax-2 or older self-play)
-- Reduces LR only when performance plateaus against hard opponents
-- Ignores easy opponents (Random, Minimax-1) for LR decisions
-- Supports curriculum-based opponent sampling linked to LR
-- Automatic training termination when target win rate is reached
+- Warmup: linear 0 -> lr_peak over `warmup_updates`.
+- Cosine: each cycle anneals from `cycle_starting_lr` down to `lr_min` over
+  `cycle_t_max` updates. Once it hits the floor it stays there until a reset.
+- Phase graduation event: phase_peak *= phase_reset_factor; new cycle starts at
+  phase_peak. Successive graduations compound (0.7 * 0.7 * ...).
+- Clone replacement event: raise cycle_starting_lr toward phase_peak (capped),
+  without resetting cycle progress. Cap is phase_peak — not lr_peak — so clones
+  cannot override phase decay. Cycle_step is preserved so frequent clone churn
+  cannot pin LR at the ceiling.
+
+Episode-based config knobs are converted to updates via episodes_per_update.
 """
 
+import math
+from typing import Dict
+
 import torch
-from typing import Dict, Callable, Optional, List, Tuple
-from dataclasses import dataclass, field
-from enum import IntEnum
 
 
-class OpponentType(IntEnum):
-    """Opponent difficulty levels."""
-    RANDOM = 0
-    MINIMAX_1 = 1
-    MINIMAX_2 = 2
-    MINIMAX_3 = 3
-    MINIMAX_4 = 4
-    SELF_PLAY = 5
-    OLD_SELF_PLAY = 6
+class WarmRestartLRScheduler:
+    """Warmup + warm-restart cosine, with phase- and clone-driven resets."""
 
-
-@dataclass
-class OpponentMix:
-    """Opponent sampling distribution."""
-    random: float = 0.0
-    minimax_1: float = 0.0
-    minimax_2: float = 0.0
-    minimax_3: float = 0.0
-    minimax_4: float = 0.0
-    self_play: float = 0.0
-    
-    def normalize(self):
-        """Normalize probabilities to sum to 1.0."""
-        total = sum([
-            self.random, self.minimax_1, self.minimax_2,
-            self.minimax_3, self.minimax_4, self.self_play
-        ])
-        if total > 0:
-            self.random /= total
-            self.minimax_1 /= total
-            self.minimax_2 /= total
-            self.minimax_3 /= total
-            self.minimax_4 /= total
-            self.self_play /= total
-    
-    def to_dict(self) -> Dict[str, float]:
-        """Convert to dictionary for serialization."""
-        return {
-            'random': self.random,
-            'minimax_1': self.minimax_1,
-            'minimax_2': self.minimax_2,
-            'minimax_3': self.minimax_3,
-            'minimax_4': self.minimax_4,
-            'self_play': self.self_play,
-        }
-
-
-class RLPlateauScheduler:
-    """
-    Custom learning rate scheduler for RL training.
-    
-    This scheduler reduces the learning rate when the agent's performance
-    against the HARDEST opponent stops improving. This prevents premature
-    LR reduction when the agent achieves 100% win rate against easy opponents
-    but hasn't yet learned to beat strong opponents.
-    
-    Key differences from standard PyTorch schedulers:
-    1. Uses "Hard Opponent Win Rate" instead of loss or average win rate
-    2. Only reduces LR when improvement falls below threshold
-    3. Supports automatic training termination
-    4. Integrates with curriculum-based opponent sampling
-    
-    Usage:
-        scheduler = RLPlateauScheduler(
-            optimizer,
-            factor=0.5,           # LR multiplier when reducing
-            patience=10,          # Steps before reducing (1000 steps each = 10k)
-            min_lr=1e-6,          # Minimum LR
-            threshold=0.02,       # Minimum improvement to reset patience
-            target_win_rate=0.95  # Stop training when reached
-        )
-        
-        # In training loop (every evaluation step, e.g., every 1000 steps)
-        hard_opponent_wr = get_win_rate_vs_minimax_2()
-        scheduler.step(hard_opponent_wr)
-        
-        if scheduler.should_stop():
-            break
-    """
-    
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
-        factor: float = 0.5,
-        patience: int = 10,
-        min_lr: float = 1e-6,
-        threshold: float = 0.02,
-        target_win_rate: float = 0.95,
-        metric_name: str = "wr_vs_mm_d2",
-        allow_early_stop: bool = False,
+        lr_peak: float,
+        lr_min: float,
+        warmup_updates: int,
+        cycle_t_max_updates: int,
+        phase_reset_factor: float,
+        clone_bump_factor: float,
     ):
-        """
-        Initialize the RL Plateau scheduler.
-        
-        Args:
-            optimizer: PyTorch optimizer (AdamW recommended)
-            factor: Multiplicative factor for LR reduction (default 0.5)
-            patience: Number of evaluation steps without improvement before reducing LR
-            min_lr: Minimum learning rate
-            threshold: Minimum improvement to count as progress (default 2%)
-            target_win_rate: Win rate threshold to stop training (default 95%)
-            metric_name: Name of metric being tracked (for logging)
-            allow_early_stop: If True, scheduler can stop training on target WR or min LR.
-        """
         self.optimizer = optimizer
-        self.factor = factor
-        self.patience = patience
-        self.min_lr = min_lr
-        self.threshold = threshold
-        self.target_win_rate = target_win_rate
-        self.metric_name = metric_name
-        self.allow_early_stop = allow_early_stop
-        
-        # State tracking
-        self.wait = 0
-        self.best_score = -float('inf')
-        self.best_episode = 0
-        self.reductions = 0
-        
-        # History for analysis
-        self.history: List[Dict] = []
-        
-        # Get initial LR
-        self.initial_lrs = [
-            group['lr'] for group in optimizer.param_groups
-        ]
-        self.current_lrs = list(self.initial_lrs)
-        
-        # Stop flag
-        self._should_stop = False
-        self.stop_reason = ""
-    
-    def step(self, metric: float, episode: int = 0) -> bool:
-        """
-        Step the scheduler with a new metric value.
+        self.lr_peak = float(lr_peak)              # original config peak; cap for clone bumps
+        self.lr_min = float(lr_min)
+        self.warmup_updates = max(1, int(warmup_updates))
+        self.cycle_t_max = max(1, int(cycle_t_max_updates))
+        self.phase_reset_factor = float(phase_reset_factor)
+        self.clone_bump_factor = float(clone_bump_factor)
 
-        The scheduler does NOT write to the optimizer directly: the trainer
-        owns LR (cosine base * plateau multiplier). A reduction here simply
-        increments `reductions`, which changes what `get_plateau_multiplier`
-        returns. The trainer's `_update_learning_rate` picks this up on its
-        next call and applies it on top of the cosine base.
+        # Dynamic state
+        self.phase_peak = self.lr_peak             # shrinks at each phase graduation
+        self.cycle_starting_lr = self.lr_peak      # peak of current cosine cycle
+        self.global_update = 0                     # total step() calls
+        self.cycle_step = 0                        # updates within current cycle (post-warmup)
+        self.in_warmup = True
+        self.last_reset_event = "none"             # "none" | "phase" | "clone"
 
-        Args:
-            metric: Win rate against the hardest opponent (e.g., Minimax-2)
-            episode: Current episode count (for logging)
+        self._apply(self._compute_lr())
 
-        Returns:
-            True if a plateau reduction was registered this step.
-        """
-        lr_reduced = False
+    # ----- LR computation -----
 
-        # Record history
-        self.history.append({
-            'episode': episode,
-            'metric': metric,
-            'best_score': self.best_score,
-            'wait': self.wait,
-            'current_lr': self.current_lrs[0],
-            'reductions': self.reductions,
-        })
+    def _compute_lr(self) -> float:
+        if self.in_warmup:
+            progress = self.global_update / self.warmup_updates
+            progress = min(1.0, max(0.0, progress))
+            return self.lr_peak * progress
 
-        # Ignore persisted stop flags when scheduler auto-stop is disabled.
-        if not self.allow_early_stop:
-            self._should_stop = False
-            self.stop_reason = ""
-
-        # Optional early-stop behavior. Disabled by default so curriculum phases
-        # drive termination, not LR scheduler state.
-        if self.allow_early_stop:
-            if metric >= self.target_win_rate:
-                self._should_stop = True
-                self.stop_reason = f"Target win rate reached: {metric:.1%} >= {self.target_win_rate:.1%}"
-                print(f"  [Scheduler] {self.stop_reason}")
-                return False
-
-            if self.current_lrs[0] <= self.min_lr:
-                self._should_stop = True
-                self.stop_reason = f"LR reached minimum: {self.current_lrs[0]:.1e} <= {self.min_lr:.1e}"
-                print(f"  [Scheduler] {self.stop_reason}")
-                return False
-
-        # Check for improvement
-        if metric > self.best_score + self.threshold:
-            self.best_score = metric
-            self.best_episode = episode
-            self.wait = 0
-        else:
-            self.wait += 1
-
-            if self.wait >= self.patience:
-                # Register a plateau reduction. Actual LR is applied by the
-                # trainer via get_plateau_multiplier().
-                self.reductions += 1
-                lr_reduced = True
-                mult = self.get_plateau_multiplier()
-                print(
-                    f"  [Scheduler] Plateau reduction #{self.reductions} "
-                    f"(multiplier now {mult:.3f}x, best {self.metric_name}={self.best_score:.1%} "
-                    f"at episode {self.best_episode:,})"
-                )
-                self.wait = 0
-
-        return lr_reduced
-
-    def get_plateau_multiplier(self) -> float:
-        """Multiplicative factor applied by plateau reductions.
-
-        The trainer composes this with the curriculum's cosine base LR:
-            final_lr = max(cosine_lr * plateau_multiplier, min_lr)
-        """
-        return self.factor ** self.reductions
-
-    def notify_current_lr(self, lr: float):
-        """Let the trainer report the effective LR back for logging parity."""
-        self.current_lrs = [lr] * max(1, len(self.current_lrs))
-
-    def reset(self):
-        """Reset scheduler state for a new phase.
-
-        Called on every phase transition so accumulated reductions from
-        previous phases (where WR ceilings were different) don't carry
-        forward and pin the new-phase LR at min_lr from the start.
-        """
-        self.best_score = -float('inf')
-        self.best_episode = 0
-        self.wait = 0
-        self.reductions = 0
-        self._should_stop = False
-        self.stop_reason = ""
-        print(f"  [Scheduler] Reset for new phase (reductions → 0, best_score → -∞)")
-
-    def _update_learning_rate(self, new_lr: float):
-        """Deprecated: kept for backward-compatible state loading paths."""
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = new_lr
-    
-    def should_stop(self) -> bool:
-        """Check if training should stop."""
-        return self._should_stop
-    
-    def get_stop_reason(self) -> str:
-        """Get the reason for stopping."""
-        return self.stop_reason
-    
-    def get_best_score(self) -> float:
-        """Get the best metric score achieved."""
-        return self.best_score
-    
-    def get_current_lr(self) -> float:
-        """Get the current learning rate."""
-        return self.current_lrs[0]
-    
-    def get_state_dict(self) -> Dict:
-        """Get scheduler state for checkpointing."""
-        return {
-            'best_score': self.best_score,
-            'best_episode': self.best_episode,
-            'wait': self.wait,
-            'current_lrs': self.current_lrs,
-            'reductions': self.reductions,
-            'should_stop': self._should_stop,
-            'stop_reason': self.stop_reason,
-            'history': self.history[-100:],  # Keep last 100 entries
-        }
-    
-    def load_state_dict(self, state: Dict):
-        """Load scheduler state from checkpoint."""
-        self.best_score = state['best_score']
-        self.best_episode = state['best_episode']
-        self.wait = state['wait']
-        self.current_lrs = state['current_lrs']
-        self.reductions = state['reductions']
-        if self.allow_early_stop:
-            self._should_stop = state['should_stop']
-            self.stop_reason = state['stop_reason']
-        else:
-            self._should_stop = False
-            self.stop_reason = ""
-        self.history = state.get('history', [])
-
-
-class CurriculumLRScheduler:
-    """
-    Learning rate scheduler linked with curriculum-based opponent sampling.
-    
-    This scheduler automatically adjusts both the learning rate and opponent
-    mixture based on training progress. It implements the following curriculum:
-    
-    - Early Training: High LR, easy opponents (learn basic rules)
-    - Mid Training: Medium LR, mixed opponents (learn strategy)
-    - Late Training: Low LR, hard opponents (refine perfection)
-    
-    Usage:
-        scheduler = CurriculumLRScheduler(
-            optimizer,
-            curriculum_stages={
-                'early': {'end_step': 10000, 'lr': 3e-4, 'mix': OpponentMix(random=0.5, minimax_1=0.5)},
-                'mid': {'end_step': 50000, 'lr': 1e-4, 'mix': OpponentMix(minimax_2=0.5, self_play=0.5)},
-                'late': {'end_step': float('inf'), 'lr': 3e-5, 'mix': OpponentMix(self_play=1.0)},
-            }
+        progress = self.cycle_step / self.cycle_t_max
+        progress = min(1.0, max(0.0, progress))
+        return self.lr_min + 0.5 * (self.cycle_starting_lr - self.lr_min) * (
+            1.0 + math.cos(math.pi * progress)
         )
-    """
-    
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        curriculum_stages: Optional[Dict] = None,
-        base_scheduler: Optional[RLPlateauScheduler] = None
-    ):
+
+    def _apply(self, lr: float):
+        for group in self.optimizer.param_groups:
+            group['lr'] = lr
+
+    # ----- Public API -----
+
+    def step(self) -> float:
+        """Advance one PPO update. Returns the new LR."""
+        self.global_update += 1
+        if self.in_warmup:
+            if self.global_update >= self.warmup_updates:
+                self.in_warmup = False
+                self.cycle_step = 0
+                self.cycle_starting_lr = self.phase_peak
+        else:
+            self.cycle_step += 1
+        lr = self._compute_lr()
+        self._apply(lr)
+        return lr
+
+    def notify_phase_graduated(self):
+        """Shrink peak by phase_reset_factor and start a fresh cosine cycle."""
+        self.phase_peak = max(self.lr_min, self.phase_peak * self.phase_reset_factor)
+        self.cycle_starting_lr = self.phase_peak
+        self.cycle_step = 0
+        self.in_warmup = False
+        self.last_reset_event = "phase"
+        self._apply(self._compute_lr())
+
+    def notify_clone_replaced(self):
+        """Raise cycle ceiling toward phase_peak; cycle progress is preserved.
+
+        Clone events fire far more often than the cosine cycle can anneal
+        (every few updates in some phases vs cycle_t_max in the thousands), so
+        resetting cycle_step here would pin LR at the ceiling forever. Instead
+        we only raise cycle_starting_lr when the bump target exceeds it, and
+        cap at phase_peak so clones cannot override phase decay.
         """
-        Initialize curriculum LR scheduler.
-        
-        Args:
-            optimizer: PyTorch optimizer
-            curriculum_stages: Dict defining curriculum stages
-            base_scheduler: Optional RLPlateauScheduler for fine-tuning within stages
-        """
-        self.optimizer = optimizer
-        self.base_scheduler = base_scheduler
-        
-        # Default curriculum stages
-        self.curriculum_stages = curriculum_stages or self._default_curriculum()
-        self.current_stage = 0
-        self.current_mix = OpponentMix()
-        
-        # Initialize with first stage
-        self._apply_stage(0)
-    
-    def _default_curriculum(self) -> Dict:
-        """Default curriculum configuration."""
-        return {
-            0: {
-                'name': 'early',
-                'end_step': 10000,
-                'lr': 3e-4,
-                'mix': OpponentMix(random=0.5, minimax_1=0.5),
-            },
-            1: {
-                'name': 'mid',
-                'end_step': 50000,
-                'lr': 1e-4,
-                'mix': OpponentMix(minimax_2=0.5, self_play=0.5),
-            },
-            2: {
-                'name': 'late',
-                'end_step': float('inf'),
-                'lr': 3e-5,
-                'mix': OpponentMix(self_play=1.0),
-            },
-        }
-    
-    def _apply_stage(self, stage: int):
-        """Apply a curriculum stage."""
-        if stage not in self.curriculum_stages:
+        if self.in_warmup:
             return
-        
-        stage_config = self.curriculum_stages[stage]
-        new_lr = stage_config['lr']
-        new_mix = stage_config['mix']
-        
-        # Update learning rate
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = new_lr
-        
-        # Update opponent mix
-        self.current_mix = new_mix
-        self.current_mix.normalize()
-        
-        self.current_stage = stage
-        
-        print(
-            f"  [CurriculumLR] Stage: {stage_config['name']}, "
-            f"LR: {new_lr:.1e}, Mix: {self.current_mix.to_dict()}"
-        )
-    
-    def step(self, step: int, metric: Optional[float] = None) -> OpponentMix:
-        """
-        Step the scheduler.
-        
-        Args:
-            step: Current training step
-            metric: Optional metric for base scheduler
-        
-        Returns:
-            Current opponent mix
-        """
-        # Check if we should advance to next stage
-        if self.current_stage + 1 in self.curriculum_stages:
-            next_stage = self.curriculum_stages[self.current_stage + 1]
-            if step >= next_stage['end_step']:
-                self._apply_stage(self.current_stage + 1)
-        
-        # Use base scheduler if provided
-        if self.base_scheduler and metric is not None:
-            self.base_scheduler.step(metric)
-        
-        return self.current_mix
-    
-    def get_opponent_mix(self) -> OpponentMix:
-        """Get current opponent mix."""
-        return self.current_mix
-    
-    def get_current_lr(self) -> float:
-        """Get current learning rate."""
+        current_lr = self.get_lr()
+        target = min(self.phase_peak, current_lr * self.clone_bump_factor)
+        if target > self.cycle_starting_lr:
+            self.cycle_starting_lr = target
+        self.last_reset_event = "clone"
+        self._apply(self._compute_lr())
+
+    def get_lr(self) -> float:
         return self.optimizer.param_groups[0]['lr']
-    
-    def should_stop(self) -> bool:
-        """Check if training should stop."""
-        if self.base_scheduler:
-            return self.base_scheduler.should_stop()
-        return False
 
+    # Aliases preserved for callers expecting the old CosineLRScheduler API.
+    def get_current_lr(self) -> float:
+        return self.get_lr()
 
-def get_curriculum_mix_and_lr(step: int) -> Tuple[Dict[str, float], float]:
-    """
-    Get opponent mix and learning rate based on training step.
-    
-    This is a convenience function for simple curriculum-based training.
-    
-    Args:
-        step: Current training step
-    
-    Returns:
-        Tuple of (opponent_mix_dict, learning_rate)
-    """
-    if step < 10000:
-        # Early: Learn basic rules against easy opponents
-        return {'random': 0.5, 'minimax1': 0.5}, 3e-4
-    elif step < 50000:
-        # Mid: Learn strategy against mixed opponents
-        return {'minimax2': 0.5, 'self': 0.5}, 1e-4
-    else:
-        # Late: Refine against self-play
-        return {'self': 1.0}, 3e-5
+    # ----- Checkpointing -----
+
+    def state_dict(self) -> Dict:
+        return {
+            'lr_peak': self.lr_peak,
+            'lr_min': self.lr_min,
+            'warmup_updates': self.warmup_updates,
+            'cycle_t_max': self.cycle_t_max,
+            'phase_reset_factor': self.phase_reset_factor,
+            'clone_bump_factor': self.clone_bump_factor,
+            'phase_peak': self.phase_peak,
+            'cycle_starting_lr': self.cycle_starting_lr,
+            'global_update': self.global_update,
+            'cycle_step': self.cycle_step,
+            'in_warmup': self.in_warmup,
+            'last_reset_event': self.last_reset_event,
+        }
+
+    def get_state_dict(self) -> Dict:
+        return self.state_dict()
+
+    def load_state_dict(self, state: Dict):
+        self.lr_peak = float(state.get('lr_peak', self.lr_peak))
+        self.lr_min = float(state.get('lr_min', self.lr_min))
+        self.warmup_updates = int(state.get('warmup_updates', self.warmup_updates))
+        self.cycle_t_max = int(state.get('cycle_t_max', self.cycle_t_max))
+        self.phase_reset_factor = float(state.get('phase_reset_factor', self.phase_reset_factor))
+        self.clone_bump_factor = float(state.get('clone_bump_factor', self.clone_bump_factor))
+        self.phase_peak = float(state.get('phase_peak', self.lr_peak))
+        self.cycle_starting_lr = float(state.get('cycle_starting_lr', self.phase_peak))
+        self.global_update = int(state.get('global_update', 0))
+        self.cycle_step = int(state.get('cycle_step', 0))
+        self.in_warmup = bool(state.get('in_warmup', True))
+        self.last_reset_event = str(state.get('last_reset_event', 'none'))
+        self._apply(self._compute_lr())

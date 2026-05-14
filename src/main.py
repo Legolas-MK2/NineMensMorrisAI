@@ -14,21 +14,18 @@ import multiprocessing as mp
 
 import torch
 
-# Import pyspiel with bug fix wrapper
-from game_wrapper import load_game as load_game_fixed
-import pyspiel
-
+import fastnmm
 from config import Config
 from model import ActorCritic
 from trainer import PPOTrainer
 from minimax import MinimaxBot, evaluate_vs_minimax
-from utils import get_legal_mask, prepare_game_state
+from utils import get_legal_mask
 from curriculum import CurriculumManager, Phase, PHASE_CONFIGS
 
 
 def get_game():
-    """Get game instance using pyspiel with position 0 bug fix."""
-    return load_game_fixed("nine_mens_morris")
+    """Get game instance using the fastnmm C++ engine."""
+    return fastnmm.load_game("nine_mens_morris")
 
 
 def play_interactive(config: Config = None):
@@ -88,11 +85,11 @@ def play_interactive(config: Config = None):
     if mode == "3":
         # Progressive minimax test
         print("\nTesting AI against Minimax depths 1-6...")
-        random_moves = int(input("Number of random moves to prepare board (0-150): ") or "75")
+        stones = int(input("Starting stones per player (1-9, -1=random 3-9): ") or "9")
         max_beaten, results = evaluate_vs_minimax(
             model, device, game.num_distinct_actions(),
             max_depth=6, games_per_depth=20, max_steps=200,
-            random_moves=random_moves
+            starting_stones=stones
         )
 
         print(f"\n{'=' * 50}")
@@ -108,22 +105,20 @@ def play_interactive(config: Config = None):
         try:
             depth = int(input("Minimax depth (1-6): "))
             ai_player = int(input("AI plays as (0/1): "))
-            random_moves = int(input("Random moves to prepare board (0-150): ") or "75")
+            stones = int(input("Starting stones per player (1-9): ") or "9")
         except ValueError:
             print("Invalid input")
             return
 
         bot = MinimaxBot(max_depth=depth)
-        state = game.new_initial_state()
-
-        # Prepare board with random moves
-        prepare_game_state(state, random_moves)
+        stones = max(1, min(9, stones))
+        state = game.new_initial_state(starting_stones=(stones, stones))
 
         move_num = 0
 
         print(f"\n{'=' * 50}")
         print(f"AI (Player {ai_player}) vs Minimax Depth {depth}")
-        print(f"Board prepared with {random_moves} random moves")
+        print(f"Each player starts with {stones} stones")
         print(f"{'=' * 50}")
         
         while not state.is_terminal():
@@ -133,24 +128,22 @@ def play_interactive(config: Config = None):
             current = state.current_player()
             
             if current == ai_player:
-                obs = torch.tensor(
-                    state.observation_tensor(current),
-                    dtype=torch.float32, device=device
-                ).unsqueeze(0)
+                obs_arr = state.observation_tensor_numpy(current).reshape(-1)
+                obs = torch.from_numpy(obs_arr).to(device).unsqueeze(0)
                 mask = torch.tensor(
                     get_legal_mask(state, game.num_distinct_actions()),
                     dtype=torch.float32, device=device
                 ).unsqueeze(0)
-                
+
                 with torch.no_grad():
                     logits, v = model(obs)
                     masked = logits.float()
                     masked[mask == 0] = -1e9
                     a = masked.argmax().item()
-                
+
                 print(f"AI plays: {a} (V={v.item():.2f})")
             else:
-                a = bot.get_action(state)
+                a = bot.step(state)
                 print(f"Minimax (depth {depth}) plays: {a}")
             
             state.apply_action(a)
@@ -171,19 +164,17 @@ def play_interactive(config: Config = None):
     # Mode 1: Human vs AI
     try:
         human = int(input("Play as (0/1): "))
-        random_moves = int(input("Random moves to prepare board (0-150): ") or "75")
+        stones = int(input("Starting stones per player (1-9): ") or "9")
     except ValueError:
         human = 0
-        random_moves = 75
+        stones = 9
 
-    state = game.new_initial_state()
-
-    # Prepare board with random moves
-    prepare_game_state(state, random_moves)
+    stones = max(1, min(9, stones))
+    state = game.new_initial_state(starting_stones=(stones, stones))
 
     print(f"\n{'=' * 50}")
     print(f"You are Player {human}")
-    print(f"Board prepared with {random_moves} random moves")
+    print(f"Each player starts with {stones} stones")
     print(f"{'=' * 50}")
     
     while not state.is_terminal():
@@ -202,10 +193,8 @@ def play_interactive(config: Config = None):
                 print("Invalid input!")
                 continue
         else:
-            obs = torch.tensor(
-                state.observation_tensor(state.current_player()),
-                dtype=torch.float32, device=device
-            ).unsqueeze(0)
+            obs_arr = state.observation_tensor_numpy(state.current_player()).reshape(-1)
+            obs = torch.from_numpy(obs_arr).to(device).unsqueeze(0)
             mask = torch.tensor(
                 get_legal_mask(state, game.num_distinct_actions()),
                 dtype=torch.float32, device=device
@@ -236,24 +225,22 @@ def show_curriculum_info():
     print("\n" + "=" * 70)
     print("CURRICULUM TRAINING PHASES")
     print("=" * 70)
-    print("\nNote: pyspiel Nine Men's Morris starts with full game.")
-    print("Random moves are used to prepare board positions for training.\n")
+    print("\nBoards are seeded via fastnmm's `starting_stones` engine option;")
+    print("no random moves are played to prepare positions.\n")
 
-    # Random moves per phase
-    random_moves_info = {
-        1: "150", 2: "150",
-        3: "~129", 4: "~107", 5: "~86", 6: "~64", 7: "~43", 8: "~21",
-        9: "0",
-        10: "0-150 (random)"
+    starting_stones_info = {
+        1: "random 3-9 (per game)",
+        2: "3", 3: "4", 4: "5", 5: "6", 6: "7", 7: "8", 8: "9",
+        9: "9",
+        10: "random 3-9 (per game)",
     }
 
     for phase, cfg in PHASE_CONFIGS.items():
         phase_num = int(phase)
         print(f"\nPhase {phase_num}: {cfg.description}")
         print("-" * 50)
-        print(f"  Random Prep:     {random_moves_info.get(phase_num, 'N/A')} moves")
+        print(f"  Starting stones: {starting_stones_info.get(phase_num, 'N/A')} per player")
         print(f"  Opponent:        {cfg.opponent_type}")
-        print(f"  Learning Rate:   {cfg.lr_start:.0e} → {cfg.lr_end:.0e}")
         print(f"  Shaping Mult:    {cfg.shaping_multiplier:.1f}x")
         print(f"  Win Threshold:   {cfg.win_rate_threshold:.0%}")
         print(f"  Min Games:       {cfg.min_games_for_graduation}")
@@ -389,15 +376,16 @@ if __name__ == "__main__":
         print("Nine Men's Morris - Curriculum PPO Training (pyspiel)")
         print("=" * 70)
         print()
-        print("This training system uses a 10-phase curriculum with random board prep:")
+        print("This training system uses a 10-phase curriculum with engine-seeded stones:")
         print()
-        print("  Phase 1-2:  150 random moves prep, vs RANDOM (warmup)")
-        print("  Phase 3-8:  Linear decrease (129->21 moves), mixed opponents")
-        print("  Phase 9:    No prep moves, full game, mixed opponents")
-        print("  Phase 10:   0-150 random prep, final phase with D1-D6 minimax")
+        print("  Phase 1:    Random 3-9 stones per game, vs RANDOM (warmup)")
+        print("  Phase 2:    3 stones per player, mixed opponents")
+        print("  Phase 3-8:  4..9 stones per player, mixed opponents")
+        print("  Phase 9:    9 stones, full game, mixed opponents")
+        print("  Phase 10:   Random 3-9 stones per game, D1-D6 minimax")
         print()
-        print("Random moves prepare diverse board positions without custom engine.")
-        print("Training starts after board prep - prep moves aren't learned.")
+        print("Starting stones are configured via fastnmm's `starting_stones` option")
+        print("instead of preparing positions with random moves.")
         print()
         print("Usage:")
         print("  python main.py train [options]    # Start training")

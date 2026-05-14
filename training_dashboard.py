@@ -59,7 +59,7 @@ def summarise(rows):
     for r in rows:
         p = r.get("phase")
         if p != prev_phase:
-            phase_transitions.append({"phase": p, "episode": r.get("episode"), "random_moves": r.get("random_moves")})
+            phase_transitions.append({"phase": p, "episode": r.get("episode"), "starting_stones": r.get("starting_stones")})
             prev_phase = p
 
     # Find milestones where minimax depth was first beaten
@@ -96,12 +96,13 @@ def summarise(rows):
         "last_episode": last.get("episode"),
         "total_steps": last.get("steps"),
         "current_phase": last.get("phase"),
-        "current_random_moves": last.get("random_moves"),
+        "current_starting_stones": last.get("starting_stones"),
         "current_wr": last.get("win_rate"),
         "current_dr": last.get("draw_rate"),
         "current_ema": last.get("ema_return"),
         "current_avg_return": last.get("avg_return"),
         "current_lr": last.get("lr"),
+        "current_eps_per_sec": last.get("eps_per_sec"),
         "minimax_depth_beaten": last.get("minimax_depth_beaten"),
         "clone_gen": last.get("clone_gen"),
         "active_mm_depth": last.get("active_mm_max_depth"),
@@ -754,6 +755,10 @@ function render(d) {
         <h2>Clone Gen &amp; MM Depth Beaten</h2>
         <div class="chart-wrap"><canvas id="chartProgress"></canvas></div>
       </div>
+      <div class="chart-panel">
+        <h2>Training Speed (episodes / sec)</h2>
+        <div class="chart-wrap"><canvas id="chartSpeed"></canvas></div>
+      </div>
     </div>
   `;
   document.getElementById('content').innerHTML = html;
@@ -826,6 +831,11 @@ function render(d) {
     { label: 'MM Depth Beaten',  data: rows.map(r => r.minimax_depth_beaten),  color: '#4f8ef7' },
     { label: 'Active MM Depth',  data: rows.map(r => r.active_mm_max_depth),   color: '#ffb74d' },
   ], 'Level', null, null, cloneGenAnnotations);
+
+  // Training throughput
+  makeLineChart('chartSpeed', labels, [
+    { label: 'Episodes / sec', data: rows.map(r => r.eps_per_sec), color: '#26c6da', fill: true },
+  ], 'eps/s', 0, null, cloneGenAnnotations);
 }
 
 function renderCards(s) {
@@ -836,7 +846,7 @@ function renderCards(s) {
     <div class="card accent">
       <div class="label">Current Phase</div>
       <div class="value phase-${s.current_phase}">${s.current_phase}</div>
-      <div class="sub">${s.current_random_moves} random moves</div>
+      <div class="sub">${s.current_starting_stones < 0 ? 'random 3-9' : s.current_starting_stones} stones/player</div>
     </div>
     <div class="card green">
       <div class="label">Win Rate</div>
@@ -883,6 +893,11 @@ function renderCards(s) {
       <div class="value" style="font-size:1.1em">${s.current_lr != null ? s.current_lr.toExponential(1) : '—'}</div>
       <div class="sub">current LR</div>
     </div>
+    <div class="card accent">
+      <div class="label">Speed</div>
+      <div class="value">${s.current_eps_per_sec != null ? s.current_eps_per_sec.toFixed(0) : '—'}</div>
+      <div class="sub">episodes / sec</div>
+    </div>
     <div class="card">
       <div class="label">Checkpoints</div>
       <div class="value">${fmt(s.total_rows)}</div>
@@ -922,7 +937,7 @@ function renderTimeline(s) {
     <div class="tl-item">
       <div class="tl-phase phase-${t.phase}">${phaseNames[t.phase] || 'Phase ' + t.phase}</div>
       <div class="tl-detail">Started: ep ${fmtEp(t.episode)}</div>
-      <div class="tl-detail">${t.random_moves} random moves</div>
+      <div class="tl-detail">${t.starting_stones < 0 ? 'random 3-9' : t.starting_stones} stones/player</div>
     </div>`).join('');
   return `<div class="timeline-section"><h2>Curriculum Phase Transitions</h2><div class="timeline">${items}</div></div>`;
 }
@@ -1067,6 +1082,3 @@ if __name__ == '__main__':
     print("=" * 60)
 
     app.run(host='0.0.0.0', port=7860, debug=False)
-
-
-#AXSIWOkDrzSgENojGzLywCqRL14OoHRITzGqBAqyL5MhVVY8#whAa2xh4tpNpLyBwFEYDpifW0skCtrCMUe6A6VWt9XU
