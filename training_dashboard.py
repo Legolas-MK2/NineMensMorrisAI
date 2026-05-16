@@ -174,7 +174,7 @@ def api_log_data():
 
 if __name__ == '__main__':
     host = os.environ.get('NMM_DASHBOARD_HOST', '0.0.0.0')
-    port = int(os.environ.get('NMM_DASHBOARD_PORT', '7861'))
+    port = int(os.environ.get('NMM_DASHBOARD_PORT', '7860'))
     import socket
     hostname = socket.gethostname()
     try:
