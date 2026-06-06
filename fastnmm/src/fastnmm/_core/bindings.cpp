@@ -234,68 +234,6 @@ PYBIND11_MODULE(_core, m) {
           "yield identical keys; any change in board, unplaced counts, "
           "side-to-move, capture phase, or turn flips it.");
 
-    // ----- SharedMoveCache (POSIX shm, lock-free) -----
-    py::class_<SharedMoveCache>(m, "SharedMoveCache",
-        "Lock-free best-move cache shared across processes via POSIX "
-        "shared memory. Maps Zobrist key -> last best action chosen at "
-        "that position. Used by MinimaxEngine for cross-worker move-"
-        "ordering hints.")
-        .def(py::init<const std::string&, std::size_t, bool>(),
-             py::arg("name"),
-             py::arg("total_bytes"),
-             py::arg("create"),
-             "Create or attach a POSIX shm segment named `name` (must "
-             "start with '/'). On create, `total_bytes` is rounded down "
-             "to a power-of-two count of 16-byte entries. On attach, "
-             "the existing size is discovered automatically.")
-        .def_static("create",
-            [](const std::string& name, std::size_t total_bytes) {
-                return new SharedMoveCache(name, total_bytes, true);
-            },
-            py::arg("name"), py::arg("total_bytes"),
-            "Create a new shared cache. Call once from the trainer.")
-        .def_static("attach",
-            [](const std::string& name) {
-                return new SharedMoveCache(name, 0, false);
-            },
-            py::arg("name"),
-            "Attach to an existing shared cache. Call once per worker.")
-        .def("get",
-             [](const SharedMoveCache& c, uint64_t key) { return c.Get(key); },
-             py::arg("key"),
-             "Return the cached action for `key`, or -1 on miss.")
-        .def("put",
-             [](SharedMoveCache& c, uint64_t key, int action) {
-                 c.Put(key, action);
-             },
-             py::arg("key"), py::arg("action"),
-             "Store `action` at `key`. No-op if key == 0 or the bucket "
-             "is locally dense.")
-        .def("close",  &SharedMoveCache::Close,
-             "Detach from the shared segment (call in every process).")
-        .def("unlink", &SharedMoveCache::Unlink,
-             "Destroy the segment (creator-only; call once at shutdown).")
-        .def_property_readonly("name",          &SharedMoveCache::Name)
-        .def_property_readonly("num_entries",   &SharedMoveCache::NumEntries)
-        .def_property_readonly("bytes",         &SharedMoveCache::Bytes)
-        .def_property_readonly("probes",        &SharedMoveCache::Probes)
-        .def_property_readonly("hits",          &SharedMoveCache::Hits)
-        .def_property_readonly("stores",        &SharedMoveCache::Stores)
-        .def_property_readonly("store_misses",  &SharedMoveCache::StoreMisses)
-        .def_property_readonly("is_creator",    &SharedMoveCache::IsCreator)
-        .def("__repr__", [](const SharedMoveCache& c) {
-            std::ostringstream os;
-            os << "<SharedMoveCache name='" << c.Name()
-               << "' entries=" << c.NumEntries()
-               << " bytes=" << c.Bytes()
-               << " probes=" << c.Probes()
-               << " hits=" << c.Hits()
-               << " hit_rate=" << (c.Probes() == 0 ? 0.0
-                                    : double(c.Hits()) / double(c.Probes()))
-               << ">";
-            return os.str();
-        });
-
     // ----- MinimaxEngine -----
     py::class_<MinimaxEngine>(m, "MinimaxEngine",
         "Persistent transposition-table-backed alpha-beta engine. "
@@ -312,21 +250,6 @@ PYBIND11_MODULE(_core, m) {
              "training; larger sizes only help by reducing collisions, "
              "not by raising the natural transposition hit rate.")
         .def_property_readonly("strict_parity", &MinimaxEngine::StrictParity)
-        .def("set_root_cache",
-             [](MinimaxEngine& e, py::object cache_obj) {
-                 if (cache_obj.is_none()) {
-                     e.SetRootCache(nullptr);
-                 } else {
-                     e.SetRootCache(cache_obj.cast<SharedMoveCache*>());
-                 }
-             },
-             py::arg("cache").none(true),
-             "Attach a SharedMoveCache to be consulted at the search "
-             "root for move-ordering hints and updated with the chosen "
-             "root action after each search. Pass None to detach. The "
-             "engine does NOT own the cache; the caller must keep it "
-             "alive for the engine's lifetime.",
-             py::keep_alive<1, 2>())
         .def("search",
              [](MinimaxEngine& eng, const State& s, int depth) {
                  SearchResult r;

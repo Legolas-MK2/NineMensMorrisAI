@@ -10,7 +10,7 @@ Public surface for the rest of the codebase:
 from __future__ import annotations
 
 import random
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.amp import autocast
@@ -57,18 +57,23 @@ def evaluate_vs_minimax(
     unlimited: bool = True,
     config=None,
     starting_stones: int = 9,
+    stone_distribution: Optional[List[Tuple[int, float]]] = None,
 ) -> Tuple[int, Dict]:
     """Play the model against progressively harder fastnmm minimax bots.
 
-    `starting_stones` is the per-player stone count to seed each game with;
-    pass -1 to randomize each player's count in [3, 9] per game.
+    If `stone_distribution` is provided, each player's stone count is sampled
+    independently from it. Otherwise `starting_stones` is used as a fixed
+    per-player count (pass -1 to randomize uniformly in [3, 9]).
     """
     # Local import to avoid a circular dependency at module load time.
-    from utils import get_legal_mask
+    from utils import get_legal_mask, relativize_obs
 
     game = fastnmm.load_game("nine_mens_morris")
     results: Dict[int, Dict] = {}
     max_depth_beaten = 0
+
+    dist_counts = [c for c, _ in stone_distribution] if stone_distribution else None
+    dist_weights = [w for _, w in stone_distribution] if stone_distribution else None
 
     model.eval()
     depth = 1
@@ -82,7 +87,11 @@ def evaluate_vs_minimax(
 
         with torch.no_grad():
             for game_idx in range(games_per_depth):
-                if starting_stones is None or starting_stones < 0:
+                if dist_counts is not None:
+                    a = random.choices(dist_counts, weights=dist_weights)[0]
+                    b = random.choices(dist_counts, weights=dist_weights)[0]
+                    stones = (a, b)
+                elif starting_stones is None or starting_stones < 0:
                     stones = (random.randint(3, 9), random.randint(3, 9))
                 else:
                     s = max(1, min(9, int(starting_stones)))
@@ -97,9 +106,7 @@ def evaluate_vs_minimax(
                 while not state.is_terminal() and steps < max_steps:
                     current = state.current_player()
                     if current == ai_player:
-                        # Use the (5,7,7) numpy tensor and flatten — matches
-                        # the model's expected obs_size of 245.
-                        obs_arr = state.observation_tensor_numpy(current).reshape(-1)
+                        obs_arr = relativize_obs(state, current)
                         obs = torch.from_numpy(obs_arr).to(device).unsqueeze(0)
                         mask = torch.tensor(
                             get_legal_mask(state, num_actions),

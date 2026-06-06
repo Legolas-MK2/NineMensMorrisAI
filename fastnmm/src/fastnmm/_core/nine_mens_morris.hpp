@@ -10,7 +10,6 @@
 #pragma once
 
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -166,8 +165,6 @@ SearchResult MinimaxSearch(const State& s, int depth);
 // Static evaluation heuristic (from perspective of `s.CurrentPlayer()`).
 int Evaluate(const State& s);
 
-class SharedMoveCache;  // forward decl; full definition below.
-
 // =========================================================================
 // MinimaxEngine: persistent transposition-table-backed alpha-beta.
 //
@@ -218,13 +215,6 @@ public:
     int          Eval(const State& s) const;
     bool         StrictParity() const { return strict_; }
 
-    // Optional shared-memory best-move cache, consulted at the search
-    // root for move-ordering and updated with the chosen root action
-    // after the search completes. Engine does NOT take ownership; the
-    // pointer must outlive the engine. Pass nullptr to detach.
-    void SetRootCache(SharedMoveCache* cache) { root_cache_ = cache; }
-    SharedMoveCache* RootCache() const { return root_cache_; }
-
     // Bump generation -- old entries become eligible for replacement.
     void NewGame();
     // Wipe the TT, reset stats.
@@ -272,7 +262,6 @@ private:
     uint64_t         mask_        = 0;
     uint8_t          generation_  = 0;
     bool             strict_      = false;
-    SharedMoveCache* root_cache_  = nullptr;  // non-owning
 
     mutable std::size_t probes_      = 0;
     mutable std::size_t hits_        = 0;
@@ -319,86 +308,6 @@ std::vector<int> PlayUntilPlayer(State& state,
 // Compute the Zobrist key of a state. Exposed for testing / external
 // caches; the engine maintains its own (recomputes on probe).
 uint64_t ZobristKey(const State& s);
-
-// =========================================================================
-// SharedMoveCache: lock-free, cross-process best-move cache.
-//
-// Maps Zobrist position key -> last best-move chosen at that position by
-// any worker that ever searched it. Backed by POSIX shared memory so all
-// 22 training workers can read/write a single table.
-//
-// Layout: open-addressing linear probing, 16-byte aligned entries:
-//   { atomic<uint64_t> key; atomic<int32_t> action; uint32_t pad; }
-// Empty slot = key == 0. (Zobrist key 0 is rejected to keep this sentinel
-// unambiguous; collision probability is 2^-64, negligible.)
-//
-// Concurrency: the action-before-key write order means a torn reader who
-// observes a fresh action with a stale key gets a key mismatch and falls
-// through. Wrong cached actions are validated against legal_actions() by
-// the consumer (engine), so even a benign race can't corrupt search.
-//
-// Sizing: 16 B/entry. 1 GiB -> ~64 M entries; 16 GiB -> ~1 G entries.
-// =========================================================================
-class SharedMoveCache {
-public:
-    static constexpr int kNoMove   = -1;
-    static constexpr int kProbeMax = 16;
-    static constexpr std::size_t kBytesPerEntry = 16;
-
-    // Create or attach. `name` must start with '/' (POSIX shm_open
-    // convention). `total_bytes` is honoured only on create; attachers
-    // discover the actual size from the existing segment.
-    SharedMoveCache(const std::string& name,
-                    std::size_t total_bytes,
-                    bool create);
-    ~SharedMoveCache();
-
-    SharedMoveCache(const SharedMoveCache&)            = delete;
-    SharedMoveCache& operator=(const SharedMoveCache&) = delete;
-
-    // Returns the cached action, or kNoMove on miss.
-    int  Get(uint64_t key) const;
-    // Stores the action at `key`. Silently no-op if the probe limit is
-    // exhausted (table is locally dense at that bucket).
-    void Put(uint64_t key, int action);
-
-    // Stats are per-process (counters in this object, not in shm).
-    std::size_t NumEntries() const { return num_entries_; }
-    std::size_t Bytes()      const { return bytes_; }
-    std::size_t Probes()     const { return probes_; }
-    std::size_t Hits()       const { return hits_; }
-    std::size_t Stores()     const { return stores_; }
-    std::size_t StoreMisses() const { return store_misses_; }
-    bool        IsCreator()  const { return is_creator_; }
-    const std::string& Name() const { return name_; }
-
-    // Manual lifecycle. Destructor calls Close() automatically; only the
-    // creator should call Unlink() to remove the segment from the system.
-    void Close();
-    void Unlink();
-
-private:
-    struct alignas(16) Entry {
-        std::atomic<uint64_t> key;
-        std::atomic<int32_t>  action;
-        uint32_t              pad;
-    };
-    static_assert(sizeof(Entry) == 16, "Entry must be 16 bytes");
-
-    Entry*      table_       = nullptr;
-    std::size_t num_entries_ = 0;     // power of two
-    uint64_t    mask_        = 0;
-    std::size_t bytes_       = 0;
-    int         shm_fd_      = -1;
-    std::string name_;
-    bool        is_creator_  = false;
-    bool        closed_      = false;
-
-    mutable std::size_t probes_       = 0;
-    mutable std::size_t hits_         = 0;
-    std::size_t         stores_       = 0;
-    std::size_t         store_misses_ = 0;
-};
 
 // Inline decoding helpers.
 inline bool IsMoveAction(int action)  { return action >= kMoveActionOffset; }

@@ -28,7 +28,7 @@ import fastnmm
 
 from model import ActorCritic
 from config import Config
-from utils import get_legal_mask
+from utils import get_legal_mask, relativize_obs
 from minimax import MinimaxBot
 from board_utils import (
     POINT_TO_COORD,
@@ -157,9 +157,8 @@ def get_ai_move_with_probs(model, state, player: int, temperature: float = 0.4) 
         Using temperature=0.4 introduces controlled randomness, making the AI
         less exploitable by humans who notice its patterns.
     """
-    obs = torch.tensor(
-        state.observation_tensor(player),
-        dtype=torch.float32
+    obs = torch.from_numpy(
+        relativize_obs(state, player)
     ).unsqueeze(0).to(DEVICE)
 
     mask = torch.tensor(

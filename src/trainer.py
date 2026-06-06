@@ -28,12 +28,11 @@ import fastnmm
 
 from config import Config
 from model import ActorCritic
-from utils import get_legal_mask, ExperienceBatch
+from utils import get_legal_mask, ExperienceBatch, relativize_obs
 from minimax import evaluate_vs_minimax, format_minimax_results
 from worker import worker_process
 from curriculum import (
     CurriculumManager, Phase, PHASE_CONFIGS, MIXED_CONFIG,
-    PHASE_1_CONFIG, PHASE_10_CONFIG,
 )
 from lr_scheduler import WarmRestartLRScheduler
 from logging_setup import get_logger
@@ -157,36 +156,28 @@ class PPOTrainer:
             new_config = PHASE_CONFIGS.get(new_phase)
             if new_config and new_config.opponent_type == 'mixed':
                 self._update_clone_model()
-                # New mixed phase starts at D1 only; D2-D7 unlock progressively via win rate
-                self._broadcast_minimax_range(min_depth=1, max_depth=1)
-                # mixed_state was reset by the curriculum, so all dominated
-                # flags are False — push fresh weights (1.0 across the board).
-                self._broadcast_minimax_weights()
+                # New mixed phase starts at D1 only (active_minimax_max_depth=1).
+                # The full distribution encodes both the unlocked range and the
+                # (fresh, all-False) dampened set.
+                self._broadcast_opponent_distribution()
 
-    def _broadcast_minimax_range(self, min_depth: int, max_depth: int):
-        """Send minimax depth range to all workers."""
-        msg = {
-            'type': 'update_minimax_range',
-            'min_depth': min_depth,
-            'max_depth': max_depth,
-        }
-        for q in self.control_queues:
-            try:
-                q.put(msg)
-            except:
-                pass
+    def _broadcast_opponent_distribution(self):
+        """Send the full per-opponent sampling distribution to all workers.
 
-    def _broadcast_minimax_weights(self):
-        """Send per-depth sampling weights to all workers.
-
-        Dominated depths (WR >= 0.90 with 0.85 hysteresis) get weight ~0.01;
-        the freed probability mass shifts to self-play in the worker. Called
-        after each PPO update so the dampener tracks current WR snapshots.
+        Slot keys: 'self', 'random', 'minimax_d1' .. 'minimax_d{active_max}'.
+        Dampened slots (WR-based for minimax/random, timed for self-play) are
+        pinned at the configured cap and the remaining mass is redistributed
+        via the equal-share-with-selfplay×3 rule (see
+        `compute_opponent_distribution`). Called after each PPO update so the
+        dampener tracks current WR snapshots and the timed self-play cap can
+        expire promptly.
         """
-        weights = self.curriculum.get_minimax_depth_weights()
+        if self.curriculum.get_config().opponent_type != 'mixed':
+            return
+        distribution = self.curriculum.get_opponent_distribution()
         msg = {
-            'type': 'update_minimax_weights',
-            'weights': weights,
+            'type': 'update_opponent_distribution',
+            'distribution': distribution,
         }
         for q in self.control_queues:
             try:
@@ -230,11 +221,11 @@ class PPOTrainer:
                 pass
 
     def _broadcast_game_settings(self):
-        """Send game settings to all workers."""
-        starting_stones = self.curriculum.get_starting_stones_for_phase()
+        """Send game settings (per-player stone distribution) to all workers."""
+        stone_distribution = self.curriculum.get_stone_distribution_for_phase()
         msg = {
             'type': 'update_game_settings',
-            'starting_stones': starting_stones,
+            'stone_distribution': stone_distribution,
         }
 
         for q in self.control_queues:
@@ -255,28 +246,15 @@ class PPOTrainer:
             'reward_config': reward_config,
         }
 
-        # For mixed mode, include opponent mix (per-phase)
+        # For mixed mode, include the full per-opponent distribution.
         if config.opponent_type == 'mixed':
-            msg['opponent_mix'] = self._opponent_mix_for_phase()
+            msg['opponent_distribution'] = self.curriculum.get_opponent_distribution()
 
         for q in self.control_queues:
             try:
                 q.put(msg)
             except:
                 pass
-
-    def _opponent_mix_for_phase(self) -> Dict[str, float]:
-        """Return the opponent mix to use for the current phase."""
-        phase = self.curriculum.current_phase
-        if phase == Phase.PHASE_1:
-            return dict(PHASE_1_CONFIG)
-        if phase == Phase.PHASE_10:
-            return {
-                'minimax': PHASE_10_CONFIG['minimax'],
-                'self':    PHASE_10_CONFIG['self'],
-                'random':  PHASE_10_CONFIG['random'],
-            }
-        return dict(MIXED_CONFIG['opponent_mix'])
 
     def get_entropy_coef(self) -> float:
         """Get current entropy coefficient with gradual decay."""
@@ -300,45 +278,19 @@ class PPOTrainer:
         except (AttributeError, OSError) as e:
             print(f"  WARN: could not set trainer CPU affinity: {e!r}")
 
-    def _setup_move_cache(self) -> None:
-        """Create the cross-process SharedMoveCache (POSIX shm). Stores the
-        creator handle on `self._move_cache` so the segment outlives workers
-        and we can `unlink()` it on shutdown. Disabled if move_cache_bytes<=0."""
-        self._move_cache = None
-        cache_name = getattr(self.config, "move_cache_name", "")
-        cache_bytes = int(getattr(self.config, "move_cache_bytes", 0))
-        if not (cache_name and cache_bytes > 0):
-            return
-        try:
-            self._move_cache = fastnmm.SharedMoveCache.create(cache_name, cache_bytes)
-            gib = self._move_cache.bytes / (1024 ** 3)
-            print(f"  SharedMoveCache: {gib:.2f} GiB "
-                  f"({self._move_cache.num_entries:,} slots) at "
-                  f"'{cache_name}'")
-        except Exception as e:
-            print(f"  WARN: could not create SharedMoveCache "
-                  f"'{cache_name}' ({cache_bytes/1024**3:.1f} GiB): "
-                  f"{e!r}\n  Training will continue without it. "
-                  f"(Hint: /dev/shm may be too small; check "
-                  f"`df -h /dev/shm` and consider "
-                  f"`mount -o remount,size=128G /dev/shm`.)")
-            self._move_cache = None
-
     def _build_worker_shared_state(self) -> Dict:
         """Construct the `shared_state` dict workers bootstrap from."""
         curr_cfg = self.curriculum.get_config()
         return {
-            'initial_starting_stones': self.curriculum.get_starting_stones_for_phase(),
+            'initial_stone_distribution': self.curriculum.get_stone_distribution_for_phase(),
             'initial_opponent_type': curr_cfg.opponent_type,
             'initial_minimax_depth': 1,
             'initial_reward_config': self.curriculum.get_reward_config(),
-            'initial_opponent_mix': (
-                self._opponent_mix_for_phase()
+            'initial_opponent_distribution': (
+                self.curriculum.get_opponent_distribution()
                 if curr_cfg.opponent_type == 'mixed'
                 else None
             ),
-            'initial_minimax_min_depth': 1,
-            'initial_minimax_max_depth': self.curriculum.get_active_minimax_max_depth(),
         }
 
     def start_workers(self):
@@ -348,7 +300,6 @@ class PPOTrainer:
 
         self.request_queue = mp.Queue()
         self.experience_queue = mp.Queue()
-        self._setup_move_cache()
 
         shared_state = self._build_worker_shared_state()
 
@@ -387,11 +338,9 @@ class PPOTrainer:
         self._broadcast_game_settings()
         self._broadcast_curriculum_update()
 
-        # Set initial minimax range from curriculum state (D1 on fresh start, unlocked depth on resume)
-        active_max = self.curriculum.get_active_minimax_max_depth()
-        self._broadcast_minimax_range(min_depth=1, max_depth=max(1, active_max))
-        # On resume, dominated flags carry over from the checkpoint.
-        self._broadcast_minimax_weights()
+        # On resume, active_minimax_max_depth and dominated flags carry over
+        # from the checkpoint and are reflected in the distribution.
+        self._broadcast_opponent_distribution()
 
         # Initialize clone for mixed phases
         config = self.curriculum.get_config()
@@ -410,26 +359,6 @@ class PPOTrainer:
             p.join(timeout=2)
             if p.is_alive():
                 p.terminate()
-
-        # Tear down the shared move cache (creator's responsibility).
-        if getattr(self, "_move_cache", None) is not None:
-            try:
-                p = self._move_cache.probes
-                h = self._move_cache.hits
-                rate = (h / p) if p else 0.0
-                print(f"  SharedMoveCache stats from trainer: "
-                      f"probes={p:,} hits={h:,} hit_rate={rate:.1%}")
-            except Exception:
-                pass
-            try:
-                self._move_cache.close()
-            except Exception:
-                pass
-            try:
-                self._move_cache.unlink()
-            except Exception:
-                pass
-            self._move_cache = None
 
     def pause_workers(self):
         """Pause all workers for PPO update."""
@@ -539,21 +468,22 @@ class PPOTrainer:
                         minimax_depth=minimax_depth
                     )
 
-                    # Drop dominated-opponent experiences from PPO training once WR
-                    # is at or above the cutoff (games still run for stats above).
-                    # In Phase 1 (random-only) we always train; filter only in mixed phases.
+                    # Drop dampened-opponent experiences from PPO training.
+                    # Sampling and training share the same dampened-set so a
+                    # game played against a 1%-pinned opponent never feeds the
+                    # gradient. Phase 1 has no mixed tracking — always train.
                     curr_cfg = self.curriculum.get_config()
                     if curr_cfg.opponent_type == 'mixed':
+                        dampened = self.curriculum.mixed_state.get_dampened_set()
                         if batch.opponent_type == 'random':
-                            wr_random = self.curriculum.mixed_state.get_win_rate_vs_opponent('random')
-                            if wr_random >= self.config.random_train_cutoff:
-                                continue  # play counted for stats, but not for training
+                            if 'random' in dampened:
+                                continue
                         elif batch.opponent_type == 'minimax':
-                            wr_mm = self.curriculum.mixed_state.get_win_rate_vs_opponent(
-                                'minimax', minimax_depth
-                            )
-                            if wr_mm >= self.config.minimax_train_cutoff:
-                                continue  # dominated this depth — skip for PPO
+                            if f'minimax_d{minimax_depth}' in dampened:
+                                continue
+                        elif batch.opponent_type == 'self':
+                            if 'self' in dampened:
+                                continue
 
                     all_experiences.append(batch)
 
@@ -574,8 +504,7 @@ class PPOTrainer:
             if non_random_games == 0:
                 logger.warning("Mixed phase batch had 0 minimax/self games; rebroadcasting curriculum.")
                 self._broadcast_curriculum_update()
-                active_max = self.curriculum.get_active_minimax_max_depth()
-                self._broadcast_minimax_range(min_depth=1, max_depth=active_max)
+                self._broadcast_opponent_distribution()
 
         self.episode_count += len(all_experiences)
         return all_experiences, all_returns
@@ -695,17 +624,17 @@ class PPOTrainer:
     def evaluate_vs_random(self, num_games: int = 200) -> float:
         """Evaluate model against random opponent."""
         game = fastnmm.load_game("nine_mens_morris")
-        stones = self.curriculum.get_starting_stones_for_phase()
+        dist = self.curriculum.get_stone_distribution_for_phase()
+        counts = [c for c, _ in dist]
+        weights = [w for _, w in dist]
         wins, draws = 0, 0
 
         self.model.eval()
         with torch.no_grad():
             for i in range(num_games):
-                if stones < 0:
-                    eval_stones = (random.randint(3, 9), random.randint(3, 9))
-                else:
-                    eval_stones = (stones, stones)
-                state = game.new_initial_state(starting_stones=eval_stones)
+                a = random.choices(counts, weights=weights)[0]
+                b = random.choices(counts, weights=weights)[0]
+                state = game.new_initial_state(starting_stones=(a, b))
 
                 # Skip if engine returns an already-terminal state for these stones
                 if state.is_terminal():
@@ -718,7 +647,7 @@ class PPOTrainer:
                     pid = state.current_player()
 
                     if pid == our_player:
-                        obs_arr = state.observation_tensor_numpy(pid).reshape(-1)
+                        obs_arr = relativize_obs(state, pid)
                         obs = torch.from_numpy(obs_arr).to(self.device).unsqueeze(0)
                         mask = torch.tensor(
                             get_legal_mask(state, self.num_actions),
@@ -748,12 +677,11 @@ class PPOTrainer:
 
     def evaluate_vs_minimax_progressive(self) -> Tuple[int, str]:
         """Test AI against progressively harder minimax bots."""
-        stones = self.curriculum.get_starting_stones_for_phase()
         max_depth_beaten, results = evaluate_vs_minimax(
             self.model, self.device, self.num_actions,
             max_depth=6, games_per_depth=10, max_steps=150,
             use_mixed_precision=self.config.use_mixed_precision,
-            starting_stones=stones,
+            stone_distribution=self.curriculum.get_stone_distribution_for_phase(),
         )
         result_str = format_minimax_results(results)
         return max_depth_beaten, result_str
@@ -813,8 +741,11 @@ class PPOTrainer:
         if config.opponent_type == 'mixed':
             wr_random = opp_wr['wr_vs_random']
             rnd_train_note = " (no-train)" if wr_random >= self.config.random_train_cutoff else ""
+            ms = self.curriculum.mixed_state
+            self_paused = ms.total_episodes < ms.selfplay_train_cooldown_until
+            self_note = f" (no-train, {ms.selfplay_train_cooldown_until - ms.total_episodes:,}ep left)" if self_paused else ""
             print(f"  WR(500):{depth_str} [MaxD:{active_max}] "
-                  f"Rnd:{wr_random:.0%}{rnd_train_note} Self:{opp_wr['wr_vs_self']:.0%}")
+                  f"Rnd:{wr_random:.0%}{rnd_train_note} Self:{opp_wr['wr_vs_self']:.0%}{self_note}")
         else:
             print(f"  WR({len(curr_stats.recent_results)}): Rnd:{win_rate:.0%} (mixed opponent WR tracking starts in Phase 2)")
 
@@ -1100,22 +1031,19 @@ class PPOTrainer:
         )
         print()
 
-        print(f"Mixed Training (Phase 2-9):")
-        mix = MIXED_CONFIG['opponent_mix']
-        print(f"  Opponent mix: {mix['minimax']*100:.0f}% minimax, {mix['self']*100:.0f}% self-play, {mix['random']*100:.0f}% random")
-        print(f"  Minimax: Random D{MIXED_CONFIG['minimax_min_depth']}-D{MIXED_CONFIG['minimax_max_depth']}")
-        print(f"  Self-play: Clone update at {MIXED_CONFIG['selfplay_winrate_threshold']*100:.0f}% WR over {MIXED_CONFIG['selfplay_winrate_games']} games")
+        print(f"Mixed Training (Phase 2-10):")
+        print(f"  Opponent mix: equal-share across self + unlocked minimax D1-D{MIXED_CONFIG['minimax_max_depth']} + random,")
+        print(f"                self-play weighted ×{MIXED_CONFIG['selfplay_weight']:.0f}. Dampened slots pinned at {MIXED_CONFIG['dampen_cap']:.0%}.")
+        print(f"  Minimax depths unlock progressively (D1 → D7) by win rate.")
+        print(f"  Self-play: Clone update at {MIXED_CONFIG['selfplay_winrate_threshold']*100:.0f}% WR over the rolling 500-game self-play window (checked at log tick)")
         print(f"  Graduation: Trend-based (plateau detection < 1° angle over 1M episodes)")
         print()
 
-        print(f"Phase 10 (Final):")
-        print(f"  Minimax: Random D1-D4, no shaping, trend-based graduation")
-        print()
-
         config = self.curriculum.get_config()
-        stones = self.curriculum.get_starting_stones_for_phase()
+        dist = self.curriculum.get_stone_distribution_for_phase()
+        dist_str = ", ".join(f"{c}:{w:.0%}" for c, w in dist)
         print(f"Starting Phase {int(self.curriculum.current_phase)}: {config.description}")
-        print(f"  Starting stones per player: {stones if stones >= 0 else 'random 3-9 per game'}")
+        print(f"  Stone distribution per player: {dist_str}")
         print("=" * 70)
 
         self.start_time = time.time()
@@ -1144,29 +1072,42 @@ class PPOTrainer:
                 metrics['cycle_step'] = self.lr_scheduler.cycle_step
                 metrics['last_reset_event'] = self.lr_scheduler.last_reset_event
 
-                # Check for clone update (85% WR over 1000 self-play games)
-                if self.curriculum.should_update_clone():
-                    self.curriculum.do_clone_update()
-
-                # Check for minimax depth unlock (D3 when D1 WR>80%, D4 when D2 WR>80%)
-                if self.curriculum.check_and_unlock_minimax_depth():
-                    new_max = self.curriculum.get_active_minimax_max_depth()
-                    self._broadcast_minimax_range(min_depth=1, max_depth=new_max)
-                    self.save_checkpoint(f"depth{new_max}_unlocked")
-
-                # Refresh per-depth sampling weights (dominated depths get 0.01,
-                # freed probability mass goes to self-play).
-                if self.curriculum.get_config().opponent_type == 'mixed':
-                    self._broadcast_minimax_weights()
-
                 if self.episode_count % cfg.log_interval < cfg.episodes_per_update:
-                    # Sample first so the logged per-depth slope/samples reflect
-                    # the freshest tick, not the prior one.
+                    # All slow-signal checks live here — one place, one cadence.
+                    # Order matters:
+                    #  1. sample per-depth WR so logging sees the freshest tick
+                    #  2. log progress (uses pre-update state)
+                    #  3. clone update (reuses the wr_vs_self we just logged)
+                    #  4. depth unlock (may broadcast and save a checkpoint)
+                    #  5. weight rebroadcast (after dominated-state refresh)
+                    #  6. graduation check (terminal signal for the phase)
                     self.curriculum.sample_minimax_winrate()
                     self.log_progress(returns, metrics)
-
-                # Check graduation
-                if self.episode_count % cfg.graduation_check_interval < cfg.episodes_per_update:
+                    if self.curriculum.should_update_clone():
+                        self.curriculum.do_clone_update()
+                    if self.curriculum.check_and_unlock_minimax_depth():
+                        new_max = self.curriculum.get_active_minimax_max_depth()
+                        self.save_checkpoint(f"depth{new_max}_unlocked")
+                    if self.curriculum.get_config().opponent_type == 'mixed':
+                        # Self-play timed dampening: if wr_vs_self crossed
+                        # the threshold, pin self-play sampling at
+                        # `dampen_cap` and drop self-play from PPO for the
+                        # configured window. Updated BEFORE the distribution
+                        # broadcast so the new dampened state is reflected.
+                        ms = self.curriculum.mixed_state
+                        wr_self = ms.get_win_rate_vs_opponent('self')
+                        if wr_self > cfg.selfplay_train_pause_threshold:
+                            ms.selfplay_train_cooldown_until = (
+                                ms.total_episodes + cfg.selfplay_train_pause_episodes
+                            )
+                            remaining = ms.selfplay_train_cooldown_until - ms.total_episodes
+                            print(
+                                f"  [Self-play dampen] wr_vs_self={wr_self:.1%} > "
+                                f"{cfg.selfplay_train_pause_threshold:.0%}; "
+                                f"pinning self-play sampling at 1% and "
+                                f"dropping it from PPO for next {remaining:,} eps."
+                            )
+                        self._broadcast_opponent_distribution()
                     self.curriculum.check_and_graduate()
 
                 # Checkpointing

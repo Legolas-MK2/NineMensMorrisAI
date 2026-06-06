@@ -19,7 +19,7 @@ from config import Config
 from model import ActorCritic
 from trainer import PPOTrainer
 from minimax import MinimaxBot, evaluate_vs_minimax
-from utils import get_legal_mask
+from utils import get_legal_mask, relativize_obs
 from curriculum import CurriculumManager, Phase, PHASE_CONFIGS
 
 
@@ -128,7 +128,7 @@ def play_interactive(config: Config = None):
             current = state.current_player()
             
             if current == ai_player:
-                obs_arr = state.observation_tensor_numpy(current).reshape(-1)
+                obs_arr = relativize_obs(state, current)
                 obs = torch.from_numpy(obs_arr).to(device).unsqueeze(0)
                 mask = torch.tensor(
                     get_legal_mask(state, game.num_distinct_actions()),
@@ -193,7 +193,7 @@ def play_interactive(config: Config = None):
                 print("Invalid input!")
                 continue
         else:
-            obs_arr = state.observation_tensor_numpy(state.current_player()).reshape(-1)
+            obs_arr = relativize_obs(state, state.current_player())
             obs = torch.from_numpy(obs_arr).to(device).unsqueeze(0)
             mask = torch.tensor(
                 get_legal_mask(state, game.num_distinct_actions()),

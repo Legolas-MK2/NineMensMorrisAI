@@ -97,6 +97,21 @@ BOARD_POS_TO_GRID: Tuple[Tuple[int, int], ...] = (
 )
 
 
+def relativize_obs(state, player: int) -> np.ndarray:
+    """Flat player-relative observation: [my_pieces, opp_pieces, ...] per cell.
+
+    pyspiel's `observation_tensor_numpy` returns an absolute board (channel 0 =
+    p0 pieces, channel 1 = p1 pieces) regardless of which player is asking.
+    Swap channels 0/1 when `player == 1` so the network always sees the same
+    [self, opponent, ...] layout.
+    """
+    obs = state.observation_tensor_numpy(player)  # shape (5, 7, 7)
+    if player == 1:
+        obs = obs.copy()
+        obs[[0, 1]] = obs[[1, 0]]
+    return obs.reshape(-1)
+
+
 def parse_board_from_state(state) -> Tuple[Optional[int], ...]:
     """Parse absolute board (0=player0, 1=player1, None=empty) from state.
 

@@ -16,7 +16,7 @@ import json
 import math
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Tuple, Any, Set
 from collections import deque
 from enum import IntEnum
 import numpy as np
@@ -77,17 +77,18 @@ class PhaseConfig:
 
 
 # Mixed opponent configuration for Phase 2+
+#
+# The base opponent distribution is no longer hardcoded. It is computed by
+# `compute_opponent_distribution()` from the current set of available enemy
+# slots: each unlocked minimax depth, self-play, and random. Self-play gets
+# a 3× weight; every other slot gets weight 1. Dampened slots are pinned at
+# `dampen_cap` (1%) and the remaining mass redistributes by weight. See
+# `compute_opponent_distribution` for the full algorithm.
 MIXED_CONFIG = {
-    # Opponent distribution - increased minimax to reduce self-play overfitting
-    'opponent_mix': {
-        'minimax': 0.37,   # 30% minimax (was 15%)
-        'self': 0.60,      # 60% self-play (was 80%)
-        'random': 0.03,    # 10% random (was 5%)
-    },
-
-    # Self-play: clone update at 80% win rate (was 90%, less aggressive)
+    # Self-play: clone update at 80% win rate over the rolling 500-game
+    # self-play window (same window that's logged as wr_vs_self). Checked at
+    # log tick (every log_interval episodes).
     'selfplay_winrate_threshold': 0.8,
-    'selfplay_winrate_games': 25000,  # Increased from 500 for stability
     # Minimum episodes between clone updates. Rapid clone churn was collapsing
     # the policy, so require at least this many episodes since the previous
     # clone before making a new one.
@@ -108,34 +109,80 @@ MIXED_CONFIG = {
     'stagnation_snapshot_window': 5,         # Compare last 5 snapshots (= 500k episodes)
     'stagnation_threshold': 0.03,            # Must improve combined d1+d2 WR by 3%
 
-    # Per-depth sampling dampening with hysteresis. When WR vs depth d crosses
-    # `dominate_threshold`, the depth is "dominated" and its sampling weight
-    # collapses to `dominate_weight` (~1% of normal). The freed probability
-    # mass shifts to self-play. The depth recovers (weight 1.0) only after WR
-    # falls below `dominate_recover` — the gap prevents flapping at the edge.
+    # Per-opponent sampling dampening with hysteresis. When WR vs an opponent
+    # crosses `dominate_threshold`, that opponent's sampling probability
+    # collapses to `dampen_cap` (1%) and the freed mass is redistributed
+    # across the remaining slots by `compute_opponent_distribution`. Recovery
+    # happens only when WR falls below `dominate_recover` — the gap prevents
+    # flapping at the boundary. Applies to minimax depths AND random.
     'minimax_depth_dominate_threshold': 0.90,
     'minimax_depth_dominate_recover': 0.85,
     'minimax_depth_dominate_min_games': 100,
-    'minimax_depth_dominate_weight': 0.01,
+    'dampen_cap': 0.01,
+    # Self-play uses a TIMED dampening instead of hysteresis: once
+    # wr_vs_self exceeds `selfplay_train_pause_threshold` (config.py) at a
+    # log tick, sampling drops to `dampen_cap` for
+    # `selfplay_train_pause_episodes` episodes, then recovers unconditionally.
+    # Self-play weighting in the base formula (slot gets 3× the share of any
+    # other non-dampened slot).
+    'selfplay_weight': 3.0,
 }
 
-# Special config for Phase 1 (warmup: self-play + random, no minimax yet)
-PHASE_1_CONFIG = {
-    'minimax': 0.0,
-    'self':    0.70,
-    'random':  0.30,
-}
 
-# Special config for Phase 10 (final phase with harder minimax)
-PHASE_10_CONFIG = {
-    'minimax': 0.44,   # 35% minimax (harder opponents for final phase)
-    'self': 0.55,      # 55% self-play
-    'random': 0.01,    # 01% random
-    'selfplay_winrate_threshold': 0.8,
-    'selfplay_winrate_games': 25000,
-    'minimax_min_depth': 1,
-    'minimax_max_depth': 7,  # D1-D7 for final phase
-}
+def compute_opponent_distribution(
+    unlocked_depths: List[int],
+    dampened: Set[str],
+    *,
+    cap_value: float = 0.01,
+    selfplay_weight: float = 3.0,
+    include_selfplay: bool = True,
+    include_random: bool = True,
+) -> Dict[str, float]:
+    """Distribute sampling probability across enemy slots.
+
+    Each slot starts with weight 1 except self-play which gets `selfplay_weight`
+    (default 3). Slot keys are 'self', 'random', and 'minimax_d{d}' for each
+    unlocked depth d. Slots whose key is in `dampened` are pinned at
+    `cap_value`; the remaining `1 - n_dampened * cap_value` mass distributes
+    across non-dampened slots proportionally to their weights.
+
+    Worked examples (cap=0.01, selfplay_weight=3):
+      unlocked=[1..7], dampened={}        → self=0.2727, mm_d* each=0.0909, random=0.0909
+      unlocked=[1..7], dampened={'random'} → self=0.2970, mm_d* each=0.0990, random=0.01
+      unlocked=[],     dampened={}        → self=0.75,  random=0.25
+    """
+    slots: List[Tuple[str, float]] = []
+    if include_selfplay:
+        slots.append(('self', selfplay_weight))
+    for d in unlocked_depths:
+        slots.append((f'minimax_d{int(d)}', 1.0))
+    if include_random:
+        slots.append(('random', 1.0))
+
+    if not slots:
+        return {}
+
+    pinned = [k for k, _ in slots if k in dampened]
+    free = [(k, w) for k, w in slots if k not in dampened]
+
+    fixed_total = cap_value * len(pinned)
+    remaining = max(0.0, 1.0 - fixed_total)
+    weight_sum = sum(w for _, w in free)
+
+    dist: Dict[str, float] = {}
+    if weight_sum <= 0.0:
+        # Every slot is dampened — degenerate, give them all cap_value.
+        for k, _ in slots:
+            dist[k] = cap_value
+        return dist
+
+    for k, _ in slots:
+        if k in dampened:
+            dist[k] = cap_value
+        else:
+            w = next(w for kk, w in free if kk == k)
+            dist[k] = remaining * w / weight_sum
+    return dist
 
 
 # Graduation criteria (Phase 2-10, mixed opponents).
@@ -302,10 +349,13 @@ class MixedTrainingState:
     """State for mixed opponent training (Phase 2+)."""
     total_episodes: int = 0
 
-    # Self-play tracking (maxlen matches selfplay_winrate_games = 1000)
-    selfplay_results: deque = field(default_factory=lambda: deque(maxlen=1000))
     clone_generation: int = 0
     last_clone_episode: int = 0  # total_episodes when clone was last updated
+
+    # Self-play PPO pause: while total_episodes < this, self-play batches are
+    # dropped from PPO training (games still play, results still tracked).
+    # Set at log tick when wr_vs_self exceeds the configured threshold.
+    selfplay_train_cooldown_until: int = 0
 
     # Minimax win rate snapshots for stagnation detection: list of (total_episodes, win_rate)
     minimax_winrate_snapshots: List = field(default_factory=list)
@@ -352,32 +402,40 @@ class MixedTrainingState:
         default_factory=lambda: {d: False for d in range(1, 8)}
     )
 
+    # Random "dominated" flag — same hysteresis rules as minimax depths.
+    # When True, random's sampling probability is pinned at `dampen_cap`
+    # and games vs random are dropped from PPO training.
+    random_dominated: bool = False
+
     def get_selfplay_win_rate(self) -> float:
-        """Get win rate from last N self-play games."""
-        if len(self.selfplay_results) < 50:
-            return 0.5  # Not enough data
-        wins = sum(1 for r in self.selfplay_results if r == 'win')
-        return wins / len(self.selfplay_results)
+        """Get win rate from the rolling self-play window (last 500 games)."""
+        return self.get_win_rate_vs_opponent('self')
 
     def should_update_clone(self) -> bool:
-        """Check if clone should be updated (85% WR over 1000 games).
+        """Check if clone should be updated.
 
-        Enforces a cooldown: a new clone cannot be created if the previous
-        clone was created within the last `selfplay_clone_cooldown_episodes`
-        episodes. The very first clone in a phase (clone_generation == 0)
-        is always allowed to be created as soon as the WR threshold is met.
+        Designed to be polled at the log tick (every log_interval episodes).
+        Uses the same rolling `results_vs_self` window (last 500 self-play
+        games) that gets reported as `wr_vs_self` in the CSV/log — no extra
+        bookkeeping. Enforces the cooldown: a new clone cannot be created if
+        the previous clone was created within the last
+        `selfplay_clone_cooldown_episodes` episodes. The very first clone in
+        a phase (clone_generation == 0) is always allowed once the WR
+        threshold is met.
         """
-        if len(self.selfplay_results) < MIXED_CONFIG['selfplay_winrate_games']:
+        if len(self.results_vs_self) < self.results_vs_self.maxlen:
             return False
         if self.clone_generation > 0:
             cooldown = MIXED_CONFIG['selfplay_clone_cooldown_episodes']
             if (self.total_episodes - self.last_clone_episode) < cooldown:
                 return False
-        return self.get_selfplay_win_rate() >= MIXED_CONFIG['selfplay_winrate_threshold']
+        return self.get_win_rate_vs_opponent('self') >= MIXED_CONFIG['selfplay_winrate_threshold']
 
     def on_clone_updated(self):
         """Called when clone is updated."""
-        self.selfplay_results.clear()
+        # Reset the self-play window so the next 500 games reflect the new
+        # (harder) clone, not the previous one.
+        self.results_vs_self.clear()
         # Reset stagnation history so the next stagnation window starts fresh.
         self.minimax_winrate_snapshots.clear()
         self.clone_generation += 1
@@ -508,17 +566,21 @@ class MixedTrainingState:
         history = self.minimax_wr_history_by_depth.get(depth)
         return 0 if history is None else len(history)
 
-    def update_minimax_dominated_state(self) -> Dict[int, bool]:
-        """Refresh per-depth `minimax_depth_dominated` flags using hysteresis.
+    def update_dampened_state(self) -> None:
+        """Refresh hysteresis flags for minimax depths AND random.
 
-        A depth d becomes dominated once WR(d) >= dominate_threshold over at
-        least dominate_min_games games. It stays dominated until WR(d) drops
+        A slot becomes dampened once WR >= dominate_threshold over at
+        least dominate_min_games games. It stays dampened until WR drops
         below dominate_recover; the gap prevents flapping at the boundary.
-        Depths with too few games to judge keep their previous flag.
+        Slots with too few games to judge keep their previous flag.
+
+        Self-play uses a TIMED scheme (`selfplay_train_cooldown_until`) and
+        is updated by the trainer, not here.
         """
         threshold = MIXED_CONFIG['minimax_depth_dominate_threshold']
         recover = MIXED_CONFIG['minimax_depth_dominate_recover']
         min_games = MIXED_CONFIG['minimax_depth_dominate_min_games']
+
         for d in range(1, 8):
             deq = self._depth_results_deque(d)
             n_games = len(deq) if deq is not None else 0
@@ -530,7 +592,7 @@ class MixedTrainingState:
                     self.minimax_depth_dominated[d] = True
                     logger.info(
                         "Depth dominated: D%d sampling collapsed "
-                        "(WR %.0f%% >= %.0f%%); freed mass -> self-play",
+                        "(WR %.0f%% >= %.0f%%)",
                         d, wr * 100, threshold * 100,
                     )
             else:
@@ -541,7 +603,52 @@ class MixedTrainingState:
                         "(WR %.0f%% < %.0f%%)",
                         d, wr * 100, recover * 100,
                     )
+
+        if len(self.results_vs_random) >= min_games:
+            wr_random = self.get_win_rate_vs_opponent('random')
+            if not self.random_dominated:
+                if wr_random >= threshold:
+                    self.random_dominated = True
+                    logger.info(
+                        "Random dominated: sampling collapsed "
+                        "(WR %.0f%% >= %.0f%%)",
+                        wr_random * 100, threshold * 100,
+                    )
+            else:
+                if wr_random < recover:
+                    self.random_dominated = False
+                    logger.info(
+                        "Random recovered: sampling restored "
+                        "(WR %.0f%% < %.0f%%)",
+                        wr_random * 100, recover * 100,
+                    )
+
+    # Back-compat alias — older trainer paths still call the old name.
+    def update_minimax_dominated_state(self) -> Dict[int, bool]:
+        self.update_dampened_state()
         return dict(self.minimax_depth_dominated)
+
+    def is_selfplay_dampened(self) -> bool:
+        """Self-play is dampened while inside the timed cooldown window."""
+        return self.total_episodes < self.selfplay_train_cooldown_until
+
+    def get_dampened_set(self) -> Set[str]:
+        """Return the set of slot keys currently pinned at `dampen_cap`.
+
+        Refreshes the hysteresis flags first so the answer is current.
+        Keys match the slot-name convention used by
+        `compute_opponent_distribution`: 'self', 'random', 'minimax_d{d}'.
+        """
+        self.update_dampened_state()
+        dampened: Set[str] = set()
+        if self.random_dominated:
+            dampened.add('random')
+        if self.is_selfplay_dampened():
+            dampened.add('self')
+        for d in range(1, 8):
+            if self.minimax_depth_dominated.get(d, False):
+                dampened.add(f'minimax_d{d}')
+        return dampened
 
 
 @dataclass
@@ -630,6 +737,37 @@ class CurriculumManager:
             return PHASE_CONFIGS[Phase.PHASE_9]
         return PHASE_CONFIGS[self.current_phase]
 
+    def get_stone_distribution_for_phase(self) -> List[Tuple[int, float]]:
+        """Per-player starting-stone sampling distribution.
+
+        Each player draws independently from this distribution at every env
+        reset, producing asymmetric games and smooth phase transitions.
+
+        Shape for phases 2-8 (centered on the phase's base count):
+          offset {-2, -1, 0, +1, +2} → weight {0.05, 0.175, 0.55, 0.175, 0.05}
+        Mass falling outside [3, 9] is collapsed onto the boundary. Phases 1
+        and 10 keep their "random 3-9" feel via a uniform distribution. Phase
+        9 stays fixed at 9 stones (full game).
+        """
+        if self.current_phase == Phase.COMPLETED:
+            return [(9, 1.0)]
+
+        phase_num = int(self.current_phase)
+
+        if phase_num in (1, 10):
+            return [(s, 1.0 / 7.0) for s in range(3, 10)]
+
+        if phase_num == 9:
+            return [(9, 1.0)]
+
+        base = phase_num + 1  # Phase 2 → 3, Phase 8 → 9
+        offset_weights = [(-2, 0.05), (-1, 0.175), (0, 0.55), (+1, 0.175), (+2, 0.05)]
+        merged: Dict[int, float] = {}
+        for offset, w in offset_weights:
+            count = max(3, min(9, base + offset))
+            merged[count] = merged.get(count, 0.0) + w
+        return sorted(merged.items())
+
     def get_starting_stones_for_phase(self) -> int:
         """
         Get the per-player starting-stone count for the current phase.
@@ -683,7 +821,7 @@ class CurriculumManager:
         if self.current_phase == Phase.PHASE_10:
             return 0.0
 
-        SHAPING_DECAY_EPISODES = 12_000_000
+        SHAPING_DECAY_EPISODES = 20_000_000
         progress = min(1.0, self.total_episodes / SHAPING_DECAY_EPISODES)
         return max(0.0, 1.0 - progress)
 
@@ -753,7 +891,6 @@ class CurriculumManager:
             self.mixed_state.games_vs_random += 1
         elif opponent_type == 'self':
             self.mixed_state.games_vs_self += 1
-            self.mixed_state.selfplay_results.append(result_str)
         elif opponent_type == 'minimax':
             self.mixed_state.games_vs_minimax += 1
             self._handle_minimax_result(result_str, minimax_depth)
@@ -1097,26 +1234,27 @@ class CurriculumManager:
 
         return False
 
-    def get_minimax_depth_weights(self) -> Dict[int, float]:
-        """Per-depth sampling weights for minimax opponents (Phase 2+).
+    def get_opponent_distribution(self) -> Dict[str, float]:
+        """Full per-opponent sampling distribution for the current phase.
 
-        Updates the dominated-state hysteresis, then maps each depth to:
-          - `minimax_depth_dominate_weight` (default 0.01) when dominated
-          - 1.0 otherwise
-
-        Workers receive this dict and redistribute the freed probability mass
-        from dominated depths to self-play; the random share is unchanged.
-        Outside mixed phases this returns all 1.0s (no-op).
+        Slot keys: 'self', 'random', 'minimax_d1' .. 'minimax_d7'. The
+        distribution sums to 1.0. Phase 1 (warmup) omits minimax entirely
+        and yields {'self': 0.75, 'random': 0.25}. All other phases use the
+        equal-share-with-selfplay×3 base formula across self + unlocked
+        minimax depths + random, with currently-dampened slots pinned at
+        `dampen_cap` and the remaining mass redistributed.
         """
-        config = self.get_config()
-        if config.opponent_type != 'mixed':
-            return {d: 1.0 for d in range(1, 8)}
-        self.mixed_state.update_minimax_dominated_state()
-        dominated_weight = MIXED_CONFIG['minimax_depth_dominate_weight']
-        return {
-            d: (dominated_weight if self.mixed_state.minimax_depth_dominated[d] else 1.0)
-            for d in range(1, 8)
-        }
+        if self.current_phase == Phase.PHASE_1:
+            unlocked: List[int] = []
+        else:
+            unlocked = list(range(1, self.mixed_state.active_minimax_max_depth + 1))
+        dampened = self.mixed_state.get_dampened_set()
+        return compute_opponent_distribution(
+            unlocked,
+            dampened,
+            cap_value=MIXED_CONFIG['dampen_cap'],
+            selfplay_weight=MIXED_CONFIG['selfplay_weight'],
+        )
 
     def get_opponent_win_rates(self) -> Dict[str, float]:
         """Get win rates vs each opponent type (last 500 games)."""
@@ -1154,13 +1292,13 @@ class CurriculumManager:
                 'total_episodes': self.mixed_state.total_episodes,
                 'clone_generation': self.mixed_state.clone_generation,
                 'last_clone_episode': self.mixed_state.last_clone_episode,
+                'selfplay_train_cooldown_until': self.mixed_state.selfplay_train_cooldown_until,
                 'games_vs_random': self.mixed_state.games_vs_random,
                 'games_vs_minimax': self.mixed_state.games_vs_minimax,
                 'games_vs_self': self.mixed_state.games_vs_self,
                 'minimax_wins_by_depth': dict(self.mixed_state.minimax_wins_by_depth),
                 'minimax_winrate_snapshots': self.mixed_state.minimax_winrate_snapshots,
                 'active_minimax_max_depth': self.mixed_state.active_minimax_max_depth,
-                'selfplay_results': list(self.mixed_state.selfplay_results),
                 'results_vs_random': list(self.mixed_state.results_vs_random),
                 'results_vs_minimax_d1': list(self.mixed_state.results_vs_minimax_d1),
                 'results_vs_minimax_d2': list(self.mixed_state.results_vs_minimax_d2),
@@ -1175,6 +1313,7 @@ class CurriculumManager:
                     d: list(dq) for d, dq in self.mixed_state.minimax_wr_history_by_depth.items()
                 },
                 'minimax_depth_dominated': dict(self.mixed_state.minimax_depth_dominated),
+                'random_dominated': self.mixed_state.random_dominated,
             },
         }
 
@@ -1213,11 +1352,11 @@ class CurriculumManager:
                     total_episodes=ms.get('total_episodes', 0),
                     clone_generation=ms.get('clone_generation', 0),
                     last_clone_episode=ms.get('last_clone_episode', 0),
+                    selfplay_train_cooldown_until=ms.get('selfplay_train_cooldown_until', 0),
                     games_vs_random=ms.get('games_vs_random', 0),
                     games_vs_minimax=ms.get('games_vs_minimax', 0),
                     games_vs_self=ms.get('games_vs_self', 0),
                     active_minimax_max_depth=ms.get('active_minimax_max_depth', 1),
-                    selfplay_results=deque(ms.get('selfplay_results', []), maxlen=MIXED_CONFIG['selfplay_winrate_games']),
                     results_vs_random=deque(ms.get('results_vs_random', []), maxlen=500),
                     results_vs_minimax_d1=deque(ms.get('results_vs_minimax_d1', []), maxlen=500),
                     results_vs_minimax_d2=deque(ms.get('results_vs_minimax_d2', []), maxlen=500),
@@ -1252,6 +1391,7 @@ class CurriculumManager:
                     self.mixed_state.minimax_depth_dominated = {
                         int(k): bool(v) for k, v in dominated_raw.items()
                     }
+                self.mixed_state.random_dominated = bool(ms.get('random_dominated', False))
 
             print(f"  Loaded curriculum: Phase {int(self.current_phase)}, {self.total_episodes:,} episodes")
             return True

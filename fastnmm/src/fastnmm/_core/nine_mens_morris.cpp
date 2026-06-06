@@ -3,16 +3,9 @@
 #include "nine_mens_morris.hpp"
 
 #include <algorithm>
-#include <cerrno>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
-#include <system_error>
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace fastnmm {
 
@@ -1318,60 +1311,7 @@ SearchResult MinimaxEngine::Search(const State& s, int depth) {
     const int cur_player = s.CurrentPlayer();
     const uint64_t root_key = ZobristKey(s);
 
-    // Optional shared-cache hint: try this move first if it's legal.
-    // Bit-exact parity with MinimaxSearch is preserved because we still
-    // iterate every legal move below in the engine's natural order; the
-    // hint only changes which one is *evaluated first*, not which one is
-    // returned (alpha-beta is sound; root has no cutoff).
-    int hint_move = -1;
-    if (root_cache_ != nullptr) {
-        const int candidate = root_cache_->Get(root_key);
-        if (candidate >= 0) {
-            for (int i = 0; i < n; ++i) {
-                if (buf[i] == candidate) { hint_move = candidate; break; }
-            }
-        }
-    }
-    if (hint_move >= 0) {
-        State child = s;
-        child.ApplyAction(hint_move);
-        int child_score;
-        if (child.IsTerminal()) {
-            const int w = child.Winner();
-            if (w == 2) {
-                child_score = 0;
-            } else if (strict_) {
-                child_score = (w == cur_player) ? +kWinScore : -kWinScore;
-                child_score -= (child_score > 0 ?  (100 - depth)
-                                                 : -(100 - depth));
-            } else {
-                child_score = (w == cur_player) ?
-                                 +(kRelaxedMate - 1) : -(kRelaxedMate - 1);
-            }
-        } else if (child.CurrentPlayer() == cur_player) {
-            const uint64_t child_key = ZobristKey(child);
-            if (strict_) {
-                child_score = NegamaxStrict(child, depth - 1, alpha, beta, nodes, child_key);
-            } else {
-                child_score = NegamaxRelaxed(child, depth - 1, alpha, beta, nodes, child_key);
-                child_score = AdjustForOnePlyDeeper(child_score);
-            }
-        } else {
-            const uint64_t child_key = ZobristKey(child);
-            if (strict_) {
-                child_score = -NegamaxStrict(child, depth - 1, -beta, -alpha, nodes, child_key);
-            } else {
-                child_score = -NegamaxRelaxed(child, depth - 1, -beta, -alpha, nodes, child_key);
-                child_score = AdjustForOnePlyDeeper(child_score);
-            }
-        }
-        best_score  = child_score;
-        best_action = hint_move;
-        if (best_score > alpha) alpha = best_score;
-    }
-
     for (int i = 0; i < n; ++i) {
-        if (buf[i] == hint_move) continue;  // already evaluated above
         State child = s;
         child.ApplyAction(buf[i]);
 
@@ -1415,178 +1355,11 @@ SearchResult MinimaxEngine::Search(const State& s, int depth) {
     }
 
     Store(root_key, depth, best_score, best_action, kFlagExact);
-    if (root_cache_ != nullptr && best_action >= 0) {
-        root_cache_->Put(root_key, best_action);
-    }
     return {best_action, best_score, nodes};
 }
 
 int MinimaxEngine::Eval(const State& s) const {
     return Evaluate(s);
-}
-
-// =========================================================================
-// SharedMoveCache.
-// =========================================================================
-namespace {
-
-std::size_t RoundDownToPow2(std::size_t n) {
-    if (n < 2) return 1;
-    std::size_t p = 1;
-    while ((p << 1) <= n) p <<= 1;
-    return p;
-}
-
-}  // namespace
-
-SharedMoveCache::SharedMoveCache(const std::string& name,
-                                 std::size_t total_bytes,
-                                 bool create) : name_(name) {
-    if (name.empty() || name[0] != '/') {
-        throw std::invalid_argument(
-            "SharedMoveCache: name must start with '/' (POSIX shm convention)");
-    }
-
-    if (create) {
-        // Round entry count down to power-of-2 so we can use mask indexing.
-        std::size_t entries = total_bytes / kBytesPerEntry;
-        if (entries < 1024) entries = 1024;
-        entries = RoundDownToPow2(entries);
-        std::size_t bytes = entries * kBytesPerEntry;
-
-        // Try to create exclusively; if a stale segment from a crashed
-        // run exists, unlink it and retry.
-        int fd = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
-        if (fd == -1 && errno == EEXIST) {
-            ::shm_unlink(name.c_str());
-            fd = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
-        }
-        if (fd == -1) {
-            throw std::system_error(errno, std::generic_category(),
-                "SharedMoveCache: shm_open(create) failed for " + name);
-        }
-        if (::ftruncate(fd, static_cast<off_t>(bytes)) != 0) {
-            const int e = errno;
-            ::close(fd);
-            ::shm_unlink(name.c_str());
-            throw std::system_error(e, std::generic_category(),
-                "SharedMoveCache: ftruncate failed (try a smaller "
-                "total_bytes; /dev/shm may be undersized)");
-        }
-        void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                         MAP_SHARED, fd, 0);
-        if (p == MAP_FAILED) {
-            const int e = errno;
-            ::close(fd);
-            ::shm_unlink(name.c_str());
-            throw std::system_error(e, std::generic_category(),
-                "SharedMoveCache: mmap failed");
-        }
-        // Linux zero-fills new pages on demand; no explicit memset needed.
-        table_       = reinterpret_cast<Entry*>(p);
-        num_entries_ = entries;
-        mask_        = static_cast<uint64_t>(entries - 1);
-        bytes_       = bytes;
-        shm_fd_      = fd;
-        is_creator_  = true;
-    } else {
-        // Attach: discover the actual size via fstat.
-        int fd = ::shm_open(name.c_str(), O_RDWR, 0600);
-        if (fd == -1) {
-            throw std::system_error(errno, std::generic_category(),
-                "SharedMoveCache: shm_open(attach) failed for " + name);
-        }
-        struct stat st{};
-        if (::fstat(fd, &st) != 0) {
-            const int e = errno;
-            ::close(fd);
-            throw std::system_error(e, std::generic_category(),
-                "SharedMoveCache: fstat failed");
-        }
-        std::size_t bytes = static_cast<std::size_t>(st.st_size);
-        std::size_t entries = bytes / kBytesPerEntry;
-        if (entries < 2 || (entries & (entries - 1)) != 0) {
-            ::close(fd);
-            throw std::runtime_error(
-                "SharedMoveCache: existing segment has non-power-of-two size");
-        }
-        void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                         MAP_SHARED, fd, 0);
-        if (p == MAP_FAILED) {
-            const int e = errno;
-            ::close(fd);
-            throw std::system_error(e, std::generic_category(),
-                "SharedMoveCache: mmap failed (attach)");
-        }
-        table_       = reinterpret_cast<Entry*>(p);
-        num_entries_ = entries;
-        mask_        = static_cast<uint64_t>(entries - 1);
-        bytes_       = bytes;
-        shm_fd_      = fd;
-        is_creator_  = false;
-        (void)total_bytes;  // ignored on attach
-    }
-}
-
-SharedMoveCache::~SharedMoveCache() {
-    Close();
-}
-
-void SharedMoveCache::Close() {
-    if (closed_) return;
-    if (table_ != nullptr && bytes_ > 0) {
-        ::munmap(table_, bytes_);
-        table_ = nullptr;
-    }
-    if (shm_fd_ != -1) {
-        ::close(shm_fd_);
-        shm_fd_ = -1;
-    }
-    closed_ = true;
-}
-
-void SharedMoveCache::Unlink() {
-    if (!is_creator_) return;
-    ::shm_unlink(name_.c_str());
-}
-
-int SharedMoveCache::Get(uint64_t key) const {
-    ++probes_;
-    if (key == 0) return kNoMove;  // 0 reserved as empty sentinel
-    std::size_t idx = static_cast<std::size_t>(key & mask_);
-    for (int i = 0; i < kProbeMax; ++i) {
-        const uint64_t k = table_[idx].key.load(std::memory_order_relaxed);
-        if (k == key) {
-            const int32_t a = table_[idx].action.load(std::memory_order_relaxed);
-            ++hits_;
-            return static_cast<int>(a);
-        }
-        if (k == 0) return kNoMove;          // empty -> definite miss
-        idx = (idx + 1) & mask_;
-    }
-    return kNoMove;
-}
-
-void SharedMoveCache::Put(uint64_t key, int action) {
-    if (key == 0) return;
-    std::size_t idx = static_cast<std::size_t>(key & mask_);
-    for (int i = 0; i < kProbeMax; ++i) {
-        const uint64_t k = table_[idx].key.load(std::memory_order_relaxed);
-        if (k == 0 || k == key) {
-            // Write action BEFORE key. A torn reader that observes the
-            // new key with the old action gets a stale move (still
-            // legal-validated by the consumer); a reader that observes
-            // the old key with the new action gets a key mismatch and
-            // falls through.
-            table_[idx].action.store(static_cast<int32_t>(action),
-                                     std::memory_order_relaxed);
-            table_[idx].key.store(key, std::memory_order_relaxed);
-            ++stores_;
-            return;
-        }
-        idx = (idx + 1) & mask_;
-    }
-    ++store_misses_;  // bucket locally dense; skip
 }
 
 // =========================================================================

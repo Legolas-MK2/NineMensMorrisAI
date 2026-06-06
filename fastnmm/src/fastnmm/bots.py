@@ -139,7 +139,6 @@ class MinimaxBot(Bot):
         depth: int = 4,
         tt_bytes: int = _DEFAULT_TT_BYTES,
         strict_parity: bool = True,
-        root_cache: Optional["_core.SharedMoveCache"] = None,
         tiebreak_seed: Optional[int] = None,
     ):
         if depth < 1:
@@ -149,10 +148,6 @@ class MinimaxBot(Bot):
         self._tiebreak_seed = tiebreak_seed
         self._rng = random.Random(tiebreak_seed)
         self.engine = _core.MinimaxEngine(int(tt_bytes), bool(strict_parity))
-        if root_cache is not None:
-            self.engine.set_root_cache(root_cache)
-        # Hold a Python reference so the cache outlives the engine.
-        self._root_cache = root_cache
         self.last_search: Optional["_core.SearchResult"] = None
 
     def step(self, state: "_core.State") -> int:

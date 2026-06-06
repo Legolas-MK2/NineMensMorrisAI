@@ -57,21 +57,6 @@ class Config:
     # you observe high collision rates.
     minimax_tt_bytes_per_bot: int = 128 * 1024 * 1024
 
-    # Cross-worker SharedMoveCache (POSIX shm). One segment, attached by
-    # all 22 workers + the trainer. Stores Zobrist key -> last best
-    # action chosen at that position. Used for move-ordering hints at
-    # the search root: if any worker has searched this position before,
-    # the cached move is tried first (alpha-beta benefits when the
-    # first move is the best one).
-    #
-    # 16 bytes/entry. Tradeoff: bigger = more positions remembered, but
-    # /dev/shm must accommodate it (typically 50% of physical RAM by
-    # default; raise via `mount -o remount,size=128G /dev/shm`).
-    #
-    # Set move_cache_bytes <= 0 to disable.
-    move_cache_name: str = "/nmm_shared_move_cache"
-    move_cache_bytes: int = 4 * 1024 * 1024 * 1024  # 4 GiB -> ~256 M entries
-    
     # Observation shape from pyspiel (set at runtime, e.g. [5, 7, 7] for nine_mens_morris)
     # Channel 0 = player 0 pieces, Channel 1 = player 1 pieces, rest = game state
     obs_shape: Optional[List[int]] = None
@@ -83,7 +68,7 @@ class Config:
     dropout: float = 0.05
     
     # PPO hyperparameters
-    gamma: float = 0.96
+    gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.12
     max_grad_norm: float = 0.5
@@ -123,7 +108,6 @@ class Config:
     save_interval: int = 100_000
     eval_interval: int = 50_000
     eval_games: int = 200
-    graduation_check_interval: int = 5_000  # Check graduation/promotion every N episodes
 
     # LR scheduler — warmup + warm-restart cosine, driven by PPO updates.
     # Peak LR after warmup. Cosine each cycle anneals from this down to lr_min.
@@ -135,7 +119,7 @@ class Config:
     # until a phase-graduation or clone-replacement reset event.
     lr_cycle_t_max_episodes: int = 40_000_000
     # On phase graduation: peak <- peak * lr_phase_reset_factor, fresh cycle.
-    lr_phase_reset_factor: float = 0.7
+    lr_phase_reset_factor: float = 0.8
     # On clone replacement: lr <- min(lr_peak, current_lr * lr_clone_bump_factor),
     # fresh cycle from the bumped lr.
     lr_clone_bump_factor: float = 1.3
@@ -157,6 +141,16 @@ class Config:
     # from PPO training (still played + counted for stats / depth-unlock).
     random_train_cutoff: float = 0.90
     minimax_train_cutoff: float = 0.90
+
+    # Self-play PPO pause: when wr_vs_self exceeds this threshold at a log
+    # tick, self-play experiences stop feeding PPO for `selfplay_train_pause_episodes`
+    # episodes. Games keep playing (results still hit results_vs_self), so the
+    # WR keeps refreshing — if it's still above the threshold at the next log
+    # tick, the pause extends. Different from random/minimax cutoffs: those use
+    # a hard WR comparison every batch; this uses a time window so we don't
+    # bounce in-and-out on noise near the threshold.
+    selfplay_train_pause_threshold: float = 0.95
+    selfplay_train_pause_episodes: int = 500_000  # 10 log cycles @ 25k each
 
     # Webserver model file size limit (bytes). Files larger than this in
     # the auto-discovered model directories are ignored as likely
