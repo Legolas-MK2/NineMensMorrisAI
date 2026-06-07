@@ -39,7 +39,7 @@ class _RandomizedMinimaxBot:
     per-process TT.
     """
 
-    def __init__(self, depth: int, random_move_prob: float = 0.3,
+    def __init__(self, depth: int, random_move_prob: float = 0.0,
                  player_id: int = 0,
                  tt_bytes: int = _DEFAULT_TT_BYTES_PER_BOT):
         self.depth = int(depth)
@@ -70,7 +70,7 @@ class MinimaxBotPool:
     def get(self, depth: int) -> _RandomizedMinimaxBot:
         if depth not in self._bots:
             self._bots[depth] = _RandomizedMinimaxBot(
-                depth=depth, random_move_prob=0.3,
+                depth=depth, random_move_prob=0.0,
                 tt_bytes=self._tt_bytes,
             )
         return self._bots[depth]
@@ -115,7 +115,7 @@ class EnvState:
             self.minimax_bot = bot_pool.get(minimax_depth)
         elif opponent_type == 'minimax':
             self.minimax_bot = _RandomizedMinimaxBot(
-                depth=minimax_depth, random_move_prob=0.3,
+                depth=minimax_depth, random_move_prob=0.0,
             )
         else:
             self.minimax_bot = None

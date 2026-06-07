@@ -391,9 +391,18 @@
                 </div>
             </div>
 
-            <div class="minimax-options">
-                <label for="prepare-moves">Prepare Moves (random moves before play)</label>
-                <input type="number" id="prepare-moves" min="0" max="150" value="30" step="1">
+            <div class="player-config">
+                <h3 style="margin-top: 10px;">Starting Stones</h3>
+                <div style="display: flex; gap: 10px;">
+                    <div style="flex: 1;">
+                        <label for="starting-stones-p0">Player 1 (White)</label>
+                        <input type="number" id="starting-stones-p0" min="1" max="9" value="9" step="1">
+                    </div>
+                    <div style="flex: 1;">
+                        <label for="starting-stones-p1">Player 2 (Black)</label>
+                        <input type="number" id="starting-stones-p1" min="1" max="9" value="9" step="1">
+                    </div>
+                </div>
             </div>
 
             <button class="btn-primary" onclick="newGame()">New Game</button>
@@ -933,7 +942,8 @@
                     player1_type: document.getElementById('player1-type').value,
                     player1_model: document.getElementById('player1-model').value,
                     player1_depth: parseInt(document.getElementById('player1-depth').value),
-                    prepare_moves: parseInt(document.getElementById('prepare-moves').value) || 0
+                    starting_stones_p0: parseInt(document.getElementById('starting-stones-p0').value) || 9,
+                    starting_stones_p1: parseInt(document.getElementById('starting-stones-p1').value) || 9,
                 };
 
                 const response = await fetch('/api/new_game', {

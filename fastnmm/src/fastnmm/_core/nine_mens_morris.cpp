@@ -632,9 +632,14 @@ int RandomAction(const State& s, uint64_t& rng) {
 //
 // Score is from the perspective of the *current* player of `s`.
 // Components (all differences are own - opponent):
-//   material      (10 * diff)  -- on-board + unplaced pieces
-//   mills         ( 3 * diff)  -- completed 3-in-a-row lines
-//   mobility      ( 1 * diff)  -- number of legal moves (approx)
+//   material      -- on-board + unplaced pieces
+//   mills         -- completed 3-in-a-row lines
+//   open_mills    -- mill threats (2-own + reachable empty slot)
+//   double_mill   -- bonus when multiple simultaneous threats exist
+//   blocked       -- own pieces with zero legal moves (moving phase only)
+//   mobility      -- number of legal moves (approx)
+// Weights shift in the flying endgame so mill threats dominate over
+// raw mobility (which is meaningless when a piece can jump anywhere).
 // Terminal wins return kWinScore; terminal losses return -kWinScore.
 // Draws return 0.
 // -----------------------------------------------------------------------
@@ -670,19 +675,140 @@ int ApproxMobility(const State& s, int player) {
     }
     return mob;
 }
+
+// Count "open mill" threats for `player`: mill lines with 2 own stones,
+// zero opponent stones, and an empty third slot reachable in one move.
+//   - Placing phase: any empty slot is reachable (drop a stone there).
+//   - Flying phase:  any empty slot is reachable (jump any own piece).
+//   - Moving phase:  empty slot must be adjacent to an own piece that is
+//                    not already inside this mill line.
+int CountOpenMills(const State& s, int player) {
+    const BitBoard own = s.Board(player);
+    const BitBoard opp = s.Board(1 - player);
+    const BitBoard occ = own | opp;
+    const BitBoard empty = (~occ) & kFullBoard;
+
+    const bool placing = s.MenToDeploy(player) > 0;
+    const bool flying  = (s.MenOnBoard(player) == 3) && !placing;
+    const bool easy_reach = placing || flying;
+
+    int threats = 0;
+    for (int i = 0; i < 16; ++i) {
+        const BitBoard m = kMillMasks[i];
+        const BitBoard own_in_line = own & m;
+        if (PopCount(own_in_line) != 2) continue;
+        if ((opp & m) != 0) continue;
+        const BitBoard slot = m & empty;
+        if (!slot) continue;
+        if (easy_reach) {
+            ++threats;
+        } else {
+            const int empty_pos = __builtin_ctz(slot);
+            const BitBoard movers = kAdjacency[empty_pos] & own & ~m;
+            if (movers) ++threats;
+        }
+    }
+    return threats;
+}
+
+// Count "mill blocks": mill lines that hold exactly 2 opponent stones
+// and 1 own stone. That own stone is the only thing preventing the
+// opponent from forming the mill -- defensively very valuable.
+int CountMillBlocks(const State& s, int player) {
+    const BitBoard own = s.Board(player);
+    const BitBoard opp = s.Board(1 - player);
+    int count = 0;
+    for (int i = 0; i < 16; ++i) {
+        const BitBoard m = kMillMasks[i];
+        if (PopCount(opp & m) == 2 && PopCount(own & m) == 1) ++count;
+    }
+    return count;
+}
+
+// Count "running mill" / swing-mill setups: pieces sitting inside a
+// completed own mill that can be moved into an empty adjacent slot
+// forming a *different* own mill. Each swing captures, so this pattern
+// is a sustained threat -- far stronger than a one-shot mill.
+//
+// Only meaningful in the moving phase: in placing phase there are no
+// "moves yet"; in flying phase every piece reaches every empty cell so
+// the basic open-mill count already captures the threat.
+int CountRunningMills(const State& s, int player) {
+    const bool placing = s.MenToDeploy(player) > 0;
+    const bool flying  = (s.MenOnBoard(player) == 3) && !placing;
+    if (placing || flying) return 0;
+
+    const BitBoard own = s.Board(player);
+    const BitBoard occ = own | s.Board(1 - player);
+    const BitBoard empty = (~occ) & kFullBoard;
+
+    // Pieces currently inside a completed own mill.
+    BitBoard in_mill = 0;
+    for (int i = 0; i < 16; ++i) {
+        const BitBoard m = kMillMasks[i];
+        if ((own & m) == m) in_mill |= m;
+    }
+
+    int count = 0;
+    BitBoard pieces = in_mill;
+    while (pieces) {
+        const int pos = __builtin_ctz(pieces);
+        pieces &= pieces - 1;
+        BitBoard targets = kAdjacency[pos] & empty;
+        while (targets) {
+            const int to = __builtin_ctz(targets);
+            targets &= targets - 1;
+            // Does moving `pos` -> `to` form a mill not containing `pos`?
+            // Two candidate mills for `to`; skip the one containing `pos`.
+            const BitBoard m1 = kPosMill1[to];
+            const BitBoard m2 = kPosMill2[to];
+            const BitBoard piece_bit = 1u << pos;
+            const BitBoard to_bit    = 1u << to;
+            const BitBoard own_minus = own & ~piece_bit;
+            bool swings = false;
+            if (m1 && !(m1 & piece_bit)) {
+                if (((own_minus | to_bit) & m1) == m1) swings = true;
+            }
+            if (!swings && m2 && !(m2 & piece_bit)) {
+                if (((own_minus | to_bit) & m2) == m2) swings = true;
+            }
+            if (swings) { ++count; break; }
+        }
+    }
+    return count;
+}
+
+// Count own pieces that have no legal move (all adjacent squares
+// occupied). Only meaningful in the moving phase -- flying pieces are
+// never blocked, and placing-phase pieces can still be added elsewhere.
+int CountBlockedPieces(const State& s, int player) {
+    const bool placing = s.MenToDeploy(player) > 0;
+    const bool flying  = (s.MenOnBoard(player) == 3) && !placing;
+    if (placing || flying) return 0;
+
+    const BitBoard own   = s.Board(player);
+    const BitBoard occ   = own | s.Board(1 - player);
+    const BitBoard empty = (~occ) & kFullBoard;
+
+    int blocked = 0;
+    BitBoard pieces = own;
+    while (pieces) {
+        const int pos = __builtin_ctz(pieces);
+        pieces &= pieces - 1;
+        if ((kAdjacency[pos] & empty) == 0) ++blocked;
+    }
+    return blocked;
+}
+
+inline bool IsFlying(const State& s, int player) {
+    return (s.MenOnBoard(player) == 3) && (s.MenToDeploy(player) == 0);
+}
 }  // namespace
 
 int Evaluate(const State& s) {
     if (s.IsTerminal()) {
         const int w = s.Winner();
         if (w == 2) return 0;  // draw
-        // Evaluate from perspective of the player "to move" even when
-        // terminal (no one is to move, but we still return a signed score).
-        // After terminal the current_player is TerminalPlayer; fall back
-        // to last mover being the OPPONENT of the one who would move next.
-        // Simplest: the winner gets +kWinScore regardless of current_player.
-        // Callers only use Evaluate at the root / internal nodes via
-        // negamax, which passes them before a node becomes terminal.
         return kWinScore;  // unused from search; see MinimaxSearch.
     }
     const int cp  = s.CurrentPlayer();
@@ -694,12 +820,107 @@ int Evaluate(const State& s) {
     const int own_mills = MillCount(s, cp);
     const int opp_mills = MillCount(s, opp);
 
+    const int own_open = CountOpenMills(s, cp);
+    const int opp_open = CountOpenMills(s, opp);
+
+    const int own_run = CountRunningMills(s, cp);
+    const int opp_run = CountRunningMills(s, opp);
+
+    const int own_mblk = CountMillBlocks(s, cp);
+    const int opp_mblk = CountMillBlocks(s, opp);
+
+    const int own_blocked = CountBlockedPieces(s, cp);
+    const int opp_blocked = CountBlockedPieces(s, opp);
+
     const int own_mob = ApproxMobility(s, cp);
     const int opp_mob = ApproxMobility(s, opp);
 
-    return 10 * (own_material - opp_material)
-         +  3 * (own_mills    - opp_mills)
-         +  1 * (own_mob      - opp_mob);
+    const bool endgame = IsFlying(s, cp) || IsFlying(s, opp);
+
+    // Phase-dependent weights. In the flying endgame, mill threats
+    // dominate and adjacency-based mobility is meaningless.
+    const int W_MAT  = endgame ? 14 :  8;
+    const int W_MILL = endgame ? 22 : 18;
+    const int W_OPEN = endgame ? 22 : 14;
+    const int W_RUN  = 30;     // running mill (every-turn capture pattern)
+    const int W_DBL  = 28;     // each additional simultaneous threat
+    const int W_MBLK = 10;     // mill block (own stone interrupting opp mill)
+    const int W_BLK  = endgame ?  0 : 10;
+    const int W_MOB  = endgame ?  0 :  1;
+
+    // Running mills also count toward the simultaneous-threat tally so
+    // a "mill + running mill" position trips the double-mill bonus.
+    const int own_eff = own_open + own_run;
+    const int opp_eff = opp_open + opp_run;
+    const int own_double = (own_eff >= 2) ? (own_eff - 1) * W_DBL : 0;
+    const int opp_double = (opp_eff >= 2) ? (opp_eff - 1) * W_DBL : 0;
+
+    return W_MAT  * (own_material - opp_material)
+         + W_MILL * (own_mills    - opp_mills)
+         + W_OPEN * (own_open     - opp_open)
+         + W_RUN  * (own_run      - opp_run)
+         +          (own_double   - opp_double)
+         + W_MBLK * (own_mblk     - opp_mblk)
+         - W_BLK  * (own_blocked  - opp_blocked)
+         + W_MOB  * (own_mob      - opp_mob);
+}
+
+EvalBreakdown EvaluateBreakdown(const State& s) {
+    EvalBreakdown b{};
+    b.current_player = s.IsTerminal() ? -1 : s.CurrentPlayer();
+    if (s.IsTerminal()) {
+        b.total = Evaluate(s);
+        return b;
+    }
+    const int cp  = s.CurrentPlayer();
+    const int opp = 1 - cp;
+
+    b.own_material = s.MenOnBoard(cp)  + s.MenToDeploy(cp);
+    b.opp_material = s.MenOnBoard(opp) + s.MenToDeploy(opp);
+    b.own_mills    = MillCount(s, cp);
+    b.opp_mills    = MillCount(s, opp);
+    b.own_open_mills = CountOpenMills(s, cp);
+    b.opp_open_mills = CountOpenMills(s, opp);
+    b.own_running_mills = CountRunningMills(s, cp);
+    b.opp_running_mills = CountRunningMills(s, opp);
+    b.own_mill_blocks   = CountMillBlocks(s, cp);
+    b.opp_mill_blocks   = CountMillBlocks(s, opp);
+    b.own_blocked  = CountBlockedPieces(s, cp);
+    b.opp_blocked  = CountBlockedPieces(s, opp);
+    b.own_mobility = ApproxMobility(s, cp);
+    b.opp_mobility = ApproxMobility(s, opp);
+
+    b.endgame = IsFlying(s, cp) || IsFlying(s, opp);
+
+    b.w_material      = b.endgame ? 14 :  8;
+    b.w_mill          = b.endgame ? 22 : 18;
+    b.w_open_mill     = b.endgame ? 22 : 14;
+    b.w_running_mill  = 30;
+    b.w_double_mill   = 28;
+    b.w_mill_block    = 10;
+    b.w_blocked       = b.endgame ?  0 : 10;
+    b.w_mobility      = b.endgame ?  0 :  1;
+
+    const int own_eff = b.own_open_mills + b.own_running_mills;
+    const int opp_eff = b.opp_open_mills + b.opp_running_mills;
+    const int own_double = (own_eff >= 2)
+        ? (own_eff - 1) * b.w_double_mill : 0;
+    const int opp_double = (opp_eff >= 2)
+        ? (opp_eff - 1) * b.w_double_mill : 0;
+
+    b.material_score      = b.w_material     * (b.own_material      - b.opp_material);
+    b.mill_score          = b.w_mill         * (b.own_mills         - b.opp_mills);
+    b.open_mill_score     = b.w_open_mill    * (b.own_open_mills    - b.opp_open_mills);
+    b.running_mill_score  = b.w_running_mill * (b.own_running_mills - b.opp_running_mills);
+    b.double_mill_score   = own_double - opp_double;
+    b.mill_block_score    = b.w_mill_block   * (b.own_mill_blocks   - b.opp_mill_blocks);
+    b.blocked_score       = -b.w_blocked     * (b.own_blocked       - b.opp_blocked);
+    b.mobility_score      = b.w_mobility     * (b.own_mobility      - b.opp_mobility);
+
+    b.total = b.material_score + b.mill_score + b.open_mill_score
+            + b.running_mill_score + b.double_mill_score
+            + b.mill_block_score + b.blocked_score + b.mobility_score;
+    return b;
 }
 
 // -----------------------------------------------------------------------

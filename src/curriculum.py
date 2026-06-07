@@ -566,12 +566,18 @@ class MixedTrainingState:
         history = self.minimax_wr_history_by_depth.get(depth)
         return 0 if history is None else len(history)
 
-    def update_dampened_state(self) -> None:
+    def update_dampened_state(self, opp_wr: Dict[str, float]) -> None:
         """Refresh hysteresis flags for minimax depths AND random.
 
-        A slot becomes dampened once WR >= dominate_threshold over at
-        least dominate_min_games games. It stays dampened until WR drops
-        below dominate_recover; the gap prevents flapping at the boundary.
+        Reads WR values directly from `opp_wr` — the same dict the trainer
+        logs each tick (`wr_vs_mm_d{d}`, `wr_vs_random`). The dampener
+        decision now consumes the value that was just logged, so
+        "logs WR >= 90%" and "fires the >= 90% protocol" stay in lockstep.
+
+        Called by the trainer once per log_interval (alongside the other
+        slow-signal checks), not on every game. A slot becomes dampened
+        once WR >= dominate_threshold over at least dominate_min_games
+        games; it stays dampened until WR drops below dominate_recover.
         Slots with too few games to judge keep their previous flag.
 
         Self-play uses a TIMED scheme (`selfplay_train_cooldown_until`) and
@@ -586,7 +592,7 @@ class MixedTrainingState:
             n_games = len(deq) if deq is not None else 0
             if n_games < min_games:
                 continue
-            wr = self.get_win_rate_vs_opponent('minimax', d)
+            wr = opp_wr.get(f'wr_vs_mm_d{d}', 0.0)
             if not self.minimax_depth_dominated[d]:
                 if wr >= threshold:
                     self.minimax_depth_dominated[d] = True
@@ -605,7 +611,7 @@ class MixedTrainingState:
                     )
 
         if len(self.results_vs_random) >= min_games:
-            wr_random = self.get_win_rate_vs_opponent('random')
+            wr_random = opp_wr.get('wr_vs_random', 0.0)
             if not self.random_dominated:
                 if wr_random >= threshold:
                     self.random_dominated = True
@@ -623,11 +629,6 @@ class MixedTrainingState:
                         wr_random * 100, recover * 100,
                     )
 
-    # Back-compat alias — older trainer paths still call the old name.
-    def update_minimax_dominated_state(self) -> Dict[int, bool]:
-        self.update_dampened_state()
-        return dict(self.minimax_depth_dominated)
-
     def is_selfplay_dampened(self) -> bool:
         """Self-play is dampened while inside the timed cooldown window."""
         return self.total_episodes < self.selfplay_train_cooldown_until
@@ -635,11 +636,12 @@ class MixedTrainingState:
     def get_dampened_set(self) -> Set[str]:
         """Return the set of slot keys currently pinned at `dampen_cap`.
 
-        Refreshes the hysteresis flags first so the answer is current.
-        Keys match the slot-name convention used by
-        `compute_opponent_distribution`: 'self', 'random', 'minimax_d{d}'.
+        Reads the cached hysteresis flags — does NOT re-evaluate them.
+        The trainer refreshes flags once per `log_interval` via
+        `update_dampened_state`; calling on every game would flap the flags
+        at the boundary and spam the log. Keys match the slot-name convention
+        used by `compute_opponent_distribution`: 'self', 'random', 'minimax_d{d}'.
         """
-        self.update_dampened_state()
         dampened: Set[str] = set()
         if self.random_dominated:
             dampened.add('random')
@@ -1061,13 +1063,7 @@ class CurriculumManager:
         if stats.episodes_in_phase < GRADUATION_CONFIG['min_episodes']:
             return False
 
-        # Condition 3: competence at the hardest currently-unlocked opponent.
-        top_depth = ms.active_minimax_max_depth
-        wr_top = ms.get_win_rate_vs_opponent('minimax', top_depth)
-        if wr_top < GRADUATION_CONFIG['min_wr_top_depth']:
-            return False
-
-        # Conditions 4 & 5: every unlocked depth has plateaued and has enough
+        # Conditions 3 & 4: every unlocked depth has plateaued and has enough
         # samples in its window.
         return self._has_plateaued()
 

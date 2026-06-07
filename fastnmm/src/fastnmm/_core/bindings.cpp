@@ -208,6 +208,48 @@ PYBIND11_MODULE(_core, m) {
           "Static heuristic value of `state` from its current player's "
           "perspective. Does not search.");
 
+    py::class_<EvalBreakdown>(m, "EvalBreakdown",
+        "Detailed breakdown of the static evaluation. All `own_*` / "
+        "`opp_*` fields are *raw counts* from the current-player and "
+        "opponent perspective. The `*_score` fields are signed and sum "
+        "to `total` (== Evaluate(state)).")
+        .def_readonly("current_player",     &EvalBreakdown::current_player)
+        .def_readonly("endgame",            &EvalBreakdown::endgame)
+        .def_readonly("own_material",       &EvalBreakdown::own_material)
+        .def_readonly("opp_material",       &EvalBreakdown::opp_material)
+        .def_readonly("own_mills",          &EvalBreakdown::own_mills)
+        .def_readonly("opp_mills",          &EvalBreakdown::opp_mills)
+        .def_readonly("own_open_mills",     &EvalBreakdown::own_open_mills)
+        .def_readonly("opp_open_mills",     &EvalBreakdown::opp_open_mills)
+        .def_readonly("own_running_mills",  &EvalBreakdown::own_running_mills)
+        .def_readonly("opp_running_mills",  &EvalBreakdown::opp_running_mills)
+        .def_readonly("own_mill_blocks",    &EvalBreakdown::own_mill_blocks)
+        .def_readonly("opp_mill_blocks",    &EvalBreakdown::opp_mill_blocks)
+        .def_readonly("own_blocked",        &EvalBreakdown::own_blocked)
+        .def_readonly("opp_blocked",        &EvalBreakdown::opp_blocked)
+        .def_readonly("own_mobility",       &EvalBreakdown::own_mobility)
+        .def_readonly("opp_mobility",       &EvalBreakdown::opp_mobility)
+        .def_readonly("w_material",         &EvalBreakdown::w_material)
+        .def_readonly("w_mill",             &EvalBreakdown::w_mill)
+        .def_readonly("w_open_mill",        &EvalBreakdown::w_open_mill)
+        .def_readonly("w_running_mill",     &EvalBreakdown::w_running_mill)
+        .def_readonly("w_double_mill",      &EvalBreakdown::w_double_mill)
+        .def_readonly("w_mill_block",       &EvalBreakdown::w_mill_block)
+        .def_readonly("w_blocked",          &EvalBreakdown::w_blocked)
+        .def_readonly("w_mobility",         &EvalBreakdown::w_mobility)
+        .def_readonly("material_score",     &EvalBreakdown::material_score)
+        .def_readonly("mill_score",         &EvalBreakdown::mill_score)
+        .def_readonly("open_mill_score",    &EvalBreakdown::open_mill_score)
+        .def_readonly("running_mill_score", &EvalBreakdown::running_mill_score)
+        .def_readonly("double_mill_score",  &EvalBreakdown::double_mill_score)
+        .def_readonly("mill_block_score",   &EvalBreakdown::mill_block_score)
+        .def_readonly("blocked_score",      &EvalBreakdown::blocked_score)
+        .def_readonly("mobility_score",     &EvalBreakdown::mobility_score)
+        .def_readonly("total",              &EvalBreakdown::total);
+
+    m.def("evaluate_breakdown", &EvaluateBreakdown, py::arg("state"),
+          "Return the per-component breakdown of the static evaluation.");
+
     // Pure-C++ random rollouts (releases the GIL so callers can parallelise).
     m.def(
         "random_playouts",

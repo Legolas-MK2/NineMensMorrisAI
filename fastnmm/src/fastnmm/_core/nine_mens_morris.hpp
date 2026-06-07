@@ -165,6 +165,47 @@ SearchResult MinimaxSearch(const State& s, int depth);
 // Static evaluation heuristic (from perspective of `s.CurrentPlayer()`).
 int Evaluate(const State& s);
 
+// Detailed breakdown of the evaluation, useful for debugging dashboards.
+// All counts are *own minus opponent* differentials from the perspective
+// of `s.CurrentPlayer()`. Weighted contributions sum to `total` (which
+// matches `Evaluate(s)` for non-terminal states).
+struct EvalBreakdown {
+    int own_material;
+    int opp_material;
+    int own_mills;
+    int opp_mills;
+    int own_open_mills;
+    int opp_open_mills;
+    int own_running_mills;
+    int opp_running_mills;
+    int own_mill_blocks;
+    int opp_mill_blocks;
+    int own_blocked;
+    int opp_blocked;
+    int own_mobility;
+    int opp_mobility;
+    int w_material;
+    int w_mill;
+    int w_open_mill;
+    int w_running_mill;
+    int w_double_mill;
+    int w_mill_block;
+    int w_blocked;
+    int w_mobility;
+    int material_score;
+    int mill_score;
+    int open_mill_score;
+    int running_mill_score;
+    int double_mill_score;
+    int mill_block_score;
+    int blocked_score;
+    int mobility_score;
+    int total;
+    bool endgame;
+    int current_player;
+};
+EvalBreakdown EvaluateBreakdown(const State& s);
+
 // =========================================================================
 // MinimaxEngine: persistent transposition-table-backed alpha-beta.
 //

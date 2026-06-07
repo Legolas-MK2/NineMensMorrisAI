@@ -249,25 +249,31 @@ def api_new_game():
 
     # Initialize new game
     game_state = GameState()
-    game_state.state = GAME.new_initial_state()
 
-    # Configure players
-    game_state.player_types[0] = config.get('player0_type', 'human')
-    game_state.player_types[1] = config.get('player1_type', 'ai')
-    game_state.player_minimax_depth[0] = config.get('player0_depth', 3)
-    game_state.player_minimax_depth[1] = config.get('player1_depth', 3)
+    ss0 = int(config.get('starting_stones_p0', 9) or 9)
+    ss1 = int(config.get('starting_stones_p1', 9) or 9)
+    ss0 = max(1, min(9, ss0))
+    ss1 = max(1, min(9, ss1))
+    game_state.state = GAME.new_initial_state(starting_stones=(ss0, ss1))
 
-    # Prepare board with random moves to produce a mid-game position.
-    prepare_moves = int(config.get('prepare_moves', 0) or 0)
-    if prepare_moves > 0:
+    # Pre-place stones on the board via random placement moves when fewer
+    # than 9 stones are set (skips placement phase for those stones).
+    # Default 9/9 = normal placement game, no pre-placement.
+    if ss0 < 9 or ss1 < 9:
         state = game_state.state
-        for _ in range(prepare_moves):
+        for _ in range(ss0 + ss1):
             if state.is_terminal():
                 break
             legal = state.legal_actions()
             if not legal:
                 break
             state.apply_action(random.choice(legal))
+
+    # Configure players
+    game_state.player_types[0] = config.get('player0_type', 'human')
+    game_state.player_types[1] = config.get('player1_type', 'ai')
+    game_state.player_minimax_depth[0] = config.get('player0_depth', 3)
+    game_state.player_minimax_depth[1] = config.get('player1_depth', 3)
 
     # Load AI models if needed
     models = get_available_models()

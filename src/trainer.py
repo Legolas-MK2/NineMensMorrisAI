@@ -1095,7 +1095,8 @@ class PPOTrainer:
                         # configured window. Updated BEFORE the distribution
                         # broadcast so the new dampened state is reflected.
                         ms = self.curriculum.mixed_state
-                        wr_self = ms.get_win_rate_vs_opponent('self')
+                        opp_wr = self.curriculum.get_opponent_win_rates()
+                        wr_self = opp_wr['wr_vs_self']
                         if wr_self > cfg.selfplay_train_pause_threshold:
                             ms.selfplay_train_cooldown_until = (
                                 ms.total_episodes + cfg.selfplay_train_pause_episodes
@@ -1107,6 +1108,11 @@ class PPOTrainer:
                                 f"pinning self-play sampling at 1% and "
                                 f"dropping it from PPO for next {remaining:,} eps."
                             )
+                        # Re-evaluate minimax/random dampener flags on the
+                        # log cadence, consuming the same opp_wr the logger
+                        # just emitted so "log says WR >= 90%" and "fire the
+                        # 90% protocol" are the same event.
+                        ms.update_dampened_state(opp_wr)
                         self._broadcast_opponent_distribution()
                     self.curriculum.check_and_graduate()
 
