@@ -54,7 +54,7 @@ class PhaseConfig:
     win_reward_base: float = 2.0
     win_reward_speed_bonus: float = 1.0
     loss_reward: float = -2.0
-    draw_penalty: float = -1.5
+    draw_penalty: float = -1.8
 
     # Base shaping intensity per phase (further reduced by schedule)
     shaping_multiplier: float = 0.0
@@ -94,12 +94,9 @@ MIXED_CONFIG = {
     # clone before making a new one.
     'selfplay_clone_cooldown_episodes': 200_000,
 
-    # Minimax depth range — gradual unlock from D1 up to D5 based on win rate.
-    # D6 and D7 are intentionally NOT used as training opponents (too slow /
-    # too strong to be useful gradient signal). WR vs D6/D7 is still tracked
-    # and logged via the evaluation pass.
+    # Minimax depth range — gradual unlock from D1 up to D7 based on win rate
     'minimax_min_depth': 1,
-    'minimax_max_depth': 5,  # D1-D5 used for training; D6/D7 are eval/log only
+    'minimax_max_depth': 7,  # D1-D7, unlocked progressively
 
     # Minimax depth unlock: unlock next depth when WR vs current >= 50% over 100 games
     'minimax_depth_unlock_threshold': 0.50,
@@ -1217,8 +1214,8 @@ class CurriculumManager:
         min_games = MIXED_CONFIG['minimax_depth_unlock_min_games']
 
         current_max = ms.active_minimax_max_depth
-        if current_max >= MIXED_CONFIG['minimax_max_depth']:
-            return False  # Already at training-side maximum (D5)
+        if current_max >= 7:
+            return False  # Already at maximum
 
         results = ms._depth_results_deque(current_max)
         if results is None or len(results) < min_games:
@@ -1246,11 +1243,7 @@ class CurriculumManager:
         if self.current_phase == Phase.PHASE_1:
             unlocked: List[int] = []
         else:
-            # Clamp to the training-side cap so a checkpoint that previously
-            # unlocked D6/D7 keeps them out of the sampling pool.
-            train_cap = MIXED_CONFIG['minimax_max_depth']
-            active_max = min(self.mixed_state.active_minimax_max_depth, train_cap)
-            unlocked = list(range(1, active_max + 1))
+            unlocked = list(range(1, self.mixed_state.active_minimax_max_depth + 1))
         dampened = self.mixed_state.get_dampened_set()
         return compute_opponent_distribution(
             unlocked,

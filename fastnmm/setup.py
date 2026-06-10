@@ -11,7 +11,13 @@ ext_modules = [
         ],
         include_dirs=["src/fastnmm/_core"],
         cxx_std=17,
-        extra_compile_args=["-O3", "-funroll-loops", "-fvisibility=hidden"],
+        extra_compile_args=[
+            "-O3",
+            "-funroll-loops",
+            "-fvisibility=hidden",
+            "-pthread",
+        ],
+        extra_link_args=["-pthread"],
     ),
 ]
 

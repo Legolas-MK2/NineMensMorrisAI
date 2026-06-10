@@ -42,7 +42,7 @@ import fastnmm
 
 from model import ActorCritic
 from config import Config
-from utils import get_legal_mask, relativize_obs
+from utils import get_legal_mask, build_token_obs
 from minimax import MinimaxBot
 from board_utils import (
     POINT_TO_COORD, POSITION_NAMES, MILLS,
@@ -251,11 +251,13 @@ def get_opponent_move(state, opponent_type: str,
         return _minimax_bots[depth].get_action(state, use_iterative=True)
     if opponent_type == "ppo" and model_path:
         model = load_model(model_path)
-        obs   = torch.from_numpy(relativize_obs(state, opponent_player)).unsqueeze(0).to(DEVICE)
+        node_feats, global_feats = build_token_obs(state, opponent_player)
+        node_t = torch.from_numpy(node_feats).unsqueeze(0).to(DEVICE)
+        glob_t = torch.from_numpy(global_feats).unsqueeze(0).to(DEVICE)
         mask  = torch.tensor(get_legal_mask(state, NUM_ACTIONS),
                              dtype=torch.float32).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
-            logits, _ = model(obs)
+            logits, _ = model(node_t, glob_t)
             logits = logits.float()
             logits[mask == 0] = -1e9
             return int(logits.argmax(dim=-1).item())

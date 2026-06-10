@@ -22,12 +22,7 @@ from config import Config
 from model import ActorCritic
 from utils import (
     get_legal_mask, count_pieces_from_state, extract_state_features,
-    compute_gae, ExperienceBatch, RewardCalculator, relativize_obs,
-    build_token_obs,
-)
-from symmetry import (
-    AUTOMORPHISMS, ACT_PERM, ACT_PERM_INV,
-    permute_token_obs, permute_mask,
+    compute_gae, ExperienceBatch, RewardCalculator, relativize_obs
 )
 
 import fastnmm
@@ -110,12 +105,6 @@ class EnvState:
         # Async minimax state
         self.pending_minimax: Optional[Future] = None
 
-        # Board-symmetry augmentation frame for this game. Redrawn per game in
-        # 'game' granularity; redrawn per AI decision in 'step' granularity.
-        # 0 = identity (canonical frame). Worker rollout decides whether to
-        # actually apply it via config.use_symmetry_aug.
-        self.sigma_idx: int = random.randrange(len(AUTOMORPHISMS))
-
     def setup_opponent(self, opponent_type: str, minimax_depth: int = 1,
                        bot_pool: 'MinimaxBotPool' = None):
         """Configure opponent for this game."""
@@ -150,19 +139,22 @@ def get_opponent_action(env: EnvState, state, num_actions: int, clone_model: Opt
 
 
 def get_clone_action(state, num_actions: int, clone_model: ActorCritic) -> int:
-    """Get action from clone model (canonical frame, never augmented)."""
+    """Get action from clone model."""
+    legal_actions = state.legal_actions()
     current_player = state.current_player()
 
-    node_feats, global_feats = build_token_obs(state, current_player)
-    node_t = torch.from_numpy(node_feats).unsqueeze(0)
-    glob_t = torch.from_numpy(global_feats).unsqueeze(0)
-    mask = torch.from_numpy(get_legal_mask(state, num_actions)).unsqueeze(0)
+    obs_arr = relativize_obs(state, current_player)
+    obs = torch.from_numpy(obs_arr).unsqueeze(0)
+    mask = torch.tensor(
+        get_legal_mask(state, num_actions),
+        dtype=torch.float32
+    ).unsqueeze(0)
 
     with torch.no_grad():
-        logits, _ = clone_model(node_t, glob_t)
+        logits, _ = clone_model(obs)
         masked = logits.squeeze(0).float()
         masked[mask.squeeze(0) == 0] = -1e9
-        action = int(masked.argmax().item())
+        action = masked.argmax().item()
 
     return action
 
@@ -351,33 +343,6 @@ def worker_process(
     minimax_thread_count = max(1, int(getattr(config, "minimax_threads_per_worker", 2)))
     minimax_executor = ThreadPoolExecutor(max_workers=minimax_thread_count)
 
-    use_sym_aug = bool(getattr(config, 'use_symmetry_aug', False))
-    aug_step = use_sym_aug and getattr(config, 'aug_granularity', 'game') == 'step'
-    n_sigmas = len(AUTOMORPHISMS)
-
-    def build_ai_obs_mask(env: EnvState, state, player: int):
-        """Build (node_feats, global_feats, mask) for an AI decision, possibly in frame sigma.
-
-        Returns (node_feats, global_feats, mask, sigma_idx). When augmentation is
-        off, sigma_idx == 0 and tensors are canonical. global_feats is symmetry-
-        invariant and never permuted.
-        """
-        node_feats, global_feats = build_token_obs(state, player)
-        mask = get_legal_mask(state, num_actions)
-        if not use_sym_aug:
-            return node_feats, global_feats, mask, 0
-        if aug_step:
-            env.sigma_idx = random.randrange(n_sigmas)
-        sigma_idx = env.sigma_idx
-        if sigma_idx == 0:
-            return node_feats, global_feats, mask, 0
-        return (
-            permute_token_obs(node_feats, sigma_idx),
-            global_feats,
-            permute_mask(mask, sigma_idx),
-            sigma_idx,
-        )
-
     def apply_opponent_action(env: EnvState, player: int, action: int):
         """Apply an opponent action and track shaping penalties."""
         state = env.state
@@ -430,8 +395,7 @@ def worker_process(
                 )
 
                 batch = ExperienceBatch(
-                    node_feats=np.stack([e['node_feats'] for e in env.experiences[player]]),
-                    global_feats=np.stack([e['global_feats'] for e in env.experiences[player]]),
+                    obs=np.stack([e['obs'] for e in env.experiences[player]]),
                     actions=np.array([e['action'] for e in env.experiences[player]], dtype=np.int64),
                     logprobs=np.array([e['logprob'] for e in env.experiences[player]], dtype=np.float32),
                     values=values,
@@ -548,39 +512,36 @@ def worker_process(
             if env.opponent_type == 'self' and clone_model is not None:
                 is_ai_turn = (current_player == env.ai_player)
                 if is_ai_turn:
-                    nf, gf, mask, sigma_idx = build_ai_obs_mask(env, state, current_player)
+                    obs = relativize_obs(state, current_player)
+                    mask = get_legal_mask(state, num_actions)
                     inference_requests.append({
                         'env_idx': env_idx,
                         'player': current_player,
-                        'node_feats': nf,
-                        'global_feats': gf,
+                        'obs': obs,
                         'mask': mask,
-                        'sigma_idx': sigma_idx,
                         'is_ai_player': True
                     })
                 else:
                     action = get_clone_action(state, num_actions, clone_model)
                     apply_opponent_action(env, current_player, action)
             elif env.opponent_type == 'self':
-                nf, gf, mask, sigma_idx = build_ai_obs_mask(env, state, current_player)
+                obs = relativize_obs(state, current_player)
+                mask = get_legal_mask(state, num_actions)
                 inference_requests.append({
                     'env_idx': env_idx,
                     'player': current_player,
-                    'node_feats': nf,
-                    'global_feats': gf,
+                    'obs': obs,
                     'mask': mask,
-                    'sigma_idx': sigma_idx,
                     'is_ai_player': current_player == env.ai_player
                 })
             elif current_player == env.ai_player:
-                nf, gf, mask, sigma_idx = build_ai_obs_mask(env, state, current_player)
+                obs = relativize_obs(state, current_player)
+                mask = get_legal_mask(state, num_actions)
                 inference_requests.append({
                     'env_idx': env_idx,
                     'player': current_player,
-                    'node_feats': nf,
-                    'global_feats': gf,
+                    'obs': obs,
                     'mask': mask,
-                    'sigma_idx': sigma_idx,
                     'is_ai_player': True
                 })
             else:
@@ -631,41 +592,27 @@ def worker_process(
         for i, req in enumerate(inference_requests):
             env_idx = req['env_idx']
             player = req['player']
-            node_feats = req['node_feats']
-            global_feats = req['global_feats']
+            obs = req['obs']
             mask = req['mask']
-            sigma_idx = req.get('sigma_idx', 0)
             is_ai_player = req['is_ai_player']
 
-            action_aug = response['actions'][i]
+            action = response['actions'][i]
             logprob = response['logprobs'][i]
             value = response['values'][i]
 
             env = envs[env_idx]
             state = env.state
 
-            # Network chose `action_aug` in frame sigma. The engine's
-            # legal_actions / apply_action are canonical, so map back.
-            if sigma_idx == 0:
-                action_canon = action_aug
-            else:
-                action_canon = int(ACT_PERM_INV[sigma_idx][action_aug])
-
             legal_actions = state.legal_actions()
             if not legal_actions:
                 continue
-            if action_canon not in legal_actions:
-                action_canon = random.choice(legal_actions)
-                # Re-derive the augmented id so experience stays in frame sigma.
-                action_aug = (
-                    action_canon if sigma_idx == 0
-                    else int(ACT_PERM[sigma_idx][action_canon])
-                )
+            if action not in legal_actions:
+                action = random.choice(legal_actions)
                 logprob = -np.log(len(legal_actions))
 
             prev_state_info = extract_state_features(state, player)
 
-            state.apply_action(action_canon)
+            state.apply_action(action)
             env.step_count += 1
 
             shaping_reward = 0.0
@@ -680,9 +627,8 @@ def worker_process(
 
             if env.opponent_type == 'self' or is_ai_player:
                 env.experiences[player].append({
-                    'node_feats': node_feats,
-                    'global_feats': global_feats,
-                    'action': action_aug,
+                    'obs': obs,
+                    'action': action,
                     'logprob': logprob,
                     'value': value,
                     'reward': shaping_reward,

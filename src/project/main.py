@@ -18,8 +18,8 @@ import fastnmm
 from config import Config
 from model import ActorCritic
 from trainer import PPOTrainer
-from minimax import MinimaxBot, evaluate_vs_minimax_cpp
-from utils import get_legal_mask, build_token_obs
+from minimax import MinimaxBot, evaluate_vs_minimax
+from utils import get_legal_mask, relativize_obs
 from curriculum import CurriculumManager, Phase, PHASE_CONFIGS
 
 
@@ -86,12 +86,10 @@ def play_interactive(config: Config = None):
         # Progressive minimax test
         print("\nTesting AI against Minimax depths 1-6...")
         stones = int(input("Starting stones per player (1-9, -1=random 3-9): ") or "9")
-        max_beaten, results = evaluate_vs_minimax_cpp(
+        max_beaten, results = evaluate_vs_minimax(
             model, device, game.num_distinct_actions(),
-            max_depth=6, unlimited=False,
-            games_per_depth=6, max_threads=os.cpu_count() or 24,
-            max_steps=200,
-            starting_stones=stones,
+            max_depth=6, games_per_depth=20, max_steps=200,
+            starting_stones=stones
         )
 
         print(f"\n{'=' * 50}")
@@ -130,16 +128,15 @@ def play_interactive(config: Config = None):
             current = state.current_player()
             
             if current == ai_player:
-                node_feats, global_feats = build_token_obs(state, current)
-                node_t = torch.from_numpy(node_feats).to(device).unsqueeze(0)
-                glob_t = torch.from_numpy(global_feats).to(device).unsqueeze(0)
+                obs_arr = relativize_obs(state, current)
+                obs = torch.from_numpy(obs_arr).to(device).unsqueeze(0)
                 mask = torch.tensor(
                     get_legal_mask(state, game.num_distinct_actions()),
                     dtype=torch.float32, device=device
                 ).unsqueeze(0)
 
                 with torch.no_grad():
-                    logits, v = model(node_t, glob_t)
+                    logits, v = model(obs)
                     masked = logits.float()
                     masked[mask == 0] = -1e9
                     a = masked.argmax().item()
@@ -196,21 +193,19 @@ def play_interactive(config: Config = None):
                 print("Invalid input!")
                 continue
         else:
-            current = state.current_player()
-            node_feats, global_feats = build_token_obs(state, current)
-            node_t = torch.from_numpy(node_feats).to(device).unsqueeze(0)
-            glob_t = torch.from_numpy(global_feats).to(device).unsqueeze(0)
+            obs_arr = relativize_obs(state, state.current_player())
+            obs = torch.from_numpy(obs_arr).to(device).unsqueeze(0)
             mask = torch.tensor(
                 get_legal_mask(state, game.num_distinct_actions()),
                 dtype=torch.float32, device=device
             ).unsqueeze(0)
-
+            
             with torch.no_grad():
-                logits, v = model(node_t, glob_t)
+                logits, v = model(obs)
                 masked = logits.float()
                 masked[mask == 0] = -1e9
                 a = masked.argmax().item()
-
+            
             print(f"AI plays: {a} (V={v.item():.2f})")
         
         state.apply_action(a)

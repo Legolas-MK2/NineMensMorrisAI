@@ -3,9 +3,15 @@
 #include "nine_mens_morris.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace fastnmm {
 
@@ -803,6 +809,78 @@ int CountBlockedPieces(const State& s, int player) {
 inline bool IsFlying(const State& s, int player) {
     return (s.MenOnBoard(player) == 3) && (s.MenToDeploy(player) == 0);
 }
+
+// -----------------------------------------------------------------------
+// Python-parity helpers used ONLY by the AI / reward-shaping evaluator.
+// They intentionally mirror the quirks of `utils._count_potential_mills`
+// and `utils._get_mobility` so switching `extract_state_features` from
+// Python loops to the C++ fast path is a bit-exact drop-in -- no
+// mid-training reward-landscape shift for in-flight runs.
+//
+// Differences from `CountOpenMills` / `ApproxMobility` (which are tuned
+// for minimax search and stay unchanged):
+//   * potential-mills "easy reach" trigger:
+//       Python: total_on_board < 18  OR  my_pieces == 3
+//       AI-pa.: total_on_board < 18  OR  my_pieces == 3  (matched)
+//       minimax: per-player MenToDeploy>0 OR MenOnBoard==3 && deploy==0
+//   * mobility flying-phase cap:
+//       Python: my_pieces <= 3 -> cap moves at 12, no adjacency
+//       AI-pa.: same
+//       minimax: no cap, scales with own*empty
+// -----------------------------------------------------------------------
+int CountAIOpenMills(const State& s, int player) {
+    const BitBoard own = s.Board(player);
+    const BitBoard opp = s.Board(1 - player);
+    const BitBoard occ = own | opp;
+    const BitBoard empty = (~occ) & kFullBoard;
+
+    const int my_pieces = PopCount(own);
+    const int total_on_board = PopCount(occ);
+    // Mirror Python: placement-phase check by *total* board occupancy
+    // against the magic "18", and flying-phase check by own piece count.
+    const bool any_empty_counts = (total_on_board < 18) || (my_pieces == 3);
+
+    int count = 0;
+    for (int i = 0; i < 16; ++i) {
+        const BitBoard m = kMillMasks[i];
+        if (PopCount(own & m) != 2) continue;
+        if ((opp & m) != 0)         continue;
+        const BitBoard slot = m & empty;
+        if (PopCount(slot) != 1)    continue;
+
+        if (any_empty_counts) {
+            ++count;
+            continue;
+        }
+        const int empty_pos = __builtin_ctz(slot);
+        const BitBoard movers = kAdjacency[empty_pos] & own & ~m;
+        if (movers) ++count;
+    }
+    return count;
+}
+
+int CountAIMobility(const State& s, int player) {
+    const BitBoard own = s.Board(player);
+    const BitBoard occ = s.Board(0) | s.Board(1);
+    const BitBoard empty = (~occ) & kFullBoard;
+
+    const int my_pieces = PopCount(own);
+    int moves = 0;
+    BitBoard pieces = own;
+    while (pieces) {
+        const int pos = __builtin_ctz(pieces);
+        pieces &= pieces - 1;
+        if (my_pieces <= 3) {
+            // Python: any empty target counts; cap at 12 total to keep
+            // the shaping feature bounded in the flying endgame.
+            moves += PopCount(empty);
+            if (moves >= 12) return 12;
+        } else {
+            moves += PopCount(kAdjacency[pos] & empty);
+        }
+    }
+    return moves;
+}
 }  // namespace
 
 int Evaluate(const State& s) {
@@ -921,6 +999,92 @@ EvalBreakdown EvaluateBreakdown(const State& s) {
             + b.running_mill_score + b.double_mill_score
             + b.mill_block_score + b.blocked_score + b.mobility_score;
     return b;
+}
+
+// -----------------------------------------------------------------------
+// AI / reward-shaping evaluator.
+//
+// Mirrors `utils.extract_state_features` from the Python side: same
+// feature counts, but always from the perspective of the *given*
+// `player`, not whoever happens to be the side-to-move. Reward shaping
+// in worker.py calls this twice per AI move (pre- and post-apply), with
+// `player` fixed to the AI for both calls -- so we cannot rely on
+// CurrentPlayer().
+//
+// All field semantics are documented next to `AIEvalBreakdown` in the
+// header. Helper functions live in the anonymous namespace just above.
+// -----------------------------------------------------------------------
+AIEvalBreakdown EvaluateForAIBreakdown(const State& s, int player) {
+    AIEvalBreakdown b{};
+    b.player = player;
+    if (s.IsTerminal()) {
+        // Terminal positions have no meaningful shaping signal; everything
+        // stays zero and the Python side computes the terminal reward
+        // separately from `state.returns()`.
+        return b;
+    }
+    if (player != 0 && player != 1) {
+        return b;
+    }
+    const int opp = 1 - player;
+
+    // Python parity: count only stones on the board, not unplaced reserves.
+    // (utils._count_pieces walks the parsed 24-tuple board; reserves don't
+    // appear there.)
+    b.my_pieces  = s.MenOnBoard(player);
+    b.opp_pieces = s.MenOnBoard(opp);
+
+    b.my_mills  = MillCount(s, player);
+    b.opp_mills = MillCount(s, opp);
+
+    b.my_potential_mills  = CountAIOpenMills(s, player);
+    b.opp_potential_mills = CountAIOpenMills(s, opp);
+
+    b.my_blocked_mills  = CountMillBlocks(s, player);
+    b.opp_blocked_mills = CountMillBlocks(s, opp);
+
+    // "Unblocked threats" from `player`'s view is the count of mills the
+    // *opponent* can close next turn -- i.e. opp's potential mills.
+    b.my_unblocked_threats  = b.opp_potential_mills;
+    b.opp_unblocked_threats = b.my_potential_mills;
+
+    // Python "double_mills" semantics: pieces inside a completed own mill
+    // that can swing into an adjacent empty slot forming a *different*
+    // own mill. That is exactly what CountRunningMills computes.
+    b.my_double_mills  = CountRunningMills(s, player);
+    b.opp_double_mills = CountRunningMills(s, opp);
+
+    b.my_mobility  = CountAIMobility(s, player);
+    b.opp_mobility = CountAIMobility(s, opp);
+
+    b.endgame = IsFlying(s, player) || IsFlying(s, opp);
+    return b;
+}
+
+int EvaluateForAI(const State& s, int player) {
+    // Default integer-weight scoring intended as a fast standalone signal
+    // when the curriculum-tunable Python potential is overkill. The Python
+    // side does not call this; it uses EvaluateForAIBreakdown and combines
+    // raw counts with the curriculum's float weights (which can be scaled
+    // by `shaping_multiplier`). Weights are chosen to roughly match the
+    // *relative* magnitudes in default reward_config (×1000) so the score
+    // is comparable across feature components without floats.
+    const AIEvalBreakdown b = EvaluateForAIBreakdown(s, player);
+    if (b.player < 0) return 0;
+
+    constexpr int W_MILL        = 300;   // mill_reward
+    constexpr int W_OPEN        = 200;   // setup_capture_reward
+    constexpr int W_OPP_OPEN    = 200;   // block_mill_reward (against)
+    constexpr int W_DOUBLE      = 500;   // double_mill_reward
+    constexpr int W_MATERIAL    = 20;    // piece_advantage_reward
+    constexpr int W_MOBILITY    = 50;    // mobility_reward
+
+    return W_MILL     * (b.my_mills          - b.opp_mills)
+         + W_OPEN     *  b.my_potential_mills
+         - W_OPP_OPEN *  b.my_unblocked_threats
+         + W_DOUBLE   *  b.my_double_mills
+         + W_MATERIAL * (b.my_pieces          - b.opp_pieces)
+         + W_MOBILITY * (b.my_mobility        - b.opp_mobility);
 }
 
 // -----------------------------------------------------------------------
@@ -1634,6 +1798,370 @@ std::vector<int> PlayUntilPlayer(State& state,
     }
 
     return taken;
+}
+
+// =========================================================================
+// ParallelMinimaxBot.
+//
+// Persistent worker pool + per-worker MinimaxEngine. The root's legal
+// actions are partitioned round-robin across workers; each worker scores
+// its slice using engine.Search() on the child of the root action (at
+// depth-1) and the orchestrator reduces to the global best.
+//
+// Strict-parity scoring for terminal children mirrors MinimaxEngine::Search
+// bit-exactly. Non-terminal children are scored by engine.Search(child,
+// depth-1) whose result is from the child's current-player POV; we negate
+// when the side-to-move flipped (mill/capture branches don't flip).
+// =========================================================================
+struct ParallelMinimaxBot::Impl {
+    // Workers stay alive for the bot's lifetime; tasks dispatched via cv.
+    struct WorkerCtx {
+        std::unique_ptr<MinimaxEngine> engine;
+        std::thread thread;
+        // Inputs for the current dispatch (set by Search, read by worker).
+        const State* root_state = nullptr;
+        int          depth      = 0;
+        // Slice of legal actions to evaluate, addressed via stride/offset:
+        // worker i processes legal[i], legal[i+nworkers], legal[i+2*nworkers]...
+        // Stored once per dispatch.
+        int worker_idx = 0;
+        // Output.
+        int   best_action = -1;
+        int   best_score  = 0;
+        long  nodes       = 0;
+    };
+
+    bool                          strict      = true;
+    int                           num_workers = 1;
+    int                           max_score   = 0;  // kWinScore or kRelaxedMate
+    std::vector<std::unique_ptr<WorkerCtx>> workers;
+
+    // Dispatch coordination.
+    std::mutex                    mu;
+    std::condition_variable       cv_start;       // workers wait on this
+    std::condition_variable       cv_done;        // orchestrator waits on this
+    int                           generation     = 0;  // bumped per Search
+    int                           pending_done   = 0;  // remaining workers in current gen
+    std::vector<int>              shared_legal;   // current root legal actions
+    int                           shared_n       = 0;
+    bool                          shutdown       = false;
+
+    void WorkerLoop(WorkerCtx* w) {
+        int last_gen = 0;
+        for (;;) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv_start.wait(lk, [&]{ return shutdown || generation != last_gen; });
+            if (shutdown) return;
+            last_gen = generation;
+            const int my_idx = w->worker_idx;
+            const int stride = num_workers;
+            const State root = *w->root_state;        // copy under lock for safety
+            const int depth  = w->depth;
+            std::vector<int> legal = shared_legal;     // copy
+            const int n = shared_n;
+            lk.unlock();
+
+            // Compute on the copy with no lock held.
+            const int cur_player = root.CurrentPlayer();
+            int local_best_a = -1;
+            int local_best_s = -max_score - 1;
+            long local_nodes = 0;
+
+            for (int i = my_idx; i < n; i += stride) {
+                const int action = legal[i];
+                State child = root;
+                child.ApplyAction(action);
+
+                int child_score;
+                long search_nodes = 0;
+                if (child.IsTerminal()) {
+                    const int win = child.Winner();
+                    if (win == 2) {
+                        child_score = 0;
+                    } else if (strict) {
+                        child_score = (win == cur_player) ? +kWinScore : -kWinScore;
+                        child_score -= (child_score > 0 ?  (100 - depth)
+                                                         : -(100 - depth));
+                    } else {
+                        child_score = (win == cur_player) ?
+                                          +(kRelaxedMate - 1) : -(kRelaxedMate - 1);
+                    }
+                } else if (depth - 1 <= 0) {
+                    // Leaf: matches MinimaxSearch / NegamaxStrict's
+                    // `depth == 0 -> return Evaluate(s)` bottom-out.
+                    // Evaluate is from `child.CurrentPlayer()`'s POV; flip
+                    // when the side-to-move switched after the root move.
+                    child_score = Evaluate(child);
+                    if (child.CurrentPlayer() != cur_player) {
+                        child_score = -child_score;
+                    }
+                    search_nodes = 1;
+                } else {
+                    SearchResult r = w->engine->Search(child, depth - 1);
+                    search_nodes = r.nodes_visited;
+                    child_score = r.score;
+                    if (child.CurrentPlayer() != cur_player) {
+                        child_score = -child_score;
+                    }
+                }
+
+                local_nodes += search_nodes;
+                if (child_score > local_best_s) {
+                    local_best_s = child_score;
+                    local_best_a = action;
+                }
+            }
+
+            // Publish result and signal done.
+            lk.lock();
+            w->best_action = local_best_a;
+            w->best_score  = local_best_s;
+            w->nodes       = local_nodes;
+            if (--pending_done == 0) {
+                cv_done.notify_one();
+            }
+            // Loop back; wait on cv_start for the next dispatch.
+        }
+    }
+};
+
+ParallelMinimaxBot::ParallelMinimaxBot(int num_threads,
+                                       std::size_t tt_bytes_per_thread,
+                                       bool strict_parity)
+    : impl_(new Impl), num_threads_(num_threads < 1 ? 1 : num_threads) {
+    impl_->strict      = strict_parity;
+    impl_->num_workers = num_threads_;
+    impl_->max_score   = strict_parity ? kWinScore : kRelaxedMate;
+    impl_->workers.reserve(num_threads_);
+    for (int i = 0; i < num_threads_; ++i) {
+        auto ctx = std::make_unique<Impl::WorkerCtx>();
+        ctx->engine = std::make_unique<MinimaxEngine>(tt_bytes_per_thread,
+                                                     strict_parity);
+        ctx->worker_idx = i;
+        impl_->workers.push_back(std::move(ctx));
+    }
+    // Spawn worker threads after all WorkerCtx ptrs are stable.
+    for (int i = 0; i < num_threads_; ++i) {
+        Impl::WorkerCtx* w = impl_->workers[i].get();
+        Impl* impl_ptr = impl_;
+        w->thread = std::thread([impl_ptr, w]() { impl_ptr->WorkerLoop(w); });
+    }
+}
+
+ParallelMinimaxBot::~ParallelMinimaxBot() {
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->shutdown = true;
+    }
+    impl_->cv_start.notify_all();
+    for (auto& w : impl_->workers) {
+        if (w->thread.joinable()) w->thread.join();
+    }
+    delete impl_;
+}
+
+SearchResult ParallelMinimaxBot::Search(const State& s, int depth) {
+    if (s.IsTerminal()) return {-1, 0, 0};
+    int buf[kMaxLegalActions];
+    const int n = s.LegalActionsInto(buf);
+    if (n == 0) {
+        return {-1, impl_->strict ? -kWinScore : -kRelaxedMate, 0};
+    }
+    if (n == 1) {
+        // Fast path: one legal move -- no search needed.
+        return {buf[0], 0, 0};
+    }
+
+    // Fast path for a single worker: use the engine directly to avoid
+    // round-tripping through the dispatch cv.
+    if (num_threads_ == 1) {
+        return impl_->workers[0]->engine->Search(s, depth);
+    }
+
+    const int n_active = std::min(num_threads_, n);
+
+    // Publish inputs and wake workers.
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->shared_legal.assign(buf, buf + n);
+        impl_->shared_n = n;
+        for (auto& w : impl_->workers) {
+            w->root_state = &s;
+            w->depth      = depth;
+            w->best_action = -1;
+            w->best_score  = -impl_->max_score - 1;
+            w->nodes       = 0;
+        }
+        impl_->pending_done = num_threads_;
+        ++impl_->generation;
+    }
+    impl_->cv_start.notify_all();
+
+    // Wait for all workers.
+    {
+        std::unique_lock<std::mutex> lk(impl_->mu);
+        impl_->cv_done.wait(lk, [&]{ return impl_->pending_done == 0; });
+    }
+
+    // Reduce to global best (workers > n_active just return -1 / sentinel).
+    int   best_action = buf[0];
+    int   best_score  = -impl_->max_score - 1;
+    long  total_nodes = 0;
+    for (auto& w : impl_->workers) {
+        total_nodes += w->nodes;
+        if (w->best_action >= 0 && w->best_score > best_score) {
+            best_score  = w->best_score;
+            best_action = w->best_action;
+        }
+    }
+    (void)n_active;
+    return {best_action, best_score, total_nodes};
+}
+
+// =========================================================================
+// RunProgressiveEval.
+//
+// Outer loop: depth = 1, 2, 3, ... while win_rate > 0.5 (or up to max_depth).
+// Inner loop: games_per_depth games run concurrently, each on its own
+// std::thread. Each thread owns a ParallelMinimaxBot configured with
+// threads_per_game = max(1, max_threads / games_per_depth) workers.
+//
+// Total threads in flight at peak = games_per_depth * threads_per_game
+// (clamped <= max_threads). For max_threads=24, games_per_depth=6 we get
+// 4 root-split workers per game x 6 games = 24 threads pegged.
+//
+// The policy_fn is invoked on model turns. Callers in the bindings layer
+// re-acquire the GIL inside the std::function wrapper so model forwards
+// can run from any worker thread. Multiple workers may call policy_fn
+// concurrently; the binding wrapper is responsible for any required
+// serialisation (e.g. cuDNN reentrancy).
+// =========================================================================
+ProgressiveEvalResult RunProgressiveEval(const ProgressiveEvalConfig& cfg,
+                                        const ProgressivePolicyFn& policy_fn,
+                                        const ProgressiveGameSpecFn& spec_fn,
+                                        const ProgressiveProgressFn& progress_fn) {
+    ProgressiveEvalResult out;
+    if (!policy_fn) {
+        throw std::invalid_argument("RunProgressiveEval requires a policy_fn");
+    }
+
+    const int games_per_depth = std::max(1, cfg.games_per_depth);
+    const int max_threads     = std::max(games_per_depth, cfg.max_threads);
+    const int threads_per_game = std::max(1, max_threads / games_per_depth);
+
+    const auto start_wall = std::chrono::steady_clock::now();
+    const double budget = cfg.time_budget_s;
+
+    auto effective_spec = [&](int depth, int gi) -> GameSpec {
+        if (spec_fn) return spec_fn(depth, gi);
+        GameSpec g;
+        g.unplaced_white = 9;
+        g.unplaced_black = 9;
+        g.ai_player      = gi % 2;
+        return g;
+    };
+
+    int depth = 1;
+    while (true) {
+        if (!cfg.unlimited && depth > cfg.max_depth) break;
+        if (budget > 0.0) {
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start_wall).count();
+            if (elapsed >= budget) break;
+        }
+
+        struct GameOutcome {
+            int  result = 0;   // +1 win, 0 draw, -1 loss for the AI
+            long nodes  = 0;
+        };
+        std::vector<GameOutcome> outcomes(games_per_depth);
+        std::vector<std::thread> threads;
+        threads.reserve(games_per_depth);
+
+        // Exceptions thrown inside policy_fn (e.g. KeyboardInterrupt) must
+        // propagate out. Each worker stashes its exception and the outer
+        // loop rethrows after join().
+        std::vector<std::exception_ptr> errors(games_per_depth);
+
+        const auto depth_start = std::chrono::steady_clock::now();
+
+        for (int gi = 0; gi < games_per_depth; ++gi) {
+            const GameSpec spec = effective_spec(depth, gi);
+            threads.emplace_back([&, gi, spec]() {
+                try {
+                    ParallelMinimaxBot bot(threads_per_game,
+                                          cfg.tt_bytes_per_thread,
+                                          cfg.strict_parity);
+                    State s(spec.unplaced_white, spec.unplaced_black);
+                    if (s.IsTerminal()) {
+                        outcomes[gi] = {0, 0};
+                        return;
+                    }
+
+                    long nodes = 0;
+                    int  steps = 0;
+                    while (!s.IsTerminal() && steps < cfg.max_steps) {
+                        const int cp = s.CurrentPlayer();
+                        int action = -1;
+                        if (cp == spec.ai_player) {
+                            // Policy callback. The binding is responsible
+                            // for re-acquiring the GIL before touching Python.
+                            action = policy_fn(s, cp, gi, depth);
+                        } else {
+                            SearchResult r = bot.Search(s, depth);
+                            action = r.action;
+                            nodes += r.nodes_visited;
+                        }
+                        if (action < 0) break;
+                        s.ApplyAction(action);
+                        ++steps;
+                    }
+
+                    int result = 0;
+                    if (s.IsTerminal()) {
+                        auto r = s.Returns();
+                        if (r[spec.ai_player] > r[1 - spec.ai_player]) result = +1;
+                        else if (r[spec.ai_player] < r[1 - spec.ai_player]) result = -1;
+                        else result = 0;
+                    }
+                    outcomes[gi] = {result, nodes};
+                } catch (...) {
+                    errors[gi] = std::current_exception();
+                }
+            });
+        }
+
+        for (auto& t : threads) t.join();
+        for (auto& ep : errors) {
+            if (ep) std::rethrow_exception(ep);
+        }
+
+        DepthResult dr;
+        for (const auto& o : outcomes) {
+            if (o.result > 0)      ++dr.wins;
+            else if (o.result < 0) ++dr.losses;
+            else                   ++dr.draws;
+            dr.total_nodes += o.nodes;
+        }
+        dr.win_rate = (dr.wins + 0.5 * dr.draws) /
+                      static_cast<double>(games_per_depth);
+        dr.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - depth_start).count();
+        out.per_depth[depth] = dr;
+
+        if (progress_fn) progress_fn(depth, dr);
+
+        if (dr.win_rate > 0.5) {
+            out.max_depth_beaten = depth;
+            ++depth;
+        } else {
+            break;
+        }
+    }
+
+    out.total_wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start_wall).count();
+    return out;
 }
 
 }  // namespace fastnmm

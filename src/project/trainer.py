@@ -29,7 +29,7 @@ import fastnmm
 from config import Config
 from model import ActorCritic
 from utils import get_legal_mask, ExperienceBatch, relativize_obs
-from minimax import evaluate_vs_minimax_cpp, format_minimax_results
+from minimax import evaluate_vs_minimax, format_minimax_results
 from worker import worker_process
 from curriculum import (
     CurriculumManager, Phase, PHASE_CONFIGS, MIXED_CONFIG,
@@ -120,17 +120,6 @@ class PPOTrainer:
         self.best_win_rate = 0.0
         self.recent_returns = deque(maxlen=5000)
 
-        # Throttle + cache for the progressive minimax eval. Episode-based
-        # so the throttle is stable even when log_progress fires multiple
-        # times within one logical log cycle (which happens when
-        # len(experiences) < episodes_per_update). "Every 8 log cycles" =
-        # "every 8 * log_interval episodes" -- a single observable signal.
-        # `_last_minimax_eval_episode = -inf` makes the first call always
-        # eval; subsequent calls eval once `episode_count` has advanced by
-        # >= `minimax_eval_every_n_log_ticks * log_interval`.
-        self._last_minimax_eval_episode: float = float('-inf')
-        self._last_minimax_eval: Optional[Tuple[int, str]] = None
-
         self.start_time = None
 
         # Clone model for self-play
@@ -145,49 +134,6 @@ class PPOTrainer:
         self.log_file = None
         self.log_writer = None
         self.existing_log_path = None  # Track existing log path for resume mode
-
-        # Heartbeat file — atomic write of a single JSON line consumed by the
-        # system monitor sidecar so we can detect "main thread blocked in C++
-        # for >N seconds" without attaching py-spy.
-        self.heartbeat_path = os.path.join(config.log_dir, "trainer_heartbeat.json")
-        self.last_heartbeat_stage = "init"
-        self._last_heartbeat_ts = 0.0
-        # Minimum interval (s) between throttled in-loop heartbeat refreshes
-        # called from `_heartbeat_tick`. Stage-transition `_heartbeat()` calls
-        # always write unconditionally; this only rate-limits the per-batch
-        # "I'm still serving inference" refresh.
-        self._heartbeat_min_interval = 2.0
-
-    def _heartbeat(self, stage: str):
-        """Touch the heartbeat file with the current stage and PID."""
-        try:
-            import json
-            payload = {
-                "ts": time.time(),
-                "pid": os.getpid(),
-                "stage": stage,
-                "episode": self.episode_count,
-                "update": self.update_count,
-                "phase": int(self.curriculum.current_phase),
-            }
-            tmp = self.heartbeat_path + ".tmp"
-            with open(tmp, "w") as f:
-                f.write(json.dumps(payload))
-            os.replace(tmp, self.heartbeat_path)
-            self.last_heartbeat_stage = stage
-            self._last_heartbeat_ts = payload["ts"]
-        except Exception:
-            pass
-
-    def _heartbeat_tick(self):
-        """Refresh the heartbeat from inside long-running loops so the
-        sidecar doesn't false-fire STALE on a legitimately slow collect
-        (e.g. workers cold-cache D7 minimax). Throttled to
-        `_heartbeat_min_interval` seconds.
-        """
-        now = time.time()
-        if now - self._last_heartbeat_ts >= self._heartbeat_min_interval:
-            self._heartbeat(self.last_heartbeat_stage)
 
     def _on_phase_change(self, old_phase: Phase, new_phase: Phase):
         """Callback when curriculum phase changes."""
@@ -442,10 +388,6 @@ class PPOTrainer:
 
     def process_inference_requests(self, timeout: float = 0.01) -> int:
         """Process batched inference requests from workers."""
-        # Throttled refresh — keeps `heartbeat_age` low during long collects
-        # so monitor doesn't falsely flag STALE while the main thread is
-        # actively serving GPU forward calls.
-        self._heartbeat_tick()
         all_requests = []
         worker_indices = {}
         worker_request_ids = {}
@@ -472,13 +414,12 @@ class PPOTrainer:
         if not all_requests:
             return 0
 
-        node_batch = torch.from_numpy(np.stack([r['node_feats'] for r in all_requests])).to(self.device)
-        global_batch = torch.from_numpy(np.stack([r['global_feats'] for r in all_requests])).to(self.device)
+        obs_batch = torch.from_numpy(np.stack([r['obs'] for r in all_requests])).to(self.device)
         mask_batch = torch.from_numpy(np.stack([r['mask'] for r in all_requests])).to(self.device)
 
         with torch.no_grad():
             with autocast('cuda', enabled=self.config.use_mixed_precision):
-                logits, values = self.model(node_batch, global_batch)
+                logits, values = self.model(obs_batch)
 
             masked_logits = logits.float()
             masked_logits[mask_batch == 0] = -1e9
@@ -573,8 +514,7 @@ class PPOTrainer:
         if not experiences:
             return {}
 
-        all_nodes = torch.from_numpy(np.concatenate([e.node_feats for e in experiences])).to(self.device)
-        all_globals = torch.from_numpy(np.concatenate([e.global_feats for e in experiences])).to(self.device)
+        all_obs = torch.from_numpy(np.concatenate([e.obs for e in experiences])).to(self.device)
         all_actions = torch.from_numpy(np.concatenate([e.actions for e in experiences])).to(self.device)
         all_old_logprobs = torch.from_numpy(np.concatenate([e.logprobs for e in experiences])).to(self.device)
         all_old_values = torch.from_numpy(np.concatenate([e.values for e in experiences])).to(self.device)
@@ -583,8 +523,7 @@ class PPOTrainer:
         advantages = torch.from_numpy(np.concatenate([e.advantages for e in experiences])).to(self.device)
         returns = torch.from_numpy(np.concatenate([e.returns for e in experiences])).to(self.device)
 
-        n_samples = all_nodes.shape[0]
-        self.total_steps += n_samples
+        self.total_steps += len(all_obs)
 
         with torch.no_grad():
             adv_mean, adv_std = advantages.mean(), advantages.std()
@@ -599,14 +538,14 @@ class PPOTrainer:
         self.model.train()
 
         for epoch in range(self.config.ppo_epochs):
-            indices = torch.randperm(n_samples, device=self.device)
+            indices = torch.randperm(len(all_obs), device=self.device)
 
-            for start in range(0, n_samples, self.config.mini_batch_size):
-                end = min(start + self.config.mini_batch_size, n_samples)
+            for start in range(0, len(all_obs), self.config.mini_batch_size):
+                end = min(start + self.config.mini_batch_size, len(all_obs))
                 idx = indices[start:end]
 
                 with autocast('cuda', enabled=self.config.use_mixed_precision and self.device.type == 'cuda'):
-                    logits, values = self.model(all_nodes[idx], all_globals[idx])
+                    logits, values = self.model(all_obs[idx])
 
                     masked_logits = logits.float()
                     masked_logits[all_masks[idx] == 0] = -1e4
@@ -737,50 +676,13 @@ class PPOTrainer:
         return (wins + 0.5 * draws) / num_games
 
     def evaluate_vs_minimax_progressive(self) -> Tuple[int, str]:
-        """Test AI against progressively harder minimax bots.
-
-        Climb is unbounded: the loop only stops once the AI's win rate at
-        some depth falls to/below 50%. The C++ orchestrator runs
-        `games_per_depth=6` games concurrently and root-splits each
-        game's minimax across `max_threads // games_per_depth` workers,
-        so 6 games x 4 workers/game pegs a 24-core box during the bot's
-        search (which dominates wall time at depth >= 4). As soon as a
-        depth's W/D/L is known the printer emits the accumulating
-        `Minimax: D1:... | D2:... | ...` line so progress is visible
-        live instead of only at the end.
-        """
-        accumulated: list = []
-
-        def _on_depth(d: int, r: Dict):
-            accumulated.append(
-                f"D{d}:{r['wins']}W/{r['draws']}D/{r['losses']}L"
-            )
-            # Overwrite the same line as each depth completes so progress is
-            # visible live without spamming a new line per depth.
-            print(f"\r  Minimax: {' | '.join(accumulated)}", end='', flush=True)
-
-        # Eval runs during the trainer's log tick — the inference-server
-        # thread is busy here, so the workers are blocked waiting for their
-        # forward responses. That makes the worker-core slice (cpu_count -
-        # reserved_display_cores) effectively idle and available.
-        cpu_count = os.cpu_count() or 4
-        reserved = int(getattr(self.config, "reserved_display_cores", 0))
-        thread_cap = max(6, cpu_count - max(0, reserved))
-
-        max_depth_beaten, results = evaluate_vs_minimax_cpp(
+        """Test AI against progressively harder minimax bots."""
+        max_depth_beaten, results = evaluate_vs_minimax(
             self.model, self.device, self.num_actions,
-            games_per_depth=6,
-            max_threads=thread_cap,
-            max_steps=150,
+            max_depth=6, games_per_depth=10, max_steps=150,
             use_mixed_precision=self.config.use_mixed_precision,
-            unlimited=True,
             stone_distribution=self.curriculum.get_stone_distribution_for_phase(),
-            progress_callback=_on_depth,
         )
-        # Close the in-place-updated minimax line so subsequent prints land
-        # on a fresh line.
-        if accumulated:
-            print(flush=True)
         result_str = format_minimax_results(results)
         return max_depth_beaten, result_str
 
@@ -799,6 +701,7 @@ class PPOTrainer:
         elapsed = time.time() - self.start_time
         eps_per_sec = (self.episode_count - self.start_episode_count) / elapsed if elapsed > 0 else 0
 
+        max_depth_beaten, minimax_str = self.evaluate_vs_minimax_progressive()
         curriculum_status = self.curriculum.get_status_string()
         config = self.curriculum.get_config()
 
@@ -819,31 +722,8 @@ class PPOTrainer:
         print(
             f"[Phase {int(self.curriculum.current_phase)}] Ep {self.episode_count:,} | {curriculum_status} | "
             f"Ret: {avg_return:+.3f} | PL: {metrics.get('policy_loss', 0):+.4f} | VL: {metrics.get('value_loss', 0):.3f} | "
-            f"LR: {metrics.get('lr', 0):.1e} | {eps_per_sec:.0f}/s",
-            flush=True,
+            f"LR: {metrics.get('lr', 0):.1e} | {eps_per_sec:.0f}/s"
         )
-
-        # Run progressive minimax eval AFTER the header so the per-depth
-        # "  Minimax: D1:… | D2:… | …" lines appear under it as each depth
-        # completes, instead of before it. Throttled by
-        # `minimax_eval_every_n_log_ticks * log_interval` *episodes* so the
-        # cadence is stable even when log_progress fires multiple times in
-        # one log cycle (which happens when len(experiences) <
-        # episodes_per_update). On skipped cycles we reuse the most recent
-        # result so the CSV column and console line stay populated.
-        every_n = max(1, int(self.config.minimax_eval_every_n_log_ticks))
-        eval_period_episodes = every_n * int(self.config.log_interval)
-        episodes_since_last = self.episode_count - self._last_minimax_eval_episode
-        do_eval = (self._last_minimax_eval is None) or (episodes_since_last >= eval_period_episodes)
-        if do_eval:
-            max_depth_beaten, minimax_str = self.evaluate_vs_minimax_progressive()
-            self._last_minimax_eval = (max_depth_beaten, minimax_str)
-            self._last_minimax_eval_episode = self.episode_count
-        else:
-            # Use the cached result for the CSV column but suppress the
-            # console print — silence between Minimax lines is the
-            # visible signal that the throttle is working.
-            max_depth_beaten, minimax_str = self._last_minimax_eval
 
         # Minimax evaluation results
         active_max = opp_wr['active_mm_max_depth']
@@ -857,9 +737,7 @@ class PPOTrainer:
             return f" D{d}:locked"
 
         depth_str = "".join(_d_str(d) for d in range(1, 8))
-        # Note: the per-depth "  Minimax: D1:… | D2:… | …" lines were already
-        # printed live by `evaluate_vs_minimax_progressive`'s progress
-        # callback, so we do not re-print the final accumulated line here.
+        print(f"  Minimax: {minimax_str}")
         if config.opponent_type == 'mixed':
             wr_random = opp_wr['wr_vs_random']
             rnd_train_note = " (no-train)" if wr_random >= self.config.random_train_cutoff else ""
@@ -1175,11 +1053,9 @@ class PPOTrainer:
 
         try:
             while self.curriculum.current_phase != Phase.COMPLETED:
-                self._heartbeat("collect")
                 # Collect experiences (workers run, main serves inference)
                 experiences, returns = self.collect_experiences(cfg.episodes_per_update)
 
-                self._heartbeat("ppo_update")
                 # PPO update — workers are NOT paused.
                 # They keep playing (minimax, random, self-play turns) and
                 # queue up inference requests. Requests pile up during PPO
@@ -1205,14 +1081,12 @@ class PPOTrainer:
                     #  4. depth unlock (may broadcast and save a checkpoint)
                     #  5. weight rebroadcast (after dominated-state refresh)
                     #  6. graduation check (terminal signal for the phase)
-                    self._heartbeat("log_progress")
                     self.curriculum.sample_minimax_winrate()
                     self.log_progress(returns, metrics)
                     if self.curriculum.should_update_clone():
                         self.curriculum.do_clone_update()
                     if self.curriculum.check_and_unlock_minimax_depth():
                         new_max = self.curriculum.get_active_minimax_max_depth()
-                        self._heartbeat("save_depth_unlock")
                         self.save_checkpoint(f"depth{new_max}_unlocked")
                     if self.curriculum.get_config().opponent_type == 'mixed':
                         # Self-play timed dampening: if wr_vs_self crossed

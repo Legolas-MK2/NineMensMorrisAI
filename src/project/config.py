@@ -23,7 +23,7 @@ class Config:
     total_episodes: int = 500_000_000  # Max episodes (curriculum may finish earlier)
     episodes_per_update: int = 8192
     ppo_epochs: int = 3
-    mini_batch_size: int = 8192
+    mini_batch_size: int = 4096
     
     # Parallelism (optimized for Threadripper 3960X + RTX 3090)
     num_workers: int = 16
@@ -61,41 +61,11 @@ class Config:
     # Channel 0 = player 0 pieces, Channel 1 = player 1 pieces, rest = game state
     obs_shape: Optional[List[int]] = None
 
-    # Board-symmetry data augmentation. The 24-point board graph has an order-16
-    # automorphism group (D4 of the 7x7 grid x inner/outer-ring swap); applying a
-    # random sigma to (obs, mask, action) during rollout yields 16x effective
-    # position diversity at zero cost. See src/symmetry.py.
-    # aug_granularity: 'game' redraws sigma once per game (per env); 'step'
-    # redraws per decision -- usually overkill, since one game gives 16 nearly
-    # iid positions under the larger-batch shuffle.
-    use_symmetry_aug: bool = True
-    aug_granularity: str = 'game'
-
-    # Model architecture -- relational token-based ActorCritic.
-    # The 24 board points are tokens; a 25th global token carries phase /
-    # piece-count features. Attention biases between board tokens add learned
-    # per-head scalars on adjacency and mill-cohabitation; both are sigma-
-    # invariant, so the bias is correct in every augmented frame.
-    d_model: int = 128
-    n_layers: int = 5
-    n_heads: int = 8
-    d_k: int = 32
-    ff_mult: int = 4
-    node_feat_dim: int = 3
-    global_feat_dim: int = 11
-    num_positions: int = 24
-    # 'pointer' = per-node + from->to inner-product head (final architecture).
-    # 'flat'    = pooled -> Linear(-> 600) head (Milestone A; for debugging).
-    policy_head: str = 'pointer'
-    # 'global' = use the global token only; 'global+mean' = concat global + mean
-    # over board tokens before the value MLP.
-    value_pool: str = 'global+mean'
-    dropout: float = 0.0
-    # Legacy fields kept so older Config instances still construct cleanly.
-    # The relational model ignores them entirely.
+    # Model architecture
     hidden_dim: int = 128
     num_res_blocks: int = 8
     num_attention_heads: int = 16
+    dropout: float = 0.05
     
     # PPO hyperparameters
     gamma: float = 0.99
@@ -138,17 +108,6 @@ class Config:
     save_interval: int = 100_000
     eval_interval: int = 50_000
     eval_games: int = 200
-
-    # Progressive minimax eval is the slowest part of a log tick (D6/D7 each
-    # take seconds-to-minutes even with root-split parallelism). Throttled
-    # in *episode space*: a fresh eval runs once `episode_count` has
-    # advanced by `minimax_eval_every_n_log_ticks * log_interval` episodes
-    # since the last fresh eval. Cached result fills the console / CSV in
-    # between. Episode-based throttling is robust against `log_progress`
-    # firing multiple times per cycle (which happens when
-    # len(experiences) < episodes_per_update). Set to 1 to evaluate on
-    # every log cycle.
-    minimax_eval_every_n_log_ticks: int = 8
 
     # LR scheduler — warmup + warm-restart cosine, driven by PPO updates.
     # Peak LR after warmup. Cosine each cycle anneals from this down to lr_min.

@@ -8,17 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import random
 import numpy as np
 
-# Optional C++ fast path for AI/PPO reward feature extraction.
-# If the installed fastnmm is older than the EvaluateForAI bindings
-# (separate from minimax `evaluate`), fall back to the pure-Python loops
-# defined further down in this file.
-try:
-    from fastnmm import evaluate_for_ai_breakdown as _cpp_ai_breakdown
-    _HAS_CPP_AI_EVAL = True
-except Exception:
-    _cpp_ai_breakdown = None
-    _HAS_CPP_AI_EVAL = False
-
 
 def get_legal_mask(state, num_actions: int) -> np.ndarray:
     """Create a binary mask of legal actions."""
@@ -80,33 +69,6 @@ POSITION_TO_MILLS: Tuple[Tuple[Tuple[int, int, int], ...], ...] = tuple(
     tuple(mill for mill in MILLS if pos in mill) for pos in range(24)
 )
 
-
-def _build_adj_matrix() -> np.ndarray:
-    m = np.zeros((24, 24), dtype=bool)
-    for u, nbrs in enumerate(ADJACENCY):
-        for v in nbrs:
-            m[u, v] = True
-    return m
-
-
-def _build_mill_matrix() -> np.ndarray:
-    m = np.zeros((24, 24), dtype=bool)
-    for mill in MILLS:
-        for a in mill:
-            for b in mill:
-                if a != b:
-                    m[a, b] = True
-    return m
-
-
-# Structural adjacency / mill-cohabitation matrices for the relational
-# trunk's attention bias. Indexed by canonical board position; invariant
-# under every board automorphism (each sigma is a graph automorphism that
-# preserves both ADJACENCY and MILLS), so the bias matrices are correct
-# in every augmented frame.
-ADJ_MATRIX: np.ndarray = _build_adj_matrix()
-MILL_MATRIX: np.ndarray = _build_mill_matrix()
-
 BOARD_POS_TO_GRID: Tuple[Tuple[int, int], ...] = (
     (0, 0),
     (0, 3),
@@ -142,81 +104,12 @@ def relativize_obs(state, player: int) -> np.ndarray:
     p0 pieces, channel 1 = p1 pieces) regardless of which player is asking.
     Swap channels 0/1 when `player == 1` so the network always sees the same
     [self, opponent, ...] layout.
-
-    Kept for the eval/play paths that still read the flat (5,7,7) form and
-    for legacy code; the training pipeline now uses `build_token_obs`.
     """
     obs = state.observation_tensor_numpy(player)  # shape (5, 7, 7)
     if player == 1:
         obs = obs.copy()
         obs[[0, 1]] = obs[[1, 0]]
     return obs.reshape(-1)
-
-
-# Number of global features produced by `build_token_obs`. Kept in sync with
-# the layout below; `Config.global_feat_dim` is set from this.
-GLOBAL_FEAT_DIM: int = 11
-NODE_FEAT_DIM: int = 3
-NUM_POSITIONS: int = 24
-
-
-def build_token_obs(state, player: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Player-relative token observation for the relational trunk.
-
-    Returns:
-        node_feats:   float32[24, 3]  -- per board point [empty, mine, opponent]
-        global_feats: float32[11]     -- phase one-hot (3) +
-                                         my/opp unplaced+onboard scaled to /9 (4) +
-                                         my/opp flying flags (2) + turn/max_turns (1) +
-                                         1 reserved slot.
-
-    "Mine" / "opponent" are relative to `player`; this is the token-obs analog of
-    `relativize_obs`'s channel swap.
-    """
-    board = parse_board_from_state(state)
-    opponent = 1 - player
-
-    node_feats = np.zeros((24, 3), dtype=np.float32)
-    my_onboard = 0
-    opp_onboard = 0
-    for p in range(24):
-        v = board[p]
-        if v is None:
-            node_feats[p, 0] = 1.0
-        elif v == player:
-            node_feats[p, 1] = 1.0
-            my_onboard += 1
-        else:
-            node_feats[p, 2] = 1.0
-            opp_onboard += 1
-
-    phase_obj = state.current_phase()
-    phase_name = getattr(phase_obj, "name", str(phase_obj)).upper()
-    placing = 1.0 if "PLAC" in phase_name else 0.0
-    moving  = 1.0 if "MOV"  in phase_name else 0.0
-    capturing = 1.0 if "CAP" in phase_name else 0.0
-
-    my_unplaced  = float(state.men_to_deploy(player)) / 9.0
-    opp_unplaced = float(state.men_to_deploy(opponent)) / 9.0
-    my_onboard_n  = float(my_onboard) / 9.0
-    opp_onboard_n = float(opp_onboard) / 9.0
-
-    placed_done = state.men_to_deploy(player) == 0 and state.men_to_deploy(opponent) == 0
-    my_flying  = 1.0 if (placed_done and my_onboard  == 3) else 0.0
-    opp_flying = 1.0 if (placed_done and opp_onboard == 3) else 0.0
-
-    max_turns = max(1, int(state.max_turns()))
-    turn_norm = float(state.turn()) / float(max_turns)
-
-    global_feats = np.array([
-        placing, moving, capturing,
-        my_unplaced, opp_unplaced, my_onboard_n, opp_onboard_n,
-        my_flying, opp_flying,
-        turn_norm,
-        0.0,  # reserved
-    ], dtype=np.float32)
-
-    return node_feats, global_feats
 
 
 def parse_board_from_state(state) -> Tuple[Optional[int], ...]:
@@ -369,35 +262,7 @@ def _get_mobility(board: Tuple[Optional[int], ...], player: int) -> int:
 
 
 def extract_state_features(state, player: int) -> Dict[str, float]:
-    """Extract low-cost board structure features for shaping, aligned with minimax.
-
-    Fast path: `fastnmm.evaluate_for_ai_breakdown(state, player)` (pure C++,
-    GIL-released) replaces the parse-board + 7 Python loops + dict build.
-    Falls back to the Python implementation if the C++ binding is missing
-    (e.g., a worker started before fastnmm was rebuilt).
-    """
-    if _HAS_CPP_AI_EVAL:
-        try:
-            b = _cpp_ai_breakdown(state, int(player))
-            return {
-                "my_pieces":             float(b.my_pieces),
-                "opp_pieces":            float(b.opp_pieces),
-                "my_mills":              float(b.my_mills),
-                "opp_mills":             float(b.opp_mills),
-                "my_potential_mills":    float(b.my_potential_mills),
-                "opp_potential_mills":   float(b.opp_potential_mills),
-                "my_blocked_mills":      float(b.my_blocked_mills),
-                "opp_blocked_mills":     float(b.opp_blocked_mills),
-                "my_unblocked_threats":  float(b.my_unblocked_threats),
-                "opp_unblocked_threats": float(b.opp_unblocked_threats),
-                "my_double_mills":       float(b.my_double_mills),
-                "opp_double_mills":      float(b.opp_double_mills),
-                "my_mobility":           float(b.my_mobility),
-                "opp_mobility":          float(b.opp_mobility),
-            }
-        except Exception:
-            pass  # graceful fallback to pure Python below
-
+    """Extract low-cost board structure features for shaping, aligned with minimax."""
     board = parse_board_from_state(state)
     opponent = 1 - player
 
@@ -544,14 +409,8 @@ def compute_gae(
 
 @dataclass
 class ExperienceBatch:
-    """Batch of experiences from a single episode for one player.
-
-    Observations are stored as token tensors (per-position + global) — the
-    relational ActorCritic ingests these directly. All tensors are in the
-    same (possibly augmented) frame as `actions` / `masks`.
-    """
-    node_feats: np.ndarray   # float32[T, 24, 3]
-    global_feats: np.ndarray # float32[T, G]
+    """Batch of experiences from a single episode for one player."""
+    obs: np.ndarray
     actions: np.ndarray
     logprobs: np.ndarray
     values: np.ndarray

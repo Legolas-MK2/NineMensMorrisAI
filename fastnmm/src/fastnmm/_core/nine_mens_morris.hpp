@@ -12,6 +12,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -207,6 +209,48 @@ struct EvalBreakdown {
 EvalBreakdown EvaluateBreakdown(const State& s);
 
 // =========================================================================
+// AI / reward-shaping evaluator.
+//
+// `Evaluate(s)` above is tuned for alpha-beta search: int weights chosen
+// for pruning quality, evaluated from `s.CurrentPlayer()`'s perspective.
+// PPO reward shaping has different needs:
+//   - it always evaluates from the *acting* player's view (which may not
+//     be the side-to-move after `apply_action` returns), so we take an
+//     explicit `player` argument;
+//   - it wants raw feature counts that Python can combine with the
+//     curriculum's float weights (mill_reward, mobility_reward, ...)
+//     and scale by `shaping_multiplier`. Returning a single int here
+//     would force the weights to live in C++.
+//
+// Both functions are pure C++ that release the GIL when bound -- the
+// hot-path call replaces a parse-board + 7 Python loops + dict build per
+// AI move, which is most of `worker.py`'s per-move overhead.
+// =========================================================================
+struct AIEvalBreakdown {
+    // Raw counts from the perspective of the `player` argument passed in.
+    // Field names mirror the dict keys produced by
+    // `utils.extract_state_features` so the Python migration is mechanical.
+    int my_pieces;
+    int opp_pieces;
+    int my_mills;
+    int opp_mills;
+    int my_potential_mills;        // == own open mills (closable next turn)
+    int opp_potential_mills;
+    int my_blocked_mills;          // own stone in a 2-opp/1-own mill line
+    int opp_blocked_mills;
+    int my_unblocked_threats;      // opp's potential_mills (== opp_open)
+    int opp_unblocked_threats;
+    int my_double_mills;           // running/swing-mill setups (own)
+    int opp_double_mills;
+    int my_mobility;
+    int opp_mobility;
+    int player;                    // echoes the input `player` for safety
+    bool endgame;                  // either side is flying
+};
+AIEvalBreakdown EvaluateForAIBreakdown(const State& s, int player);
+int              EvaluateForAI(const State& s, int player);
+
+// =========================================================================
 // MinimaxEngine: persistent transposition-table-backed alpha-beta.
 //
 // Bit-exact parity with MinimaxSearch (same returned score, same chosen
@@ -363,5 +407,123 @@ inline int  EncodeMove(int from, int to) {
 // When `out_lengths` is non-null, writes the length of each game (in actions).
 double RandomPlayouts(int num_games, uint64_t seed,
                       int* out_lengths = nullptr);
+
+// =========================================================================
+// ParallelMinimaxBot: root-splitting parallel alpha-beta.
+//
+// Holds `num_threads` persistent MinimaxEngine instances plus a persistent
+// worker pool. On each Search call the root's legal actions are partitioned
+// round-robin across workers; each worker scores its slice and a global
+// argmax reduces to (best_action, best_score, total_nodes).
+//
+// Why root-split and not a shared TT search? Per-thread TTs avoid the
+// concurrent-hashmap synchronisation cost and match the engine's existing
+// data-flow exactly -- each engine builds its own TT as the game
+// progresses. The trade-off is no cross-thread transposition sharing and
+// no narrowed root alpha (we use a full window per worker). For depths
+// 4-10 in Nine Men's Morris this gives ~1.5-3x speedup with 4-6 workers.
+//
+// Bit-exact parity with single-threaded MinimaxEngine::Search for terminal
+// leaves (kWinScore +/- depth tie-break). Non-terminal leaves use the
+// engine's strict_parity mode (same TT/probe behaviour).
+//
+// Thread-safety: a single ParallelMinimaxBot instance is NOT safe to call
+// Search() on from multiple threads concurrently. Construct one per game.
+// =========================================================================
+class ParallelMinimaxBot {
+public:
+    ParallelMinimaxBot(int num_threads,
+                       std::size_t tt_bytes_per_thread,
+                       bool strict_parity = true);
+    ~ParallelMinimaxBot();
+
+    ParallelMinimaxBot(const ParallelMinimaxBot&)            = delete;
+    ParallelMinimaxBot& operator=(const ParallelMinimaxBot&) = delete;
+
+    SearchResult Search(const State& s, int depth);
+
+    int NumThreads() const { return num_threads_; }
+
+private:
+    struct Impl;
+    Impl* impl_;
+    int   num_threads_;
+};
+
+// =========================================================================
+// Progressive minimax evaluation.
+//
+// Runs the full model-vs-minimax climb in pure C++:
+//
+//   for depth in 1, 2, 3, ... (until win_rate <= 0.5 or max_depth):
+//       run `games_per_depth` games concurrently
+//           each game uses its own ParallelMinimaxBot with
+//           `threads_per_game` workers
+//       on minimax turns: pure-C++ alpha-beta (GIL released)
+//       on model turns: re-acquire GIL, call `policy_fn(state) -> action`
+//
+// total threads in flight at peak = games_per_depth * threads_per_game.
+// For a 24-core machine, e.g. 6 games x 4 threads/game saturates all cores
+// during the bot search (which is where >95% of wall-time is spent).
+//
+// PolicyFn signature (called per model decision, with GIL re-acquired):
+//   int policy_fn(const State& state, int current_player,
+//                 int game_idx, int depth) -> action_int
+//
+// Returns a map: depth -> { wins, draws, losses, total_nodes, win_rate, ... }.
+// max_depth_beaten is the largest depth where win_rate > 0.5.
+// =========================================================================
+struct GameSpec {
+    int unplaced_white = 9;
+    int unplaced_black = 9;
+    int ai_player      = 0;  // 0 = AI is white, 1 = AI is black
+};
+
+struct DepthResult {
+    int  wins        = 0;
+    int  draws       = 0;
+    int  losses      = 0;
+    long total_nodes = 0;
+    double win_rate  = 0.0;
+    double wall_seconds = 0.0;
+};
+
+struct ProgressiveEvalConfig {
+    int    max_depth          = 100;          // upper bound when unlimited=false
+    int    games_per_depth    = 6;
+    int    max_threads        = 24;           // total threads in flight at peak
+    int    max_steps          = 200;          // per-game step cap (draw on cap)
+    std::size_t tt_bytes_per_thread = 64ULL * 1024 * 1024;
+    bool   unlimited          = true;         // climb until win_rate <= 0.5
+    bool   strict_parity      = true;
+    double time_budget_s      = -1.0;         // negative = no budget
+};
+
+// PolicyFn: called whenever it's the AI's turn. Must return a legal action.
+// The state is read-only from the callback's perspective; the caller will
+// apply the returned action after the callback returns.
+using ProgressivePolicyFn = std::function<int(const State&, int /*current_player*/,
+                                              int /*game_idx*/, int /*depth*/)>;
+
+// Per-depth progress callback. Optional. Fired after each depth completes
+// (after the climb decision is made). Useful for streaming D{n}:W/D/L lines
+// to a logger as soon as a depth finishes.
+using ProgressiveProgressFn = std::function<void(int /*depth*/, const DepthResult&)>;
+
+// GameSpec provider: called once per game, gives caller control over
+// stone counts and which side the AI plays. Default behaviour (when
+// nullptr): ai_player alternates by game index, both sides start with 9.
+using ProgressiveGameSpecFn = std::function<GameSpec(int /*depth*/, int /*game_idx*/)>;
+
+struct ProgressiveEvalResult {
+    int                              max_depth_beaten = 0;
+    std::map<int, DepthResult>       per_depth;
+    double                           total_wall_seconds = 0.0;
+};
+
+ProgressiveEvalResult RunProgressiveEval(const ProgressiveEvalConfig& cfg,
+                                         const ProgressivePolicyFn& policy_fn,
+                                         const ProgressiveGameSpecFn& spec_fn = nullptr,
+                                         const ProgressiveProgressFn& progress_fn = nullptr);
 
 }  // namespace fastnmm
