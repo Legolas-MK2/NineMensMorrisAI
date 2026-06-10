@@ -191,23 +191,19 @@ def compute_opponent_distribution(
 # Graduation criteria (Phase 2-10, mixed opponents).
 #
 # Each WR sampling tick fills a per-depth window (20 samples = 500k-episode
-# lookback). A phase graduates only when ALL of the following hold for every
+# lookback). A phase graduates only when BOTH of the following hold for every
 # currently-unlocked minimax depth:
-#   1. clone_generations_in_phase >= min_clone_generations
-#   2. episodes_in_phase >= min_episodes
-#   3. WR vs the top unlocked depth >= min_wr_top_depth
-#   4. slope angle of WR vs depth d < trend_max_angle_degrees, for every d
-#   5. samples_in_window for depth d >= min_samples_per_depth, for every d
+#   1. episodes_in_phase >= min_episodes
+#   2. slope angle of WR vs depth d < trend_max_angle_degrees, for every d
+#      (with at least min_samples_per_depth samples in the window)
 #
 # Combined-WR is no longer used to drive graduation (it inflated easy depths
 # and hid weakness on top depths). It may still be logged for dashboards.
 GRADUATION_CONFIG = {
     'trend_window_samples': 20,        # samples per depth window (per-depth + legacy combined)
-    'trend_max_angle_degrees': 0.0,    # condition 4: no measurable improvement
-    'min_episodes': 2_500_000,         # condition 2
-    'min_wr_top_depth': 0.70,          # condition 3
-    'min_samples_per_depth': 20,       # condition 5
-    'min_clone_generations': 5,        # condition 1
+    'trend_max_angle_degrees': 0.0,    # condition 2: no measurable improvement
+    'min_episodes': 2_500_000,         # condition 1
+    'min_samples_per_depth': 20,       # condition 2: minimum samples in depth window
 }
 
 
@@ -1052,21 +1048,14 @@ class CurriculumManager:
         if self.current_phase == Phase.PHASE_1:
             return self.mixed_state.get_win_rate_vs_opponent('random') >= config.win_rate_threshold
 
-        # Phase 2-10 graduation: per-depth saturation + competence at top depth.
-        # All five conditions must hold simultaneously.
-        ms = self.mixed_state
+        # Phase 2-10 graduation: per-depth saturation.
+        # Both conditions must hold simultaneously.
 
-        # Condition 1: enough clone generations have happened in this phase
-        # (so the agent has actually faced progressively harder snapshots,
-        # not just its frozen initial clone).
-        if ms.clone_generation < GRADUATION_CONFIG['min_clone_generations']:
-            return False
-
-        # Condition 2: minimum time-in-phase floor.
+        # Condition 1: minimum time-in-phase floor.
         if stats.episodes_in_phase < GRADUATION_CONFIG['min_episodes']:
             return False
 
-        # Conditions 3 & 4: every unlocked depth has plateaued and has enough
+        # Condition 2: every unlocked depth has plateaued and has enough
         # samples in its window.
         return self._has_plateaued()
 

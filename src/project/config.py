@@ -125,11 +125,9 @@ class Config:
     lr_clone_bump_factor: float = 1.3
 
     # Phase graduation thresholds (Phase 2-10, mixed opponents).
-    # All conditions must hold simultaneously to graduate.
-    graduation_min_episodes: int = 2_500_000
-    graduation_min_wr_top_depth: float = 0.70
+    # Both conditions must hold simultaneously to graduate.
+    graduation_min_episodes: int = 1_500_000
     graduation_min_samples_per_depth: int = 20
-    graduation_min_clone_generations: int = 5
 
     # Directories
     model_dir: str = "models"

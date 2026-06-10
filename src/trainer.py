@@ -120,15 +120,10 @@ class PPOTrainer:
         self.best_win_rate = 0.0
         self.recent_returns = deque(maxlen=5000)
 
-        # Throttle + cache for the progressive minimax eval. Episode-based
-        # so the throttle is stable even when log_progress fires multiple
-        # times within one logical log cycle (which happens when
-        # len(experiences) < episodes_per_update). "Every 8 log cycles" =
-        # "every 8 * log_interval episodes" -- a single observable signal.
-        # `_last_minimax_eval_episode = -inf` makes the first call always
-        # eval; subsequent calls eval once `episode_count` has advanced by
-        # >= `minimax_eval_every_n_log_ticks * log_interval`.
-        self._last_minimax_eval_episode: float = float('-inf')
+        # Cache for the progressive minimax eval. Refreshed only at phase
+        # graduations (see `_on_phase_change`) and once at training start
+        # (see `train()`). `log_progress` never triggers a fresh eval --
+        # it reads from this cache so the CSV column stays populated.
         self._last_minimax_eval: Optional[Tuple[int, str]] = None
 
         self.start_time = None
@@ -197,6 +192,18 @@ class PPOTrainer:
         # Notify LR scheduler: shrink peak by phase_reset_factor and restart cycle.
         self.lr_scheduler.notify_phase_graduated()
         self.update_count_at_phase_start = self.update_count
+
+        # End-of-phase: run the progressive minimax eval so the depth
+        # ladder reflects the freshly-graduated model. Result is cached
+        # in `_last_minimax_eval` so every subsequent log_progress line
+        # under the new phase reuses it until the next graduation.
+        print(f"\n=== End-of-phase eval (Phase {int(old_phase)} -> {int(new_phase)}) ===",
+              flush=True)
+        try:
+            max_depth_beaten, minimax_str = self.evaluate_vs_minimax_progressive()
+            self._last_minimax_eval = (max_depth_beaten, minimax_str)
+        except Exception as e:
+            logger.warning("End-of-phase minimax eval failed: %r", e)
 
         # Save checkpoint at phase transition
         self.save_checkpoint(f"phase{int(old_phase)}_complete")
@@ -823,27 +830,15 @@ class PPOTrainer:
             flush=True,
         )
 
-        # Run progressive minimax eval AFTER the header so the per-depth
-        # "  Minimax: D1:… | D2:… | …" lines appear under it as each depth
-        # completes, instead of before it. Throttled by
-        # `minimax_eval_every_n_log_ticks * log_interval` *episodes* so the
-        # cadence is stable even when log_progress fires multiple times in
-        # one log cycle (which happens when len(experiences) <
-        # episodes_per_update). On skipped cycles we reuse the most recent
-        # result so the CSV column and console line stay populated.
-        every_n = max(1, int(self.config.minimax_eval_every_n_log_ticks))
-        eval_period_episodes = every_n * int(self.config.log_interval)
-        episodes_since_last = self.episode_count - self._last_minimax_eval_episode
-        do_eval = (self._last_minimax_eval is None) or (episodes_since_last >= eval_period_episodes)
-        if do_eval:
-            max_depth_beaten, minimax_str = self.evaluate_vs_minimax_progressive()
-            self._last_minimax_eval = (max_depth_beaten, minimax_str)
-            self._last_minimax_eval_episode = self.episode_count
-        else:
-            # Use the cached result for the CSV column but suppress the
-            # console print — silence between Minimax lines is the
-            # visible signal that the throttle is working.
+        # Progressive minimax eval runs ONLY at phase graduations -- see
+        # `_on_phase_change`. Here we just read the cached result so the
+        # CSV column stays populated. `_last_minimax_eval` is None until
+        # the first phase graduation (or the initial eval at train()
+        # start, which seeds the cache for Phase 1's log lines).
+        if self._last_minimax_eval is not None:
             max_depth_beaten, minimax_str = self._last_minimax_eval
+        else:
+            max_depth_beaten, minimax_str = 0, "(no eval yet)"
 
         # Minimax evaluation results
         active_max = opp_wr['active_mm_max_depth']
@@ -1173,6 +1168,19 @@ class PPOTrainer:
 
         self.start_workers()
 
+        # Seed the minimax-eval cache once at startup so the first log
+        # cycle's `Minimax: D1:...` line reflects a real result. Without
+        # this, log_progress would print `(no eval yet)` until the first
+        # phase graduation -- which is many hours away in long phases.
+        if self._last_minimax_eval is None:
+            print("\n=== Startup minimax eval (seeds the per-log cache) ===",
+                  flush=True)
+            try:
+                mb, mstr = self.evaluate_vs_minimax_progressive()
+                self._last_minimax_eval = (mb, mstr)
+            except Exception as e:
+                logger.warning("Startup minimax eval failed: %r", e)
+
         try:
             while self.curriculum.current_phase != Phase.COMPLETED:
                 self._heartbeat("collect")
@@ -1239,6 +1247,32 @@ class PPOTrainer:
                         # just emitted so "log says WR >= 90%" and "fire the
                         # 90% protocol" are the same event.
                         ms.update_dampened_state(opp_wr)
+                        # If every other opponent (random + all unlocked-and-
+                        # trainable minimax depths) is dampened, lift the
+                        # self-play pause early. Otherwise every slot pins at
+                        # `dampen_cap`, sampling collapses to uniform, and no
+                        # opponent produces gradient signal.
+                        if ms.is_selfplay_dampened():
+                            top_d = min(
+                                ms.active_minimax_max_depth,
+                                MIXED_CONFIG['minimax_max_depth'],
+                            )
+                            mm_all_damp = top_d >= 1 and all(
+                                ms.minimax_depth_dominated.get(d, False)
+                                for d in range(1, top_d + 1)
+                            )
+                            if mm_all_damp and ms.random_dominated:
+                                remaining = (
+                                    ms.selfplay_train_cooldown_until
+                                    - ms.total_episodes
+                                )
+                                ms.selfplay_train_cooldown_until = 0
+                                print(
+                                    f"  [Self-play un-dampen] all minimax "
+                                    f"(D1-D{top_d}) and random dampened; "
+                                    f"lifting self-play pause {remaining:,} "
+                                    f"eps early to restore PPO signal."
+                                )
                         self._broadcast_opponent_distribution()
                     self.curriculum.check_and_graduate()
 

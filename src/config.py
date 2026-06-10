@@ -139,16 +139,10 @@ class Config:
     eval_interval: int = 50_000
     eval_games: int = 200
 
-    # Progressive minimax eval is the slowest part of a log tick (D6/D7 each
-    # take seconds-to-minutes even with root-split parallelism). Throttled
-    # in *episode space*: a fresh eval runs once `episode_count` has
-    # advanced by `minimax_eval_every_n_log_ticks * log_interval` episodes
-    # since the last fresh eval. Cached result fills the console / CSV in
-    # between. Episode-based throttling is robust against `log_progress`
-    # firing multiple times per cycle (which happens when
-    # len(experiences) < episodes_per_update). Set to 1 to evaluate on
-    # every log cycle.
-    minimax_eval_every_n_log_ticks: int = 8
+    # Progressive minimax eval runs once at training start (seeds the
+    # cache for the first log lines) and again on every phase graduation.
+    # Log-tick frequency throttling was removed -- phase graduations are
+    # the natural milestone for refreshing the depth ladder.
 
     # LR scheduler — warmup + warm-restart cosine, driven by PPO updates.
     # Peak LR after warmup. Cosine each cycle anneals from this down to lr_min.
@@ -166,11 +160,9 @@ class Config:
     lr_clone_bump_factor: float = 1.3
 
     # Phase graduation thresholds (Phase 2-10, mixed opponents).
-    # All conditions must hold simultaneously to graduate.
+    # Both conditions must hold simultaneously to graduate.
     graduation_min_episodes: int = 2_500_000
-    graduation_min_wr_top_depth: float = 0.70
     graduation_min_samples_per_depth: int = 20
-    graduation_min_clone_generations: int = 5
 
     # Directories
     model_dir: str = "models"
