@@ -195,15 +195,13 @@ def compute_opponent_distribution(
 # currently-unlocked minimax depth:
 #   1. episodes_in_phase >= min_episodes
 #   2. slope angle of WR vs depth d < trend_max_angle_degrees, for every d
-#      (with at least min_samples_per_depth samples in the window)
 #
 # Combined-WR is no longer used to drive graduation (it inflated easy depths
 # and hid weakness on top depths). It may still be logged for dashboards.
 GRADUATION_CONFIG = {
     'trend_window_samples': 20,        # samples per depth window (per-depth + legacy combined)
-    'trend_max_angle_degrees': 0.0,    # condition 2: no measurable improvement
-    'min_episodes': 2_500_000,         # condition 1
-    'min_samples_per_depth': 20,       # condition 2: minimum samples in depth window
+    'trend_max_angle_degrees': 2.0,    # condition 2: allow small upward drift on saturated depths
+    'min_episodes': 1_500_000,         # condition 1
 }
 
 
@@ -1001,10 +999,9 @@ class CurriculumManager:
         """
         Check whether every unlocked minimax depth has plateaued.
 
-        Returns True iff, for every unlocked depth d:
-          - the per-depth window has at least `min_samples_per_depth` samples
-          - the slope angle of WR-vs-depth-d (over a 1M-episode horizon) is
-            below `trend_max_angle_degrees` (i.e., flat or declining).
+        Returns True iff, for every unlocked depth d, the slope angle of
+        WR-vs-depth-d (over a 1M-episode horizon) is below
+        `trend_max_angle_degrees` (i.e., flat or declining).
 
         If any depth is still climbing, the phase is still making progress.
         """
@@ -1014,14 +1011,11 @@ class CurriculumManager:
 
         ms = self.mixed_state
         active_max = ms.active_minimax_max_depth
-        min_samples = GRADUATION_CONFIG['min_samples_per_depth']
         max_angle = GRADUATION_CONFIG['trend_max_angle_degrees']
 
         for d in range(1, active_max + 1):
-            if ms.get_window_size_for_depth(d) < min_samples:
-                return False
             angle = ms.get_slope_angle_for_depth(d)
-            if angle == float('inf') or angle >= max_angle:
+            if angle == float('inf') or angle > max_angle:
                 return False
         return True
 
@@ -1130,8 +1124,11 @@ class CurriculumManager:
         # Reset stats for new phase
         self.stats = PhaseStats(phase=self.current_phase)
 
-        # Reset mixed state for new phase
+        # Reset mixed state for new phase, but carry over the minimax unlock
+        # progression so a graduated phase doesn't have to re-unlock D1→D7.
+        prev_active_max_depth = self.mixed_state.active_minimax_max_depth
         self.mixed_state = MixedTrainingState()
+        self.mixed_state.active_minimax_max_depth = prev_active_max_depth
 
         # Notify callbacks
         for callback in self.on_phase_change_callbacks:
