@@ -89,10 +89,6 @@ MIXED_CONFIG = {
     # self-play window (same window that's logged as wr_vs_self). Checked at
     # log tick (every log_interval episodes).
     'selfplay_winrate_threshold': 0.8,
-    # Minimum episodes between clone updates. Rapid clone churn was collapsing
-    # the policy, so require at least this many episodes since the previous
-    # clone before making a new one.
-    'selfplay_clone_cooldown_episodes': 200_000,
 
     # Minimax depth range — gradual unlock from D1 up to D5 based on win rate.
     # D6 and D7 are intentionally NOT used as training opponents (too slow /
@@ -414,18 +410,11 @@ class MixedTrainingState:
         Designed to be polled at the log tick (every log_interval episodes).
         Uses the same rolling `results_vs_self` window (last 500 self-play
         games) that gets reported as `wr_vs_self` in the CSV/log — no extra
-        bookkeeping. Enforces the cooldown: a new clone cannot be created if
-        the previous clone was created within the last
-        `selfplay_clone_cooldown_episodes` episodes. The very first clone in
-        a phase (clone_generation == 0) is always allowed once the WR
-        threshold is met.
+        bookkeeping. Requires the window to be full so the WR signal is
+        stable.
         """
         if len(self.results_vs_self) < self.results_vs_self.maxlen:
             return False
-        if self.clone_generation > 0:
-            cooldown = MIXED_CONFIG['selfplay_clone_cooldown_episodes']
-            if (self.total_episodes - self.last_clone_episode) < cooldown:
-                return False
         return self.get_win_rate_vs_opponent('self') >= MIXED_CONFIG['selfplay_winrate_threshold']
 
     def on_clone_updated(self):
