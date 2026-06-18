@@ -21,11 +21,16 @@ except Exception:
 
 
 def get_legal_mask(state, num_actions: int) -> np.ndarray:
-    """Create a binary mask of legal actions."""
-    mask = np.zeros(num_actions, dtype=np.float32)
+    """Create a binary mask of legal actions.
+
+    Returned as np.bool_ (1 byte/element) — 4× smaller than the old float32
+    encoding. All callsites consume it as a boolean index (`mask == 0`) or
+    via fancy indexing in symmetry permutations; both work on bool dtype.
+    """
+    mask = np.zeros(num_actions, dtype=np.bool_)
     legal = state.legal_actions()
     if legal:
-        mask[legal] = 1.0
+        mask[legal] = True
     return mask
 
 
@@ -138,8 +143,8 @@ BOARD_POS_TO_GRID: Tuple[Tuple[int, int], ...] = (
 def relativize_obs(state, player: int) -> np.ndarray:
     """Flat player-relative observation: [my_pieces, opp_pieces, ...] per cell.
 
-    pyspiel's `observation_tensor_numpy` returns an absolute board (channel 0 =
-    p0 pieces, channel 1 = p1 pieces) regardless of which player is asking.
+    fastnmm's `observation_tensor_numpy` returns an absolute board (channel 0
+    = p0 pieces, channel 1 = p1 pieces) regardless of which player is asking.
     Swap channels 0/1 when `player == 1` so the network always sees the same
     [self, opponent, ...] layout.
 

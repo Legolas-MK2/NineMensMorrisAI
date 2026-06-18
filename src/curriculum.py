@@ -1,14 +1,39 @@
 """
 Nine Men's Morris - Curriculum Manager
-Handles phased training with automatic progression
+Handles phased training with automatic progression.
 
-Phase Structure:
-- Phase 1: Random stones (3-9), jumping phase, vs random only (warmup)
-          Min 200k episodes, shaping_multiplier=1.0
-- Phase 2-9: 3-9 stones, mixed opponents (30% minimax D1-D2, 65% self-play, 5% random)
-             Shaping multiplier: 1.0 -> 0.0 over first 3/4 of phase, then 0.0 for last 1/4
-             Resets to 1.0 at start of each new phase
-- Phase 10: Full game, no shaping (multiplier=0.0), 1M episodes, minimax D1-D4 (35% minimax, 55% self-play, 10% random)
+Boards are seeded via fastnmm's `starting_stones` engine option — no random
+moves are played to prepare positions. The per-player stone count is drawn
+from a per-phase distribution at every env reset, so adjacent phases overlap
+smoothly.
+
+Phase structure:
+- Phase 1: Per-player stones drawn uniformly from {3..9}, opponent mix is
+          self-play + random only (75% self / 25% random). Used as warmup;
+          graduation is gated on WR vs random.
+- Phase 2-8: Per-player stone count concentrated around 3..9 with a small
+             {-2, -1, 0, +1, +2} spread, mixed opponents. The base mix is
+             equal-share across self + unlocked minimax depths + random, with
+             self-play weighted x3 (see `compute_opponent_distribution`).
+             Currently-dampened slots are pinned at `dampen_cap` (1%).
+- Phase 9: Fixed 9 stones per player (full game), same mixed opponents.
+- Phase 10: Per-player stones drawn uniformly from {3..9}, mixed opponents.
+            Shaping continues its global linear decay (does NOT force to 0
+            on phase entry). Duration is anchored to the shaping schedule:
+            phase 10 runs for PHASE_10_POST_SHAPING_EPISODES after shaping
+            reaches 0. If shaping ended before phase 10 began, phase 10
+            lasts exactly that floor; otherwise it lasts long enough that
+            the final PHASE_10_POST_SHAPING_EPISODES are shaping-free.
+- Phase 11: Infinite phase combining the structure of Phase 9 and Phase 10.
+            Runs forever in alternating sub-phases of
+            `PHASE_11_FULL_GAME_EPISODES` full-game episodes (9 stones per
+            player, like Phase 9) followed by `PHASE_11_MIX_EPISODES`
+            uniform-{3..9} episodes (like Phase 10). The cycle repeats
+            until the operator stops training; the phase never graduates.
+
+Training only opposes minimax depths D1..D5 (see `minimax_max_depth`); WR
+vs D6/D7 is tracked from the periodic progressive minimax eval, never from
+training games.
 """
 
 import os
@@ -28,17 +53,18 @@ logger = get_logger(__name__)
 
 class Phase(IntEnum):
     """Training phases."""
-    PHASE_1 = 1   # Random 3-9 stones, jumping, vs random (warmup)
-    PHASE_2 = 2   # 3 stones, jumping, mixed opponents
-    PHASE_3 = 3   # 4 stones, moving, mixed opponents
-    PHASE_4 = 4   # 5 stones, moving, mixed opponents
-    PHASE_5 = 5   # 6 stones, moving, mixed opponents
-    PHASE_6 = 6   # 7 stones, moving, mixed opponents
-    PHASE_7 = 7   # 8 stones, moving, mixed opponents
-    PHASE_8 = 8   # 9 stones, moving, mixed opponents
-    PHASE_9 = 9   # 9 stones, full game (placing), mixed opponents
-    PHASE_10 = 10 # Final: full game, no shaping, D1-D6 minimax
-    COMPLETED = 11
+    PHASE_1 = 1   # Random 3-9 stones per player, self + random only (warmup)
+    PHASE_2 = 2   # ~3 stones per player, mixed opponents
+    PHASE_3 = 3   # ~4 stones per player, mixed opponents
+    PHASE_4 = 4   # ~5 stones per player, mixed opponents
+    PHASE_5 = 5   # ~6 stones per player, mixed opponents
+    PHASE_6 = 6   # ~7 stones per player, mixed opponents
+    PHASE_7 = 7   # ~8 stones per player, mixed opponents
+    PHASE_8 = 8   # ~9 stones per player, mixed opponents
+    PHASE_9 = 9   # 9 stones per player (full game), mixed opponents
+    PHASE_10 = 10 # Random 3-9 stones per player, shaping keeps decaying
+    PHASE_11 = 11 # Infinite: alternates 2.5M full-game (9 stones) + 2.5M uniform {3..9}
+    COMPLETED = 12
 
 
 @dataclass
@@ -47,8 +73,9 @@ class PhaseConfig:
     phase: Phase
     description: str
 
-    # Opponent settings for Phase 1 (random only)
-    opponent_type: str = 'random'  # 'random' for Phase 1, 'mixed' for Phase 2+
+    # Opponent type. All phases currently use 'mixed'; Phase 1 just omits
+    # minimax from the unlocked set so the mix degenerates to self + random.
+    opponent_type: str = 'mixed'
 
     # Reward multipliers
     win_reward_base: float = 2.0
@@ -201,11 +228,48 @@ GRADUATION_CONFIG = {
 }
 
 
+# Shaping decay schedule, applied across the whole run (not per-phase). Phase 10
+# deliberately keeps consuming this schedule — it does NOT force shaping to 0
+# the moment phase 10 begins.
+SHAPING_DECAY_EPISODES = 20_000_000
+
+# Phase 10 must end with at least this many shaping-free episodes. If shaping
+# already ended before phase 10 started, phase 10 lasts exactly this long;
+# otherwise phase 10 length = (episodes_with_shaping_in_phase_10) + this.
+PHASE_10_POST_SHAPING_EPISODES = 5_000_000
+
+# Phase 10 draw-penalty decay: starts at the per-phase configured draw_penalty
+# (-1.5) at episodes_in_phase=0 and linearly decays to PHASE_10_DRAW_PENALTY_END
+# over PHASE_10_DRAW_PENALTY_DECAY_EPISODES, then stays at the end value. Lower
+# magnitude makes draws less catastrophic so the model can accept a draw against
+# strong minimax instead of forcing a losing aggression.
+PHASE_10_DRAW_PENALTY_END = -0.2
+PHASE_10_DRAW_PENALTY_DECAY_EPISODES = 4_000_000
+
+# Phase 11 sub-phase cycle. Phase 11 alternates indefinitely between two
+# sub-phases:
+#   sub-phase 'full' -> fixed 9 stones per player (like Phase 9), for
+#     PHASE_11_FULL_GAME_EPISODES episodes.
+#   sub-phase 'mix'  -> per-player stones uniform over {3..9} (like
+#     Phase 10), for PHASE_11_MIX_EPISODES episodes.
+# Cycle length = PHASE_11_FULL_GAME_EPISODES + PHASE_11_MIX_EPISODES. The
+# phase never graduates; the operator stops training to end it.
+PHASE_11_FULL_GAME_EPISODES = 2_500_000
+PHASE_11_MIX_EPISODES = 2_500_000
+PHASE_11_CYCLE_EPISODES = PHASE_11_FULL_GAME_EPISODES + PHASE_11_MIX_EPISODES
+
+# Phase 11 inherits Phase 10's end-state draw penalty as a flat value (the
+# decaying schedule has already played out by the time training reaches
+# Phase 11; a flat low-magnitude penalty keeps draws acceptable against
+# strong minimax without re-triggering the decay each cycle).
+PHASE_11_DRAW_PENALTY = PHASE_10_DRAW_PENALTY_END
+
+
 # Define all phases
 PHASE_CONFIGS = {
     Phase.PHASE_1: PhaseConfig(
         phase=Phase.PHASE_1,
-        description="Warmup: 0-150 random pre-moves, 70% self / 30% random",
+        description="warmup; per-player stones uniform over {3..9}; 75% self / 25% random",
         opponent_type='mixed',
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
@@ -219,7 +283,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_2: PhaseConfig(
         phase=Phase.PHASE_2,
-        description="150 random pre-moves, vs mixed",
+        description="per-player stones {3: 78%, 4: 18%, 5: 5%}; vs mixed",
         opponent_type='mixed',
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
@@ -232,7 +296,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_3: PhaseConfig(
         phase=Phase.PHASE_3,
-        description="~129 random pre-moves, vs mixed",
+        description="per-player stones {3: 22%, 4: 55%, 5: 18%, 6: 5%}; vs mixed",
         opponent_type='mixed',
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
@@ -245,7 +309,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_4: PhaseConfig(
         phase=Phase.PHASE_4,
-        description="~107 random pre-moves, vs mixed",
+        description="per-player stones {3: 5%, 4: 18%, 5: 55%, 6: 18%, 7: 5%}; vs mixed",
         opponent_type='mixed',
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
@@ -258,7 +322,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_5: PhaseConfig(
         phase=Phase.PHASE_5,
-        description="~86 random pre-moves, vs mixed",
+        description="per-player stones {4: 5%, 5: 18%, 6: 55%, 7: 18%, 8: 5%}; vs mixed",
         opponent_type='mixed',
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
@@ -271,7 +335,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_6: PhaseConfig(
         phase=Phase.PHASE_6,
-        description="~64 random pre-moves, vs mixed",
+        description="per-player stones {5: 5%, 6: 18%, 7: 55%, 8: 18%, 9: 5%}; vs mixed",
         opponent_type='mixed',
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
@@ -284,7 +348,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_7: PhaseConfig(
         phase=Phase.PHASE_7,
-        description="~43 random pre-moves, vs mixed",
+        description="per-player stones {6: 5%, 7: 18%, 8: 55%, 9: 22%}; vs mixed",
         opponent_type='mixed',
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
@@ -297,7 +361,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_8: PhaseConfig(
         phase=Phase.PHASE_8,
-        description="~21 random pre-moves, vs mixed",
+        description="per-player stones {7: 5%, 8: 18%, 9: 78%}; vs mixed",
         opponent_type='mixed',
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
@@ -310,7 +374,7 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_9: PhaseConfig(
         phase=Phase.PHASE_9,
-        description="Full game from start (0 pre-moves), vs mixed",
+        description="9 stones/player (full game); vs mixed",
         opponent_type='mixed',
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
@@ -323,23 +387,47 @@ PHASE_CONFIGS = {
 
     Phase.PHASE_10: PhaseConfig(
         phase=Phase.PHASE_10,
-        description="Full game, 0-150 random pre-moves, vs harder minimax",
+        description="per-player stones uniform over {3..9}; vs mixed (D1-D5)",
         opponent_type='mixed',
         win_reward_base=2.0,
         win_reward_speed_bonus=1.0,
         loss_reward=-2.0,
         draw_penalty=-1.5,
-        shaping_multiplier=0.0,  # No shaping rewards
+        shaping_multiplier=0.0,  # Per-phase field is unused; live multiplier comes from get_shaping_multiplier
         win_rate_threshold=0.50,
         min_games_for_graduation=1000,
-        max_episodes=0,  # No fixed limit - uses trend-based graduation
+        max_episodes=0,  # Duration enforced by should_graduate using PHASE_10_POST_SHAPING_EPISODES
+    ),
+
+    Phase.PHASE_11: PhaseConfig(
+        phase=Phase.PHASE_11,
+        description=(
+            f"infinite: alternates {PHASE_11_FULL_GAME_EPISODES / 1_000_000:g}M full-game "
+            f"(9 stones) + {PHASE_11_MIX_EPISODES / 1_000_000:g}M uniform {{3..9}}; vs mixed (D1-D5)"
+        ),
+        opponent_type='mixed',
+        win_reward_base=2.0,
+        win_reward_speed_bonus=1.0,
+        loss_reward=-2.0,
+        # Draw penalty is overridden via get_phase11_draw_penalty() (flat
+        # PHASE_11_DRAW_PENALTY); the field value here is only consulted as a
+        # safety fallback.
+        draw_penalty=PHASE_11_DRAW_PENALTY,
+        shaping_multiplier=0.0,  # Live multiplier comes from get_shaping_multiplier (already 0 by phase 11)
+        win_rate_threshold=0.50,
+        min_games_for_graduation=1000,
+        max_episodes=0,  # Phase 11 never graduates; runs until the operator stops training.
     ),
 }
 
 
 @dataclass
 class MixedTrainingState:
-    """State for mixed opponent training (Phase 2+)."""
+    """Per-phase mixed-opponent training state.
+
+    Used by every phase. Phase 1 leaves the minimax depth slots untouched (no
+    minimax is sampled there); Phase 2+ unlock and populate them as WR climbs.
+    """
     total_episodes: int = 0
 
     clone_generation: int = 0
@@ -361,7 +449,8 @@ class MixedTrainingState:
     games_vs_minimax: int = 0
     games_vs_self: int = 0
 
-    # Active minimax depth ceiling (starts at D1, unlocks D2-D7 progressively via win rate)
+    # Active minimax depth ceiling (starts at D1, unlocks D2-D5 progressively
+    # via win rate; D6/D7 are never sampled as training opponents).
     active_minimax_max_depth: int = 1
 
     # Win tracking for last 500 games per opponent type
@@ -706,7 +795,8 @@ class CurriculumManager:
         self.phase_history: List[Dict] = []
         self.total_episodes = 0
 
-        # Mixed training state (for Phase 2+)
+        # Mixed training state (used by all phases — Phase 1 omits minimax
+        # from the unlocked set but still tracks per-opponent windows).
         self.mixed_state = MixedTrainingState()
 
         # Callbacks
@@ -735,12 +825,19 @@ class CurriculumManager:
           offset {-2, -1, 0, +1, +2} → weight {0.05, 0.175, 0.55, 0.175, 0.05}
         Mass falling outside [3, 9] is collapsed onto the boundary. Phases 1
         and 10 keep their "random 3-9" feel via a uniform distribution. Phase
-        9 stays fixed at 9 stones (full game).
+        9 stays fixed at 9 stones (full game). Phase 11 toggles between the
+        Phase 9 and Phase 10 distributions according to its sub-phase cycle
+        (see `get_phase11_subphase`).
         """
         if self.current_phase == Phase.COMPLETED:
             return [(9, 1.0)]
 
         phase_num = int(self.current_phase)
+
+        if phase_num == 11:
+            if self.get_phase11_subphase() == 'full':
+                return [(9, 1.0)]
+            return [(s, 1.0 / 7.0) for s in range(3, 10)]
 
         if phase_num in (1, 10):
             return [(s, 1.0 / 7.0) for s in range(3, 10)]
@@ -773,6 +870,8 @@ class CurriculumManager:
         - Phase 7: 8 stones
         - Phase 8: 9 stones
         - Phase 9: 9 stones (full game)
+        - Phase 11: 9 stones during the 'full' sub-phase, -1 during 'mix'
+          (see `get_phase11_subphase`).
 
         Returns:
             Stone count in [1, 9], or -1 for randomize-per-game phases.
@@ -781,6 +880,9 @@ class CurriculumManager:
             return 9
 
         phase_num = int(self.current_phase)
+
+        if phase_num == 11:
+            return 9 if self.get_phase11_subphase() == 'full' else -1
 
         if phase_num in (1, 10):
             return -1
@@ -791,27 +893,78 @@ class CurriculumManager:
         stones = phase_num + 1  # Phase 2 → 3, Phase 8 → 9
         return max(1, min(9, stones))
 
+    def get_phase11_subphase(self) -> str:
+        """Return Phase 11's current sub-phase: 'full' or 'mix'.
+
+        Phase 11 alternates indefinitely:
+          [0, PHASE_11_FULL_GAME_EPISODES) -> 'full' (9 stones / player)
+          [PHASE_11_FULL_GAME_EPISODES, PHASE_11_CYCLE_EPISODES) -> 'mix'
+        repeating every PHASE_11_CYCLE_EPISODES of episodes-in-phase.
+
+        Outside phase 11 the helper returns 'full' as a harmless default;
+        callers gate on the active phase first.
+        """
+        if self.current_phase != Phase.PHASE_11:
+            return 'full'
+        position = self.stats.episodes_in_phase % PHASE_11_CYCLE_EPISODES
+        return 'full' if position < PHASE_11_FULL_GAME_EPISODES else 'mix'
+
+    def get_phase11_subphase_progress(self) -> Tuple[int, int]:
+        """Return (episodes_into_current_subphase, subphase_length) for Phase 11.
+
+        Used by logging to display progress through the active sub-phase.
+        Outside phase 11 returns (0, 0).
+        """
+        if self.current_phase != Phase.PHASE_11:
+            return (0, 0)
+        position = self.stats.episodes_in_phase % PHASE_11_CYCLE_EPISODES
+        if position < PHASE_11_FULL_GAME_EPISODES:
+            return (position, PHASE_11_FULL_GAME_EPISODES)
+        return (position - PHASE_11_FULL_GAME_EPISODES, PHASE_11_MIX_EPISODES)
+
     def get_shaping_multiplier(self) -> float:
         """
         Monotonic decay across total training episodes (no per-phase reset).
 
         Combined with PBRS, the optimal policy is preserved for any mult ≥ 0,
         so this schedule only controls the *scale* of the dense signal, not
-        its correctness. Decaying smoothly across phases avoids the
-        value-function shock that phase-boundary resets used to cause.
+        its correctness. Decaying smoothly across phases — including into
+        phase 10 — avoids the value-function shock that phase-boundary resets
+        used to cause.
 
         - Start (episode 0): 1.0
         - Linear decay over SHAPING_DECAY_EPISODES
-        - Final phase (PHASE_10) and COMPLETED: floor at 0.0
+        - COMPLETED: floor at 0.0
+        - Phase 10: keeps consuming the same schedule (no short-circuit). The
+          shaping-free tail at the end of phase 10 is enforced by
+          should_graduate(), not by zeroing the multiplier here.
         """
         if self.current_phase == Phase.COMPLETED:
             return 0.0
-        if self.current_phase == Phase.PHASE_10:
-            return 0.0
 
-        SHAPING_DECAY_EPISODES = 20_000_000
         progress = min(1.0, self.total_episodes / SHAPING_DECAY_EPISODES)
         return max(0.0, 1.0 - progress)
+
+    def get_phase10_draw_penalty(self) -> float:
+        """Late-phase draw-penalty schedule (phases 10 and 11).
+
+        - Outside phases 10/11: returns the per-phase configured value
+          unchanged.
+        - Inside phase 10: decays linearly from `config.draw_penalty` (-1.5)
+          to `PHASE_10_DRAW_PENALTY_END` over the first
+          `PHASE_10_DRAW_PENALTY_DECAY_EPISODES` episodes of the phase, then
+          holds at the end value.
+        - Inside phase 11: held flat at `PHASE_11_DRAW_PENALTY` (the same
+          end value Phase 10 decayed to); the cycling sub-phases must not
+          re-trigger a decay.
+        """
+        config = self.get_config()
+        if self.current_phase == Phase.PHASE_11:
+            return PHASE_11_DRAW_PENALTY
+        if self.current_phase != Phase.PHASE_10:
+            return config.draw_penalty
+        progress = min(1.0, self.stats.episodes_in_phase / PHASE_10_DRAW_PENALTY_DECAY_EPISODES)
+        return config.draw_penalty + (PHASE_10_DRAW_PENALTY_END - config.draw_penalty) * progress
 
     def get_reward_config(self) -> Dict[str, float]:
         """Get current reward configuration.
@@ -819,6 +972,10 @@ class CurriculumManager:
         Per-feature weights are scaled by the shaping multiplier. step_penalty
         is scaled too so the final phase is genuinely sparse. Gamma is included
         so the PBRS shaping in RewardCalculator can compute γ·Φ(s') − Φ(s).
+
+        Phase 10 also overrides `draw_penalty` with a linear decay schedule —
+        see `get_phase10_draw_penalty`. Workers receive the updated value via
+        the periodic reward-config rebroadcast in the trainer's log tick.
         """
         config = self.get_config()
         mult = self.get_shaping_multiplier()
@@ -827,7 +984,7 @@ class CurriculumManager:
             'win_reward_base': config.win_reward_base,
             'win_reward_speed_bonus': config.win_reward_speed_bonus,
             'loss_reward': config.loss_reward,
-            'draw_penalty': config.draw_penalty,
+            'draw_penalty': self.get_phase10_draw_penalty(),
             'mill_reward': config.mill_reward * mult,
             'enemy_mill_penalty': config.enemy_mill_penalty * mult,
             'block_mill_reward': config.block_mill_reward * mult,
@@ -867,7 +1024,9 @@ class CurriculumManager:
 
         config = self.get_config()
         if config.opponent_type != 'mixed':
-            return  # Phase 1: no mixed tracking needed
+            # Defensive guard for future non-mixed phases; today every phase
+            # in PHASE_CONFIGS is 'mixed', so this branch is unreachable.
+            return
 
         # Track for mixed training
         self.mixed_state.total_episodes += 1
@@ -1031,7 +1190,23 @@ class CurriculumManager:
         if self.current_phase == Phase.PHASE_1:
             return self.mixed_state.get_win_rate_vs_opponent('random') >= config.win_rate_threshold
 
-        # Phase 2-10 graduation: per-depth saturation.
+        # Phase 10: anchored to the shaping schedule. Phase 10 ends exactly
+        # PHASE_10_POST_SHAPING_EPISODES after shaping reaches 0.
+        #   - If shaping already ended when phase 10 began, duration = floor.
+        #   - If shaping continues N episodes into phase 10, duration = N + floor.
+        if self.current_phase == Phase.PHASE_10:
+            episodes_in_phase = stats.episodes_in_phase
+            total_at_phase_start = self.total_episodes - episodes_in_phase
+            shaping_overlap = max(0, SHAPING_DECAY_EPISODES - total_at_phase_start)
+            required = shaping_overlap + PHASE_10_POST_SHAPING_EPISODES
+            return episodes_in_phase >= required
+
+        # Phase 11: infinite. Cycles full-game / mix sub-phases forever; the
+        # operator stops training to end it. Never graduates on its own.
+        if self.current_phase == Phase.PHASE_11:
+            return False
+
+        # Phase 2-9 graduation: per-depth saturation.
         # Both conditions must hold simultaneously.
 
         # Condition 1: minimum time-in-phase floor.
@@ -1104,8 +1279,10 @@ class CurriculumManager:
 
         old_phase = self.current_phase
 
-        # Move to next phase
-        if self.current_phase == Phase.PHASE_10:
+        # Move to next phase. Phase 11 is the terminal training phase (infinite
+        # cycling sub-phases) — should_graduate() returns False there, so this
+        # branch is only reached for phases 1..10.
+        if self.current_phase == Phase.PHASE_11:
             self.current_phase = Phase.COMPLETED
         else:
             self.current_phase = Phase(int(self.current_phase) + 1)
@@ -1114,7 +1291,7 @@ class CurriculumManager:
         self.stats = PhaseStats(phase=self.current_phase)
 
         # Reset mixed state for new phase, but carry over the minimax unlock
-        # progression so a graduated phase doesn't have to re-unlock D1→D7.
+        # progression so a graduated phase doesn't have to re-unlock D1→D5.
         prev_active_max_depth = self.mixed_state.active_minimax_max_depth
         self.mixed_state = MixedTrainingState()
         self.mixed_state.active_minimax_max_depth = prev_active_max_depth
@@ -1154,8 +1331,18 @@ class CurriculumManager:
         stones = self.get_starting_stones_for_phase()
         stones_str = f"{stones}st" if stones >= 0 else "rand-st"
 
+        if self.current_phase == Phase.PHASE_11:
+            sub = self.get_phase11_subphase()
+            sub_pos, sub_len = self.get_phase11_subphase_progress()
+            phase_label = (
+                f"Phase 11(inf, {sub} "
+                f"{sub_pos // 1000}k/{sub_len // 1000}k)"
+            )
+        else:
+            phase_label = f"Phase {int(self.current_phase)}/11"
+
         parts = [
-            f"Phase {int(self.current_phase)}/10",
+            phase_label,
             stones_str,
             f"WR:{wr:.0%}",
             f"Shape:{shaping_mult:.2f}",
@@ -1174,13 +1361,15 @@ class CurriculumManager:
         return " | ".join(parts)
 
     def get_active_minimax_max_depth(self) -> int:
-        """Get currently unlocked maximum minimax depth (starts at 2, max 4)."""
+        """Get currently unlocked maximum minimax depth (starts at 1, cap = D5)."""
         return self.mixed_state.active_minimax_max_depth
 
     def check_and_unlock_minimax_depth(self) -> bool:
         """
-        Progressively unlock harder minimax depths (D1 → D7):
+        Progressively unlock harder minimax depths (D1 → D5):
         D(n+1) unlocks when WR vs D(n) >= 50% over at least 100 games.
+        D5 is the training cap; D6/D7 are never sampled as training
+        opponents (see `minimax_max_depth`).
         Returns True if a new depth was unlocked.
         """
         config = self.get_config()

@@ -84,7 +84,7 @@ def play_interactive(config: Config = None):
     
     if mode == "3":
         # Progressive minimax test
-        print("\nTesting AI against Minimax depths 1-6...")
+        print("\nTesting AI against Minimax depths 1-6 (eval-only — D5 is the training cap)...")
         stones = int(input("Starting stones per player (1-9, -1=random 3-9): ") or "9")
         max_beaten, results = evaluate_vs_minimax_cpp(
             model, device, game.num_distinct_actions(),
@@ -133,10 +133,9 @@ def play_interactive(config: Config = None):
                 node_feats, global_feats = build_token_obs(state, current)
                 node_t = torch.from_numpy(node_feats).to(device).unsqueeze(0)
                 glob_t = torch.from_numpy(global_feats).to(device).unsqueeze(0)
-                mask = torch.tensor(
-                    get_legal_mask(state, game.num_distinct_actions()),
-                    dtype=torch.float32, device=device
-                ).unsqueeze(0)
+                mask = torch.from_numpy(
+                    get_legal_mask(state, game.num_distinct_actions())
+                ).to(device).unsqueeze(0)
 
                 with torch.no_grad():
                     logits, v = model(node_t, glob_t)
@@ -200,10 +199,9 @@ def play_interactive(config: Config = None):
             node_feats, global_feats = build_token_obs(state, current)
             node_t = torch.from_numpy(node_feats).to(device).unsqueeze(0)
             glob_t = torch.from_numpy(global_feats).to(device).unsqueeze(0)
-            mask = torch.tensor(
-                get_legal_mask(state, game.num_distinct_actions()),
-                dtype=torch.float32, device=device
-            ).unsqueeze(0)
+            mask = torch.from_numpy(
+                get_legal_mask(state, game.num_distinct_actions())
+            ).to(device).unsqueeze(0)
 
             with torch.no_grad():
                 logits, v = model(node_t, glob_t)
@@ -231,26 +229,34 @@ def show_curriculum_info():
     print("CURRICULUM TRAINING PHASES")
     print("=" * 70)
     print("\nBoards are seeded via fastnmm's `starting_stones` engine option;")
-    print("no random moves are played to prepare positions.\n")
+    print("no random moves are played to prepare positions. Each env reset")
+    print("draws TWO independent per-player counts from the phase's distribution,")
+    print("so asymmetric pairs are common and adjacent phases overlap.\n")
 
-    starting_stones_info = {
-        1: "random 3-9 (per game)",
-        2: "3", 3: "4", 4: "5", 5: "6", 6: "7", 7: "8", 8: "9",
-        9: "9",
-        10: "random 3-9 (per game)",
-    }
-
+    # Use a real CurriculumManager so distributions stay in lockstep with the
+    # actual sampling code rather than getting re-hardcoded here.
+    manager = CurriculumManager(save_dir=".curriculum_info_preview")
     for phase, cfg in PHASE_CONFIGS.items():
         phase_num = int(phase)
+        manager.current_phase = phase
+        manager.stats.phase = phase
+        dist = manager.get_stone_distribution_for_phase()
+        dist_str = ", ".join(f"{c}: {w:.0%}" for c, w in dist)
+
         print(f"\nPhase {phase_num}: {cfg.description}")
         print("-" * 50)
-        print(f"  Starting stones: {starting_stones_info.get(phase_num, 'N/A')} per player")
+        print(f"  Stone dist:      {dist_str}")
         print(f"  Opponent:        {cfg.opponent_type}")
-        print(f"  Shaping Mult:    {cfg.shaping_multiplier:.1f}x")
+        print(f"  Shaping (base):  {cfg.shaping_multiplier:.2f}x  "
+              f"(live mult decays globally over training)")
         print(f"  Win Threshold:   {cfg.win_rate_threshold:.0%}")
         print(f"  Min Games:       {cfg.min_games_for_graduation}")
         if cfg.max_episodes > 0:
             print(f"  Max Episodes:    {cfg.max_episodes:,}")
+        if phase == Phase.PHASE_11:
+            print(f"  Duration:        infinite (alternating sub-phases; stop with Ctrl-C)")
+            print(f"  Stone dist shown above is for the CURRENT sub-phase; "
+                  f"the other sub-phase uses the complementary distribution.")
 
     print("\n" + "=" * 70)
 
@@ -275,6 +281,9 @@ Examples:
 
   # Show curriculum information
   python main.py info
+
+  # Run the infinite final phase (Phase 11). Stop with Ctrl-C when you're done.
+  python main.py train --phase 11
         """
     )
     
@@ -300,8 +309,8 @@ Examples:
         help='Environments per worker (default: 48)'
     )
     parser.add_argument(
-        '--phase', type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-        help='Start from specific phase (1-10)'
+        '--phase', type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        help='Start from specific phase (1-11). Phase 11 is infinite (runs until stopped).'
     )
     parser.add_argument(
         '--use-last-checkpoint', action='store_true',
@@ -378,19 +387,24 @@ Examples:
 if __name__ == "__main__":
     if len(sys.argv) == 1:
         print("=" * 70)
-        print("Nine Men's Morris - Curriculum PPO Training (pyspiel)")
+        print("Nine Men's Morris - Curriculum PPO Training (fastnmm)")
         print("=" * 70)
         print()
-        print("This training system uses a 10-phase curriculum with engine-seeded stones:")
+        print("This training system uses an 11-phase curriculum with engine-seeded stones:")
         print()
-        print("  Phase 1:    Random 3-9 stones per game, vs RANDOM (warmup)")
-        print("  Phase 2:    3 stones per player, mixed opponents")
-        print("  Phase 3-8:  4..9 stones per player, mixed opponents")
-        print("  Phase 9:    9 stones, full game, mixed opponents")
-        print("  Phase 10:   Random 3-9 stones per game, D1-D6 minimax")
+        print("  Phase 1:    Per-player stones uniform over {3..9}; self + random only")
+        print("              (75% self / 25% random) — warmup.")
+        print("  Phase 2-8:  Per-player stone count concentrated around 3..9 with a")
+        print("              small spread; mixed opponents.")
+        print("  Phase 9:    9 stones per player (full game); mixed opponents.")
+        print("  Phase 10:   Per-player stones uniform over {3..9}; mixed opponents")
+        print("              (training minimax cap is D5; D6/D7 are eval-only).")
+        print("  Phase 11:   Infinite — alternates 2.5M full-game (9 stones) and 2.5M")
+        print("              uniform-{3..9} sub-phases forever; stop training to end it.")
         print()
         print("Starting stones are configured via fastnmm's `starting_stones` option")
-        print("instead of preparing positions with random moves.")
+        print("instead of preparing positions with random moves. Run `python main.py info`")
+        print("for the full per-phase stone distribution.")
         print()
         print("Usage:")
         print("  python main.py train [options]    # Start training")
@@ -402,7 +416,7 @@ if __name__ == "__main__":
         print("  --workers N         Number of worker processes (default: 22)")
         print("  --envs N            Environments per worker (default: 48)")
         print("  --episodes N        Maximum total episodes")
-        print("  --phase N           Start from curriculum phase N (1-10)")
+        print("  --phase N           Start from curriculum phase N (1-11; 11 is infinite)")
         print()
         print("Examples:")
         print("  # Standard training")

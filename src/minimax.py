@@ -249,10 +249,9 @@ def _play_one_eval_game(
             node_feats, global_feats = build_token_obs(state, current)
             node_t = torch.from_numpy(node_feats).to(device).unsqueeze(0)
             glob_t = torch.from_numpy(global_feats).to(device).unsqueeze(0)
-            mask = torch.tensor(
-                get_legal_mask(state, num_actions),
-                dtype=torch.float32, device=device,
-            ).unsqueeze(0)
+            mask = torch.from_numpy(
+                get_legal_mask(state, num_actions)
+            ).to(device).unsqueeze(0)
             with _gpu_lock, torch.no_grad():
                 with autocast(
                     "cuda",
@@ -460,10 +459,9 @@ def evaluate_vs_minimax_cpp(
         node_feats, global_feats = build_token_obs(state, current_player)
         node_t = torch.from_numpy(node_feats).to(device).unsqueeze(0)
         glob_t = torch.from_numpy(global_feats).to(device).unsqueeze(0)
-        mask = torch.tensor(
-            get_legal_mask(state, num_actions),
-            dtype=torch.float32, device=device,
-        ).unsqueeze(0)
+        mask = torch.from_numpy(
+            get_legal_mask(state, num_actions)
+        ).to(device).unsqueeze(0)
         with _gpu_lock, torch.no_grad():
             with autocast(
                 "cuda",

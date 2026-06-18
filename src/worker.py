@@ -513,6 +513,13 @@ def worker_process(
                 }
                 continue
 
+            if msg['type'] == 'update_reward_config':
+                new_cfg = msg.get('reward_config')
+                if isinstance(new_cfg, dict):
+                    current_reward_config = new_cfg
+                    reward_calculator.update_config(current_reward_config)
+                continue
+
         if not running:
             break
 

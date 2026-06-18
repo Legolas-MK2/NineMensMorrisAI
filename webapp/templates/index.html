@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0f1729">
+    <meta name="color-scheme" content="dark">
+    <title>Nine Men's Morris — Play the AI</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=2">
+</head>
+<body>
+    <header class="app-header">
+        <h1>Nine Men's Morris</h1>
+        <p class="subtitle">Play against a trained neural network</p>
+    </header>
+
+    <main class="layout">
+
+        <section class="panel panel-controls" aria-label="Game setup">
+            <h2>Setup</h2>
+
+            <div class="control-group">
+                <label for="player0-type">You play</label>
+                <select id="player0-type">
+                    <option value="human" selected>Human (white)</option>
+                    <option value="ai">AI (white)</option>
+                    <option value="minimax">Minimax (white)</option>
+                    <option value="random">Random (white)</option>
+                </select>
+            </div>
+
+            <div class="control-group" id="player0-model-group">
+                <label for="player0-model">White model</label>
+                <select id="player0-model"></select>
+            </div>
+
+            <div class="control-group hidden" id="player0-depth-group">
+                <label for="player0-depth">White minimax depth</label>
+                <input type="number" id="player0-depth" min="1" max="8" value="3">
+            </div>
+
+            <div class="control-group">
+                <label for="player1-type">Opponent</label>
+                <select id="player1-type">
+                    <option value="ai" selected>AI (black)</option>
+                    <option value="human">Human (black)</option>
+                    <option value="minimax">Minimax (black)</option>
+                    <option value="random">Random (black)</option>
+                </select>
+            </div>
+
+            <div class="control-group" id="player1-model-group">
+                <label for="player1-model">Black model</label>
+                <select id="player1-model"></select>
+            </div>
+
+            <div class="control-group hidden" id="player1-depth-group">
+                <label for="player1-depth">Black minimax depth</label>
+                <input type="number" id="player1-depth" min="1" max="8" value="3">
+            </div>
+
+            <div class="control-group">
+                <label for="temperature">
+                    AI temperature
+                    <span class="hint">low = sharper, high = varied</span>
+                </label>
+                <input type="range" id="temperature" min="0" max="100" value="40">
+                <output id="temperature-value">0.40</output>
+            </div>
+
+            <div class="button-row">
+                <button id="new-game-btn" class="btn btn-primary">New game</button>
+                <button id="ai-move-btn" class="btn btn-secondary">AI move</button>
+            </div>
+        </section>
+
+        <section class="panel panel-board" aria-label="Board">
+            <div class="board-header">
+                <div class="player-card" id="player-card-0">
+                    <span class="player-dot dot-white"></span>
+                    <span class="player-label">White</span>
+                    <span class="player-pieces" id="p0-pieces">0</span>
+                    <span class="player-reserve" id="p0-reserve">9 left</span>
+                </div>
+                <div class="phase-badge" id="phase-display">—</div>
+                <div class="player-card" id="player-card-1">
+                    <span class="player-dot dot-black"></span>
+                    <span class="player-label">Black</span>
+                    <span class="player-pieces" id="p1-pieces">0</span>
+                    <span class="player-reserve" id="p1-reserve">9 left</span>
+                </div>
+            </div>
+
+            <div id="capture-banner" class="capture-banner hidden">
+                <span class="capture-icon" aria-hidden="true">🎯</span>
+                <span id="capture-banner-text">Mill formed — capture an opponent piece!</span>
+            </div>
+
+            <div class="board-wrap">
+                <svg id="board" viewBox="0 0 700 700" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Nine Men's Morris board">
+                    <g id="board-lines"></g>
+                    <g id="board-points"></g>
+                    <g id="board-pieces"></g>
+                    <g id="board-highlights"></g>
+                </svg>
+            </div>
+
+            <div class="status-bar">
+                <span id="turn-indicator">Press New game to start</span>
+            </div>
+
+            <div id="game-over" class="game-over hidden">
+                <strong id="winner-text"></strong>
+                <button id="play-again-btn" class="btn btn-primary">Play again</button>
+            </div>
+        </section>
+
+        <section class="panel panel-info" aria-label="Move log">
+            <h2>Activity</h2>
+            <div class="legend">
+                <p>How to play:</p>
+                <ul>
+                    <li>Tap an empty point to <strong>place</strong> a piece.</li>
+                    <li>Once all 9 are placed, tap a piece then a connected point to <strong>move</strong>.</li>
+                    <li>Forming a row of 3 lets you <strong>capture</strong> an opponent's piece.</li>
+                </ul>
+            </div>
+            <h3>Move log</h3>
+            <div id="move-log" class="move-log"></div>
+            <h3 class="ai-thoughts-heading">AI top moves</h3>
+            <div id="ai-thoughts" class="ai-thoughts">
+                <p class="hint">The AI's top-ranked moves will appear here.</p>
+            </div>
+        </section>
+
+    </main>
+
+    <footer class="app-footer">
+        <span>Drop new <code>.pt</code> models into <code>webapp/models/</code></span>
+    </footer>
+
+    <script src="{{ url_for('static', filename='app.js') }}?v=4"></script>
+</body>
+</html>

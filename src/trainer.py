@@ -1,11 +1,20 @@
 """
 Nine Men's Morris - PPO Trainer with Curriculum Learning
-Main training loop with phased curriculum progression
+Main training loop with phased curriculum progression.
 
-Phase Structure:
-- Phase 1: 3 stones jumping, vs random (warmup)
-- Phase 2-9: 3-9 stones, mixed opponents (30% minimax, 60% self, 10% random)
-- Phase 10: Full game, harder minimax (35% minimax, 55% self, 10% random)
+Phase structure (see curriculum.py for full details):
+- Phase 1: per-player stones uniform over {3..9}; warmup with self + random
+  (75% / 25%); graduated when WR vs random crosses threshold.
+- Phase 2-8: per-player stone count concentrated around the phase target
+  (3..9) with a small spread; mixed opponents (self, unlocked minimax depths,
+  random) sampled by `compute_opponent_distribution`.
+- Phase 9: fixed 9 stones per player (full game), same mixed opponents.
+- Phase 10: per-player stones uniform over {3..9}; mixed opponents; duration
+  anchored to the shaping schedule (ends after a configured shaping-free tail).
+- Phase 11: infinite phase; alternates 2.5M full-game (9 stones) sub-phases
+  with 2.5M uniform-{3..9} sub-phases forever. Never graduates; the operator
+  stops training to end it. Sub-phase flips re-broadcast stone-distribution
+  game settings to workers.
 """
 
 import os
@@ -32,7 +41,7 @@ from utils import get_legal_mask, ExperienceBatch, relativize_obs
 from minimax import evaluate_vs_minimax_cpp, format_minimax_results
 from worker import worker_process
 from curriculum import (
-    CurriculumManager, Phase, PHASE_CONFIGS, MIXED_CONFIG,
+    CurriculumManager, Phase, PHASE_CONFIGS, MIXED_CONFIG, GRADUATION_CONFIG,
 )
 from lr_scheduler import WarmRestartLRScheduler
 from logging_setup import get_logger
@@ -126,6 +135,15 @@ class PPOTrainer:
         # it reads from this cache so the CSV column stays populated.
         self._last_minimax_eval: Optional[Tuple[int, str]] = None
 
+        # Phase 11 sub-phase tracker. Phase 11 toggles between 'full' (9
+        # stones / player) and 'mix' (uniform {3..9}) sub-phases every
+        # PHASE_11_FULL_GAME_EPISODES / PHASE_11_MIX_EPISODES episodes.
+        # We rebroadcast game settings (stone distribution) to workers on
+        # every sub-phase flip; the trainer detects the flip by comparing
+        # the curriculum's reported sub-phase against this cache at each
+        # log tick. Initialized lazily on first phase-11 log tick.
+        self._last_phase11_subphase: Optional[str] = None
+
         self.start_time = None
 
         # Clone model for self-play
@@ -212,14 +230,18 @@ class PPOTrainer:
         self._broadcast_game_settings()
         self._broadcast_curriculum_update()
 
-        # Initialize clone for mixed phases (Phase 2+)
+        # Refresh clone weights for the new phase. Every phase (including
+        # Phase 1 warmup) samples self-play, so the clone needs to track the
+        # latest weights at every phase boundary.
         if new_phase != Phase.COMPLETED:
             new_config = PHASE_CONFIGS.get(new_phase)
             if new_config and new_config.opponent_type == 'mixed':
                 self._update_clone_model()
-                # New mixed phase starts at D1 only (active_minimax_max_depth=1).
-                # The full distribution encodes both the unlocked range and the
-                # (fresh, all-False) dampened set.
+                # active_minimax_max_depth carries over across graduations
+                # (Phase 1 has no minimax in its distribution; Phase 2 starts
+                # at D1 and progressively unlocks). The full distribution
+                # encodes both the unlocked range and the (post-reset,
+                # all-False) dampened set.
                 self._broadcast_opponent_distribution()
 
     def _broadcast_opponent_distribution(self):
@@ -259,7 +281,12 @@ class PPOTrainer:
         self._broadcast_clone_update()
 
     def _on_clone_update(self):
-        """Callback when clone should be updated (85% WR over 1000 games, cooldown-gated)."""
+        """Callback when the clone should be updated.
+
+        Trigger: wr_vs_self over the rolling 500-game self-play window
+        crosses `selfplay_winrate_threshold` (default 80%), checked at
+        each log tick.
+        """
         self._update_clone_model()
         # Bump LR slightly to help adapt to the harder snapshot, then restart cycle.
         self.lr_scheduler.notify_clone_replaced()
@@ -311,6 +338,57 @@ class PPOTrainer:
         if config.opponent_type == 'mixed':
             msg['opponent_distribution'] = self.curriculum.get_opponent_distribution()
 
+        for q in self.control_queues:
+            try:
+                q.put(msg)
+            except:
+                pass
+
+    def _maybe_broadcast_phase11_subphase_change(self):
+        """Detect a Phase 11 sub-phase flip and rebroadcast game settings.
+
+        Phase 11 alternates infinitely between two stone-distribution regimes
+        (full game vs uniform mix). The distribution lives in worker memory
+        and is only re-sent on explicit broadcasts, so the trainer must push
+        a refreshed `update_game_settings` message whenever the curriculum
+        reports a different sub-phase than it did at the previous log tick.
+        No-op outside Phase 11.
+        """
+        if self.curriculum.current_phase != Phase.PHASE_11:
+            self._last_phase11_subphase = None
+            return
+        current = self.curriculum.get_phase11_subphase()
+        if self._last_phase11_subphase is None:
+            # First log tick under phase 11 — sync the cache; the initial
+            # game-settings broadcast was already sent on phase entry by
+            # `_on_phase_change`.
+            self._last_phase11_subphase = current
+            return
+        if current != self._last_phase11_subphase:
+            prev = self._last_phase11_subphase
+            self._last_phase11_subphase = current
+            sub_pos, sub_len = self.curriculum.get_phase11_subphase_progress()
+            print(
+                f"  [Phase 11] Sub-phase flip: {prev} -> {current} "
+                f"(next {sub_len:,} eps; cycle {sub_pos:,}/{sub_len:,})",
+                flush=True,
+            )
+            # Stone-distribution changed; reward config (draw penalty is flat
+            # in phase 11) is unaffected, so we only push the game settings.
+            self._broadcast_game_settings()
+
+    def _broadcast_reward_config(self):
+        """Send only the reward config to all workers (no opp-type / dist).
+
+        Used at the log tick during phase 10 to propagate the slowly-decaying
+        draw_penalty. Kept separate from `_broadcast_curriculum_update` so it
+        cannot accidentally trigger env recreation in workers — the worker
+        handler updates the reward_calculator and nothing else.
+        """
+        msg = {
+            'type': 'update_reward_config',
+            'reward_config': self.curriculum.get_reward_config(),
+        }
         for q in self.control_queues:
             try:
                 q.put(msg)
@@ -536,8 +614,9 @@ class PPOTrainer:
 
                     # Drop dampened-opponent experiences from PPO training.
                     # Sampling and training share the same dampened-set so a
-                    # game played against a 1%-pinned opponent never feeds the
-                    # gradient. Phase 1 has no mixed tracking — always train.
+                    # game played against a 1%-pinned opponent never feeds
+                    # the gradient. The `opponent_type != 'mixed'` branch is
+                    # an unreachable safety net (all phases are mixed today).
                     curr_cfg = self.curriculum.get_config()
                     if curr_cfg.opponent_type == 'mixed':
                         dampened = self.curriculum.mixed_state.get_dampened_set()
@@ -717,10 +796,9 @@ class PPOTrainer:
                     if pid == our_player:
                         obs_arr = relativize_obs(state, pid)
                         obs = torch.from_numpy(obs_arr).to(self.device).unsqueeze(0)
-                        mask = torch.tensor(
-                            get_legal_mask(state, self.num_actions),
-                            dtype=torch.float32, device=self.device
-                        ).unsqueeze(0)
+                        mask = torch.from_numpy(
+                            get_legal_mask(state, self.num_actions)
+                        ).to(self.device).unsqueeze(0)
 
                         with autocast('cuda', enabled=self.config.use_mixed_precision):
                             logits, _ = self.model(obs)
@@ -810,7 +888,8 @@ class PPOTrainer:
         config = self.curriculum.get_config()
 
         # Get per-opponent win rates (last 500 games each).
-        # Phase 1 uses random-only training and does not populate mixed buffers.
+        # All phases are currently 'mixed'; the fallback is a defensive
+        # placeholder for any future non-mixed phase.
         opp_wr = self.curriculum.get_opponent_win_rates()
         if config.opponent_type != 'mixed':
             opp_wr = {
@@ -830,11 +909,9 @@ class PPOTrainer:
             flush=True,
         )
 
-        # Progressive minimax eval runs ONLY at phase graduations -- see
-        # `_on_phase_change`. Here we just read the cached result so the
-        # CSV column stays populated. `_last_minimax_eval` is None until
-        # the first phase graduation (or the initial eval at train()
-        # start, which seeds the cache for Phase 1's log lines).
+        # Progressive minimax eval runs ONLY at phase graduations (and once
+        # at startup) -- see `_on_phase_change` and `train()`. Here we just
+        # read the cached result so the CSV column stays populated.
         if self._last_minimax_eval is not None:
             max_depth_beaten, minimax_str = self._last_minimax_eval
         else:
@@ -864,7 +941,8 @@ class PPOTrainer:
             print(f"  WR(500):{depth_str} [MaxD:{active_max}] "
                   f"Rnd:{wr_random:.0%}{rnd_train_note} Self:{opp_wr['wr_vs_self']:.0%}{self_note}")
         else:
-            print(f"  WR({len(curr_stats.recent_results)}): Rnd:{win_rate:.0%} (mixed opponent WR tracking starts in Phase 2)")
+            # Defensive fallback for any future non-mixed phase.
+            print(f"  WR({len(curr_stats.recent_results)}): Rnd:{win_rate:.0%}")
 
         # CSV logging
         if self.log_file is None:
@@ -978,7 +1056,7 @@ class PPOTrainer:
         """
         snapshot = self.curriculum.last_graduation_snapshot
         if snapshot is None:
-            return  # Phase 1's win-rate-driven graduation also lands here; no per-depth data.
+            return  # No per-depth data captured for this graduation.
 
         episodes_in_phase = snapshot.get('episodes_in_phase', 0)
         updates_in_phase = self.update_count - self.update_count_at_phase_start
@@ -1148,12 +1226,17 @@ class PPOTrainer:
         )
         print()
 
-        print(f"Mixed Training (Phase 2-10):")
-        print(f"  Opponent mix: equal-share across self + unlocked minimax D1-D{MIXED_CONFIG['minimax_max_depth']} + random,")
-        print(f"                self-play weighted ×{MIXED_CONFIG['selfplay_weight']:.0f}. Dampened slots pinned at {MIXED_CONFIG['dampen_cap']:.0%}.")
-        print(f"  Minimax depths unlock progressively (D1 → D7) by win rate.")
-        print(f"  Self-play: Clone update at {MIXED_CONFIG['selfplay_winrate_threshold']*100:.0f}% WR over the rolling 500-game self-play window (checked at log tick)")
-        print(f"  Graduation: Trend-based (plateau detection < 1° angle over 1M episodes)")
+        print(f"Mixed Training (Phase 1-11):")
+        print(f"  Phase 1 mix: self + random only (no minimax) — 75% self / 25% random.")
+        print(f"  Phase 2-11 mix: equal-share across self + unlocked minimax D1-D{MIXED_CONFIG['minimax_max_depth']} + random,")
+        print(f"                  self-play weighted ×{MIXED_CONFIG['selfplay_weight']:.0f}. Dampened slots pinned at {MIXED_CONFIG['dampen_cap']:.0%}.")
+        print(f"  Minimax depths unlock progressively (D1 → D{MIXED_CONFIG['minimax_max_depth']}) by win rate; "
+              f"D6/D7 stay eval-only.")
+        print(f"  Self-play: Clone update at {MIXED_CONFIG['selfplay_winrate_threshold']*100:.0f}% WR over the rolling 500-game self-play window (checked at log tick).")
+        print(f"  Graduation (Phase 2-9): trend-based plateau detection < "
+              f"{GRADUATION_CONFIG['trend_max_angle_degrees']:.1f}° over a 1M-episode horizon "
+              f"for every unlocked depth.")
+        print(f"  Phase 11 is infinite: alternates 2.5M full-game + 2.5M uniform-mix sub-phases until stopped.")
         print()
 
         config = self.curriculum.get_config()
@@ -1274,6 +1357,19 @@ class PPOTrainer:
                                     f"eps early to restore PPO signal."
                                 )
                         self._broadcast_opponent_distribution()
+                    # Phase 10: draw_penalty decays linearly over its first
+                    # 4M episodes (see PHASE_10_DRAW_PENALTY_DECAY_EPISODES in
+                    # curriculum.py). Push the freshly-computed value out to
+                    # workers each log tick so terminal rewards track the
+                    # schedule instead of staying pinned at the phase-start
+                    # value.
+                    if self.curriculum.current_phase == Phase.PHASE_10:
+                        self._broadcast_reward_config()
+                    # Phase 11: flip stone distribution on sub-phase change.
+                    # Draw penalty is flat in phase 11 so no reward-config
+                    # rebroadcast is required, but the stone distribution
+                    # swaps between full-game and uniform-mix each cycle.
+                    self._maybe_broadcast_phase11_subphase_change()
                     self.curriculum.check_and_graduate()
 
                 # Checkpointing

@@ -57,7 +57,7 @@ class Config:
     # you observe high collision rates.
     minimax_tt_bytes_per_bot: int = 128 * 1024 * 1024
 
-    # Observation shape from pyspiel (set at runtime, e.g. [5, 7, 7] for nine_mens_morris)
+    # Observation shape from fastnmm (set at runtime, e.g. [5, 7, 7] for nine_mens_morris)
     # Channel 0 = player 0 pieces, Channel 1 = player 1 pieces, rest = game state
     obs_shape: Optional[List[int]] = None
 
@@ -115,9 +115,9 @@ class Config:
     # Game settings
     max_game_steps: int = 300
 
-    # Note: Using pyspiel's nine_mens_morris game
-    # Random moves are used to prepare board positions for training
-    # The number of random moves is managed by curriculum per phase
+    # Note: Using fastnmm's nine_mens_morris C++ engine.
+    # Board positions are seeded via the engine's `starting_stones` option;
+    # the curriculum controls the per-phase per-player stone distribution.
 
     # Mixed precision
     use_mixed_precision: bool = True
@@ -133,7 +133,9 @@ class Config:
     normalize_returns: bool = False
     return_norm_clip: float = 5.0
     
-    # Logging - less frequent, always with minimax eval
+    # Logging cadence. Progressive minimax eval is NOT rerun every log tick —
+    # it only runs at training startup and on phase graduation (see
+    # PPOTrainer._on_phase_change); each log tick reuses the cached result.
     log_interval: int = 25_000
     save_interval: int = 100_000
     eval_interval: int = 50_000

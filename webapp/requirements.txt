@@ -1,0 +1,6 @@
+# Runtime deps for the Nine Men's Morris public webapp.
+# fastnmm is the C++ game engine; install it from the parent repo with:
+#   pip install -e ../fastnmm
+Flask>=2.3
+numpy>=1.24
+torch>=2.0

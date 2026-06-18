@@ -1,0 +1,6 @@
+# Don't commit model binaries — they ship out-of-band.
+models/*.pt
+!models/.gitkeep
+
+__pycache__/
+*.pyc
