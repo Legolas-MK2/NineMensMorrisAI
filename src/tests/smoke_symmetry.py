@@ -33,7 +33,6 @@ def make_tiny_config(use_aug: bool, tmpdir: str, policy_head: str = 'pointer'):
     cfg.ppo_epochs = 1
     cfg.mini_batch_size = 256
     cfg.minimax_threads_per_worker = 1
-    cfg.reserved_display_cores = 0
     cfg.worker_nice = 0
     cfg.use_mixed_precision = False
     cfg.use_symmetry_aug = use_aug

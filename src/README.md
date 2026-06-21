@@ -137,9 +137,7 @@ are invariant to sigma, so the bias is correct in every augmented frame.
 ### Parallelism
 
 - **N worker processes**, each managing `envs_per_worker` games. Workers
-  pin themselves to a sub-range of CPU cores (leaving
-  `reserved_display_cores` for the display server) and run with a niceness
-  offset so the desktop stays responsive.
+  run across all available CPU cores with a niceness offset.
 - **One thread pool per worker** for asynchronous minimax (default 2
   threads per worker). The C++ minimax engine releases the GIL during
   search, so multiple bot threads run concurrently on different cores.

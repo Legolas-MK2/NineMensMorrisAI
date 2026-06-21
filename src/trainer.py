@@ -401,22 +401,6 @@ class PPOTrainer:
         progress = min(1.0, self.episode_count / cfg.entropy_decay_episodes)
         return cfg.entropy_coef_start + progress * (cfg.entropy_coef_end - cfg.entropy_coef_start)
 
-    def _setup_cpu_affinity(self) -> None:
-        """Pin the trainer process to the worker core range, leaving the
-        reserved tail for the display server / IDE."""
-        reserved = int(getattr(self.config, "reserved_display_cores", 0))
-        if reserved <= 0:
-            return
-        try:
-            available = sorted(os.sched_getaffinity(0))
-            worker_cores = [c for c in available if c < (len(available) - reserved)]
-            if worker_cores:
-                os.sched_setaffinity(0, set(worker_cores))
-                print(f"  Trainer pinned to cores {worker_cores[0]}-"
-                      f"{worker_cores[-1]} ({reserved} reserved for display)")
-        except (AttributeError, OSError) as e:
-            print(f"  WARN: could not set trainer CPU affinity: {e!r}")
-
     def _build_worker_shared_state(self) -> Dict:
         """Construct the `shared_state` dict workers bootstrap from."""
         curr_cfg = self.curriculum.get_config()
@@ -434,7 +418,6 @@ class PPOTrainer:
 
     def start_workers(self):
         """Start worker processes."""
-        self._setup_cpu_affinity()
         print(f"Starting {self.config.num_workers} workers...")
 
         self.request_queue = mp.Queue()
@@ -844,13 +827,8 @@ class PPOTrainer:
             # visible live without spamming a new line per depth.
             print(f"\r  Minimax: {' | '.join(accumulated)}", end='', flush=True)
 
-        # Eval runs during the trainer's log tick — the inference-server
-        # thread is busy here, so the workers are blocked waiting for their
-        # forward responses. That makes the worker-core slice (cpu_count -
-        # reserved_display_cores) effectively idle and available.
         cpu_count = os.cpu_count() or 4
-        reserved = int(getattr(self.config, "reserved_display_cores", 0))
-        thread_cap = max(6, cpu_count - max(0, reserved))
+        thread_cap = max(6, cpu_count)
 
         max_depth_beaten, results = evaluate_vs_minimax_cpp(
             self.model, self.device, self.num_actions,

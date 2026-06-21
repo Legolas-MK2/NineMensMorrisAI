@@ -15,12 +15,6 @@ from __future__ import annotations
 
 import os
 
-# Cap BLAS thread pools BEFORE importing torch/numpy so a single inference
-# request doesn't try to claim every core on the host.
-os.environ.setdefault("OMP_NUM_THREADS", "4")
-os.environ.setdefault("MKL_NUM_THREADS", "4")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
-
 import random
 import socket
 import sys

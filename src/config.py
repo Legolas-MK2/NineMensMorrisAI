@@ -31,17 +31,8 @@ class Config:
 
     # Per-worker async-minimax thread pool.
     # Total concurrent minimax searches = num_workers * minimax_threads_per_worker.
-    # Keep this product <= (physical_cores - reserved_display_cores) or the
-    # X/VNC server starves and the desktop freezes during training.
-    # Default 2 -> 16*2 = 32 threads, fits a 48-core box leaving 4 for display.
     minimax_threads_per_worker: int = 2
 
-    # CPU isolation for desktop responsiveness when running in a VNC
-    # or VSCodium container. Workers pin to cores [0, ncpu - reserved)
-    # and run with `worker_nice` niceness. The display server keeps
-    # cores [ncpu - reserved, ncpu) for itself.
-    # Set reserved_display_cores=0 to disable on bare-metal setups.
-    reserved_display_cores: int = 4
     worker_nice: int = 10  # niceness offset; 0 = same priority as parent
 
     # Minimax transposition-table size, per (worker, depth) bot.

@@ -190,20 +190,6 @@ def worker_process(
     np.random.seed(worker_id + int(time.time() * 1000) % 2**31)
     random.seed(worker_id + int(time.time() * 1000) % 2**31)
 
-    # Restrict workers to a sub-range of cores so the X/VNC server keeps
-    # CPU available and the desktop stays responsive. Without this, 16+
-    # workers each running C++ minimax on a multi-thread executor saturate
-    # all cores and the VNC framebuffer stops updating.
-    reserved = int(getattr(config, "reserved_display_cores", 0))
-    if reserved > 0:
-        try:
-            available = sorted(os.sched_getaffinity(0))
-            worker_cores = [c for c in available if c < (len(available) - reserved)]
-            if worker_cores:
-                os.sched_setaffinity(0, set(worker_cores))
-        except (AttributeError, OSError):
-            pass
-
     nice_level = int(getattr(config, "worker_nice", 0))
     if nice_level > 0:
         try:
@@ -346,8 +332,6 @@ def worker_process(
     for env in envs:
         setup_new_game(env)
 
-    # Thread pool for async minimax. Sized via Config: too many threads
-    # across all workers saturates the box and starves the display server.
     minimax_thread_count = max(1, int(getattr(config, "minimax_threads_per_worker", 2)))
     minimax_executor = ThreadPoolExecutor(max_workers=minimax_thread_count)
 
