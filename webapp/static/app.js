@@ -39,9 +39,13 @@ const state = {
     selectedFrom: null,          // for the "select piece -> select dest" flow
     busy: false,                 // suppress double-clicks while a request is in flight
     gameStarted: false,
+    // Bumped on every New Game. In-flight fetch handlers compare against this
+    // before touching state.boardState — stale responses from a previous game
+    // are dropped instead of clobbering the freshly initialised board.
+    gameGen: 0,
     config: {                    // mirrors the form (refreshed on New Game)
-        player0_type: 'human',
-        player1_type: 'ai',
+        player0_type: 'ai',
+        player1_type: 'human',
         player0_model: '',
         player1_model: '',
         player0_depth: 3,
@@ -357,6 +361,7 @@ function onPointClick(pos) {
 }
 
 async function applyHumanMove(action) {
+    const gen = state.gameGen;
     state.busy = true;
     try {
         const r = await fetch('/api/move', {
@@ -365,6 +370,7 @@ async function applyHumanMove(action) {
             body: JSON.stringify({ action }),
         });
         const data = await r.json();
+        if (gen !== state.gameGen) return;  // game restarted while in flight
         if (!data.success) {
             console.warn('Move rejected:', data.error);
             return;
@@ -375,8 +381,9 @@ async function applyHumanMove(action) {
         renderPieces(data.state.positions);
         renderHighlights(data.state.legal_actions, data.state);
     } finally {
-        state.busy = false;
+        if (gen === state.gameGen) state.busy = false;
     }
+    if (gen !== state.gameGen) return;
     // If the next player is an AI/minimax/random, schedule their move.
     maybeAutoplay();
 }
@@ -398,7 +405,9 @@ async function doAiMove() {
     const cur = snap.current_player;
     const type = state.config[`player${cur}_type`];
 
+    const gen = state.gameGen;
     state.busy = true;
+    let failed = false;
     try {
         const payload = {
             player_type: type,
@@ -412,8 +421,12 @@ async function doAiMove() {
             body: JSON.stringify(payload),
         });
         const data = await r.json();
+        if (gen !== state.gameGen) return;  // game restarted while in flight
         if (!data.success) {
+            failed = true;
             console.warn('AI move failed:', data.error);
+            const turn = $('turn-indicator');
+            if (turn) turn.textContent = `AI move failed: ${data.error || 'unknown error'}`;
             return;
         }
         appendLog(data.player, data.move_description);
@@ -424,8 +437,9 @@ async function doAiMove() {
         renderPieces(data.state.positions);
         renderHighlights(data.state.legal_actions, data.state);
     } finally {
-        state.busy = false;
+        if (gen === state.gameGen) state.busy = false;
     }
+    if (gen !== state.gameGen || failed) return;
     // Chain if it's still a bot's turn (e.g. consecutive bot players, or post-capture).
     if (state.boardState && !state.boardState.is_terminal) {
         const nextType = state.config[`player${state.boardState.current_player}_type`];
@@ -481,17 +495,28 @@ async function newGame() {
     state.config.player0_depth = parseInt($('player0-depth').value, 10) || 3;
     state.config.player1_depth = parseInt($('player1-depth').value, 10) || 3;
 
+    // Invalidate any in-flight requests from the previous game and wipe the
+    // busy flag — otherwise a stale doAiMove finishing after this point would
+    // overwrite state.boardState (and the freshly drawn highlights), and a
+    // busy=true left over from a stalled request would block the new game's
+    // first AI move from ever firing.
+    state.gameGen++;
+    state.busy = false;
     state.selectedFrom = null;
     state.lastAiHighlight = null;
+    state.boardState = null;
     $('move-log').innerHTML = '';
     showAiThoughts(null);
 
+    const gen = state.gameGen;
     const r = await fetch('/api/new_game', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(state.config),
     });
     const data = await r.json();
+    // Bail if the user clicked New Game again while this one was in flight.
+    if (gen !== state.gameGen) return;
     if (!data.success) {
         alert('Could not start game.');
         return;

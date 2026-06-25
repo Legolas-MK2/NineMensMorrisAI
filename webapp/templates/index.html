@@ -21,10 +21,10 @@
             <h2>Setup</h2>
 
             <div class="control-group">
-                <label for="player0-type">You play</label>
+                <label for="player0-type">Opponent</label>
                 <select id="player0-type">
-                    <option value="human" selected>Human (white)</option>
-                    <option value="ai">AI (white)</option>
+                    <option value="human">Human (white)</option>
+                    <option value="ai" selected>AI (white)</option>
                     <option value="minimax">Minimax (white)</option>
                     <option value="random">Random (white)</option>
                 </select>
@@ -41,10 +41,10 @@
             </div>
 
             <div class="control-group">
-                <label for="player1-type">Opponent</label>
+                <label for="player1-type">You play</label>
                 <select id="player1-type">
-                    <option value="ai" selected>AI (black)</option>
-                    <option value="human">Human (black)</option>
+                    <option value="ai">AI (black)</option>
+                    <option value="human" selected>Human (black)</option>
                     <option value="minimax">Minimax (black)</option>
                     <option value="random">Random (black)</option>
                 </select>
@@ -140,6 +140,6 @@
         <span>Drop new <code>.pt</code> models into <code>webapp/models/</code></span>
     </footer>
 
-    <script src="{{ url_for('static', filename='app.js') }}?v=4"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=6"></script>
 </body>
 </html>

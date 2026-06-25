@@ -356,6 +356,14 @@ def api_ai_move():
         current_player = gs.state.current_player()
         probabilities: Optional[Dict[int, float]] = None
 
+        # Defensive: if the seat whose turn it is was configured as human, refuse.
+        # This catches a stale ai_move request that arrives after a new_game reset —
+        # without this check the server would happily play for the human side using
+        # whatever model the (now-orphaned) client request supplied.
+        configured = gs.player_types.get(current_player, "human")
+        if configured == "human":
+            return jsonify({"success": False, "error": "Not the bot's turn"}), 409
+
         if player_type == "ai":
             model = gs.player_models.get(current_player)
             if model is None:

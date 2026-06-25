@@ -115,7 +115,7 @@ MIXED_CONFIG = {
     # Self-play: clone update at 80% win rate over the rolling 500-game
     # self-play window (same window that's logged as wr_vs_self). Checked at
     # log tick (every log_interval episodes).
-    'selfplay_winrate_threshold': 0.8,
+    'selfplay_winrate_threshold': 0.92,
 
     # Minimax depth range — gradual unlock from D1 up to D5 based on win rate.
     # D6 and D7 are intentionally NOT used as training opponents (too slow /
@@ -892,6 +892,18 @@ class CurriculumManager:
 
         stones = phase_num + 1  # Phase 2 → 3, Phase 8 → 9
         return max(1, min(9, stones))
+
+    def get_ai_disadvantage(self) -> bool:
+        """Return True when the AI should start each game with fewer stones.
+
+        Active only during Phase 11's 'mix' sub-phase. The 'full' sub-phase
+        uses a single fixed count (9 stones / player) so disadvantage is
+        meaningless there. Outside Phase 11 this always returns False.
+        """
+        return (
+            self.current_phase == Phase.PHASE_11
+            and self.get_phase11_subphase() == 'mix'
+        )
 
     def get_phase11_subphase(self) -> str:
         """Return Phase 11's current sub-phase: 'full' or 'mix'.

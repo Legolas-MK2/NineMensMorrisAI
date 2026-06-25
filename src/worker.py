@@ -89,7 +89,8 @@ class EnvState:
         self.reward_calculator = reward_calculator
         self.reset()
 
-    def reset(self, starting_stones: Optional[Tuple[int, int]] = None):
+    def reset(self, starting_stones: Optional[Tuple[int, int]] = None,
+              ai_player: Optional[int] = None):
         if starting_stones is None:
             self.state = self.game.new_initial_state()
             init_pieces = (9, 9)
@@ -102,7 +103,9 @@ class EnvState:
 
         # Opponent settings (set by worker based on curriculum)
         self.opponent_type = 'random'
-        self.ai_player = random.randint(0, 1)
+        # ai_player can be forced by the caller (used when stone counts must be
+        # assigned to a specific player before the game state is created).
+        self.ai_player = ai_player if ai_player is not None else random.randint(0, 1)
         self.minimax_bot = None
         self.minimax_depth = 0
         self.clone_player = 1 - self.ai_player
@@ -215,6 +218,14 @@ def worker_process(
     else:
         current_stone_distribution = [(9, 1.0)]
 
+    # When True, the AI always starts each game with FEWER stones than its
+    # opponent. Active during Phase 11's 'mix' sub-phase — the two stone
+    # counts are drawn independently and then sorted so the AI player always
+    # receives the smaller value. Equal draws are left unchanged.
+    current_ai_disadvantage: bool = bool(
+        shared_state.get('initial_ai_disadvantage', False)
+    )
+
     # Create game using the fastnmm C++ engine
     game = fastnmm.load_game("nine_mens_morris")
 
@@ -276,12 +287,39 @@ def worker_process(
         """Draw two independent per-player stone counts from the current
         phase's distribution. Asymmetric pairs are common by design — the
         distribution overlaps with adjacent phases to smooth transitions.
+
+        Returns (player_0_stones, player_1_stones).
         """
         counts = [c for c, _ in current_stone_distribution]
         weights = [w for _, w in current_stone_distribution]
         a = random.choices(counts, weights=weights)[0]
         b = random.choices(counts, weights=weights)[0]
         return (a, b)
+
+    def sample_starting_stones_for_ai(ai_player: int) -> Tuple[int, int]:
+        """Like sample_starting_stones but guarantees the AI player always
+        starts with fewer (or equal) stones than its opponent.
+
+        Used when `current_ai_disadvantage` is True. Both counts are drawn
+        independently from the same distribution; if the draw gives the AI
+        more stones than the opponent, the two values are swapped so the AI
+        always plays from the smaller hand. Equal draws are left unchanged.
+
+        Args:
+            ai_player: which player index (0 or 1) is the AI.
+
+        Returns:
+            (player_0_stones, player_1_stones) with player[ai_player] ≤ player[1-ai_player].
+        """
+        counts = [c for c, _ in current_stone_distribution]
+        weights = [w for _, w in current_stone_distribution]
+        a = random.choices(counts, weights=weights)[0]
+        b = random.choices(counts, weights=weights)[0]
+        # Sort so the smaller count goes to ai_player.
+        lo, hi = min(a, b), max(a, b)
+        if ai_player == 0:
+            return (lo, hi)
+        return (hi, lo)
 
     def recreate_game():
         """Recreate game with current settings."""
@@ -318,7 +356,17 @@ def worker_process(
         nonlocal game
 
         env.game = game
-        env.reset(starting_stones=sample_starting_stones())
+        if current_ai_disadvantage:
+            # Pre-determine which player side the AI will occupy so we can
+            # assign the smaller stone count to that side before creating the
+            # game state (starting_stones must be known at init time).
+            ai_player = random.randint(0, 1)
+            env.reset(
+                starting_stones=sample_starting_stones_for_ai(ai_player),
+                ai_player=ai_player,
+            )
+        else:
+            env.reset(starting_stones=sample_starting_stones())
 
         if current_opponent_type == 'mixed':
             opp_type, depth = select_mixed_opponent()
@@ -475,11 +523,18 @@ def worker_process(
 
             if msg['type'] == 'update_game_settings':
                 new_dist_raw = msg.get('stone_distribution')
+                new_adv = bool(msg.get('ai_disadvantage', False))
+                changed = False
                 if new_dist_raw is not None:
                     new_dist = [(int(c), float(w)) for c, w in new_dist_raw]
                     if new_dist != current_stone_distribution:
                         current_stone_distribution = new_dist
-                        recreate_after_control = True
+                        changed = True
+                if new_adv != current_ai_disadvantage:
+                    current_ai_disadvantage = new_adv
+                    changed = True
+                if changed:
+                    recreate_after_control = True
                 continue
 
             if msg['type'] == 'update_clone':

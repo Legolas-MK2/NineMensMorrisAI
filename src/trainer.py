@@ -309,11 +309,19 @@ class PPOTrainer:
                 pass
 
     def _broadcast_game_settings(self):
-        """Send game settings (per-player stone distribution) to all workers."""
+        """Send game settings (stone distribution + AI-disadvantage flag) to workers.
+
+        The `ai_disadvantage` flag is True during Phase 11's 'mix' sub-phase:
+        the worker draws two stone counts independently and then ensures the AI
+        player (the one producing gradients) always receives the smaller count,
+        training it to win from a disadvantaged position.
+        """
         stone_distribution = self.curriculum.get_stone_distribution_for_phase()
+        ai_disadvantage = self.curriculum.get_ai_disadvantage()
         msg = {
             'type': 'update_game_settings',
             'stone_distribution': stone_distribution,
+            'ai_disadvantage': ai_disadvantage,
         }
 
         for q in self.control_queues:
@@ -368,13 +376,15 @@ class PPOTrainer:
             prev = self._last_phase11_subphase
             self._last_phase11_subphase = current
             sub_pos, sub_len = self.curriculum.get_phase11_subphase_progress()
+            adv = self.curriculum.get_ai_disadvantage()
             print(
                 f"  [Phase 11] Sub-phase flip: {prev} -> {current} "
-                f"(next {sub_len:,} eps; cycle {sub_pos:,}/{sub_len:,})",
+                f"(next {sub_len:,} eps; cycle {sub_pos:,}/{sub_len:,})"
+                + (" [AI disadvantage ON: AI gets fewer stones]" if adv else ""),
                 flush=True,
             )
-            # Stone-distribution changed; reward config (draw penalty is flat
-            # in phase 11) is unaffected, so we only push the game settings.
+            # Stone-distribution and ai_disadvantage flag both changed;
+            # reward config (flat draw penalty in phase 11) is unaffected.
             self._broadcast_game_settings()
 
     def _broadcast_reward_config(self):
@@ -406,6 +416,7 @@ class PPOTrainer:
         curr_cfg = self.curriculum.get_config()
         return {
             'initial_stone_distribution': self.curriculum.get_stone_distribution_for_phase(),
+            'initial_ai_disadvantage': self.curriculum.get_ai_disadvantage(),
             'initial_opponent_type': curr_cfg.opponent_type,
             'initial_minimax_depth': 1,
             'initial_reward_config': self.curriculum.get_reward_config(),
