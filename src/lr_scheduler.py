@@ -7,7 +7,7 @@ Driven by PPO update steps (not episodes). Behavior:
 - Cosine: each cycle anneals from `cycle_starting_lr` down to `lr_min` over
   `cycle_t_max` updates. Once it hits the floor it stays there until a reset.
 - Phase graduation event: phase_peak *= phase_reset_factor; new cycle starts at
-  phase_peak. Successive graduations compound (0.7 * 0.7 * ...).
+  phase_peak. Successive graduations compound (factor^n, e.g. 0.8 * 0.8 * ...).
 - Clone replacement event: raise cycle_starting_lr toward phase_peak (capped),
   without resetting cycle progress. Cap is phase_peak — not lr_peak — so clones
   cannot override phase decay. Cycle_step is preserved so frequent clone churn

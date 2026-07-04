@@ -19,7 +19,7 @@ from model import ActorCritic
 
 def discover_models(
     repo_root: Path,
-    max_bytes: int = 200 * 1024 * 1024,
+    max_bytes: int = Config.max_model_file_bytes,
 ) -> List[Dict[str, str]]:
     """Scan the canonical model/checkpoint directories under `repo_root`.
 
@@ -58,7 +58,6 @@ def load_actor_critic(
     path: str,
     obs_size: int,
     num_actions: int,
-    obs_shape: List[int],
     device: torch.device,
     cache: Optional[Dict[str, Any]] = None,
 ) -> ActorCritic:
@@ -72,7 +71,6 @@ def load_actor_critic(
         return cache[path]
 
     cfg = Config()
-    cfg.obs_shape = list(obs_shape)
     model = ActorCritic(obs_size, num_actions, cfg).to(device)
 
     ckpt = torch.load(path, map_location=device, weights_only=False)

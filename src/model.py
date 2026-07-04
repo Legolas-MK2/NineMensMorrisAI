@@ -211,7 +211,6 @@ class ActorCritic(nn.Module):
 
     def _embed_tokens(self, node_feats: torch.Tensor, global_feats: torch.Tensor) -> torch.Tensor:
         """node_feats: [B,24,F], global_feats: [B,G] -> [B,25,D]."""
-        B = node_feats.shape[0]
         node_tok = self.node_embed(node_feats) + self.position_embed(self._pos_ids).unsqueeze(0)
         glob_tok = self.global_embed(global_feats).unsqueeze(1)  # [B,1,D]
         return torch.cat([node_tok, glob_tok], dim=1)
@@ -256,33 +255,3 @@ class ActorCritic(nn.Module):
         value = self.value_head(v).squeeze(-1)
         value = torch.clamp(value, -self.value_clip, self.value_clip)
         return logits, value
-
-    def get_action_and_value(self, node_feats, global_feats, mask,
-                             deterministic: bool = False, temperature: float = 1.0):
-        logits, value = self.forward(node_feats, global_feats)
-        masked = logits.float()
-        masked[mask == 0] = -1e9
-
-        if deterministic:
-            action = masked.argmax(dim=-1)
-            probs = F.softmax(masked, dim=-1)
-            dist = torch.distributions.Categorical(probs)
-        else:
-            scaled = masked / max(temperature, 0.01)
-            probs = F.softmax(scaled, dim=-1)
-            dist = torch.distributions.Categorical(probs)
-            action = dist.sample()
-
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
-        return action, log_prob, entropy, value
-
-    def get_action_for_play(self, node_feats, global_feats, mask, temperature: float = 0.4):
-        with torch.no_grad():
-            logits, _ = self.forward(node_feats, global_feats)
-            masked = logits.float()
-            masked[mask == 0] = -1e9
-            scaled = masked / max(temperature, 0.01)
-            probs = F.softmax(scaled, dim=-1)
-            dist = torch.distributions.Categorical(probs)
-            return int(dist.sample().item())

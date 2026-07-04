@@ -15,8 +15,9 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Use the real scheduler class — no reimplementation.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+# Use the real scheduler class — no reimplementation. (Script lives in
+# tools/; the scheduler lives in <repo>/src.)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import torch
 from lr_scheduler import WarmRestartLRScheduler
 
@@ -26,7 +27,7 @@ LR_PEAK = 3e-4
 LR_MIN = 1e-6
 WARMUP = 200
 CYCLE_T_MAX = 1600
-PHASE_RESET = 0.7
+PHASE_RESET = 0.8
 CLONE_BUMP = 1.3
 TOTAL_UPDATES = 7000
 
@@ -169,7 +170,7 @@ def plot(xs, lrs, peaks, phase_marks, clone_marks):
         "                   lr = lr_min + ½·(cycle_starting_lr − lr_min)·(1 + cos(π·progress))\n"
         "                   ↳ at progress=1 the lr is pinned to lr_min (floor-hold)\n\n"
         "  notify_phase_graduated():\n"
-        "    phase_peak       = max(lr_min, phase_peak · phase_reset_factor)   # 0.7, compounds\n"
+        "    phase_peak       = max(lr_min, phase_peak · phase_reset_factor)   # 0.8, compounds\n"
         "    cycle_starting_lr = phase_peak\n"
         "    cycle_step       = 0   # fresh cosine from the shrunken peak\n\n"
         "  notify_clone_replaced():\n"

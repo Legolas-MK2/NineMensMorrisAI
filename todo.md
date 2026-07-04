@@ -1,1 +1,0 @@
-for input in the model. enime possistion is always -1 and player poss 

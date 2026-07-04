@@ -84,12 +84,9 @@ PYBIND11_MODULE(_core, m) {
              py::arg("player") = 0)
         .def("observation_tensor",
              [](const State& s, int player) {
-                 auto arr = py::array_t<float>(kObservationSize);
-                 s.ObservationTensor(player, arr.mutable_data());
                  // Return flat list-of-floats (matches OpenSpiel's Python API).
                  std::vector<float> out(kObservationSize);
-                 std::memcpy(out.data(), arr.data(),
-                             sizeof(float) * kObservationSize);
+                 s.ObservationTensor(player, out.data());
                  return out;
              },
              py::arg("player") = 0)
@@ -208,7 +205,9 @@ PYBIND11_MODULE(_core, m) {
           py::arg("state"), py::arg("depth") = 4,
           "Shortcut for `minimax_search(state, depth).action`.");
 
-    m.def("evaluate", &Evaluate, py::arg("state"),
+    m.def("evaluate",
+          [](const State& s) { return Evaluate(s); },
+          py::arg("state"),
           "Static heuristic value of `state` from its current player's "
           "perspective. Does not search.");
 
@@ -253,6 +252,36 @@ PYBIND11_MODULE(_core, m) {
 
     m.def("evaluate_breakdown", &EvaluateBreakdown, py::arg("state"),
           "Return the per-component breakdown of the static evaluation.");
+
+    // ----- Tunable evaluation weights -----
+    py::class_<EvalWeights>(m, "EvalWeights",
+        "Tunable weight set for the minimax static evaluation. Defaults "
+        "match the historical hardcoded values. Pass to "
+        "`MinimaxEngine.set_weights(...)` for per-game jitter.")
+        .def(py::init<>())
+        .def_readwrite("w_material_mid", &EvalWeights::w_material_mid)
+        .def_readwrite("w_material_end", &EvalWeights::w_material_end)
+        .def_readwrite("w_mill_mid",     &EvalWeights::w_mill_mid)
+        .def_readwrite("w_mill_end",     &EvalWeights::w_mill_end)
+        .def_readwrite("w_open_mid",     &EvalWeights::w_open_mid)
+        .def_readwrite("w_open_end",     &EvalWeights::w_open_end)
+        .def_readwrite("w_running",      &EvalWeights::w_running)
+        .def_readwrite("w_double",       &EvalWeights::w_double)
+        .def_readwrite("w_mill_block",   &EvalWeights::w_mill_block)
+        .def_readwrite("w_blocked_mid",  &EvalWeights::w_blocked_mid)
+        .def_readwrite("w_mobility_mid", &EvalWeights::w_mobility_mid)
+        .def("__repr__", [](const EvalWeights& w) {
+            std::ostringstream os;
+            os << "<EvalWeights mat=" << w.w_material_mid << "/" << w.w_material_end
+               << " mill=" << w.w_mill_mid << "/" << w.w_mill_end
+               << " open=" << w.w_open_mid << "/" << w.w_open_end
+               << " run=" << w.w_running
+               << " dbl=" << w.w_double
+               << " mblk=" << w.w_mill_block
+               << " blk=" << w.w_blocked_mid
+               << " mob=" << w.w_mobility_mid << ">";
+            return os.str();
+        });
 
     // ----- AI / reward-shaping evaluator (separate from minimax `evaluate`) -----
     py::class_<AIEvalBreakdown>(m, "AIEvalBreakdown",
@@ -366,6 +395,13 @@ PYBIND11_MODULE(_core, m) {
              },
              py::arg("state"),
              "Return the static heuristic value of `state` (no search).")
+        .def("set_weights", &MinimaxEngine::SetWeights, py::arg("weights"),
+             "Replace the engine's evaluation weights. Clears the TT, "
+             "because previously cached scores were computed under the "
+             "old weights and would poison the next search.")
+        .def_property_readonly("weights",
+             [](const MinimaxEngine& e) { return e.Weights(); },
+             "Current evaluation weights.")
         .def("new_game", &MinimaxEngine::NewGame,
              "Bump the generation counter so older entries become "
              "preferred for replacement. Call between unrelated games.")

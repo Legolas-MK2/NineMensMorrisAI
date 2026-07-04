@@ -208,6 +208,28 @@ struct EvalBreakdown {
 };
 EvalBreakdown EvaluateBreakdown(const State& s);
 
+// Tunable evaluation weights. Defaults reproduce the hardcoded weights
+// used by Evaluate(const State&). Per-game jitter (option 1 in the
+// non-determinism plan) lets callers vary these to make the bot pick
+// different tactics across games without changing the search core.
+struct EvalWeights {
+    int w_material_mid = 8;
+    int w_material_end = 14;
+    int w_mill_mid     = 18;
+    int w_mill_end     = 22;
+    int w_open_mid     = 14;
+    int w_open_end     = 22;
+    int w_running      = 30;
+    int w_double       = 28;
+    int w_mill_block   = 10;
+    int w_blocked_mid  = 10;   // endgame blocked weight is fixed at 0
+    int w_mobility_mid = 1;    // endgame mobility weight is fixed at 0
+};
+
+// Weighted variant of Evaluate. The unweighted overload above stays
+// compile-time-constant for the hot free-function MinimaxSearch path.
+int Evaluate(const State& s, const EvalWeights& w);
+
 // =========================================================================
 // AI / reward-shaping evaluator.
 //
@@ -300,6 +322,12 @@ public:
     int          Eval(const State& s) const;
     bool         StrictParity() const { return strict_; }
 
+    // Per-engine evaluation weights. Updating clears the TT because
+    // stored scores were computed under the old weights and would
+    // poison the new search.
+    const EvalWeights& Weights() const { return weights_; }
+    void               SetWeights(const EvalWeights& w);
+
     // Bump generation -- old entries become eligible for replacement.
     void NewGame();
     // Wipe the TT, reset stats.
@@ -347,6 +375,8 @@ private:
     uint64_t         mask_        = 0;
     uint8_t          generation_  = 0;
     bool             strict_      = false;
+    bool             use_custom_weights_ = false;
+    EvalWeights      weights_     = {};
 
     mutable std::size_t probes_      = 0;
     mutable std::size_t hits_        = 0;

@@ -2,31 +2,19 @@
 Nine Men's Morris - PPO Trainer with Curriculum Learning
 Main training loop with phased curriculum progression.
 
-Phase structure (see curriculum.py for full details):
-- Phase 1: per-player stones uniform over {3..9}; warmup with self + random
-  (75% / 25%); graduated when WR vs random crosses threshold.
-- Phase 2-8: per-player stone count concentrated around the phase target
-  (3..9) with a small spread; mixed opponents (self, unlocked minimax depths,
-  random) sampled by `compute_opponent_distribution`.
-- Phase 9: fixed 9 stones per player (full game), same mixed opponents.
-- Phase 10: per-player stones uniform over {3..9}; mixed opponents; duration
-  anchored to the shaping schedule (ends after a configured shaping-free tail).
-- Phase 11: infinite phase; alternates 2.5M full-game (9 stones) sub-phases
-  with 2.5M uniform-{3..9} sub-phases forever. Never graduates; the operator
-  stops training to end it. Sub-phase flips re-broadcast stone-distribution
-  game settings to workers.
+See the module docstring of curriculum.py for the full phase structure.
+Training runs until the operator stops Phase 11 (which is infinite).
 """
 
 import os
+import json
 import time
 import csv
 import glob
-import random
 import queue
-from collections import deque
 from typing import List, Tuple, Dict, Optional
 import multiprocessing as mp
-from multiprocessing import Process, Queue, Event
+from multiprocessing import Process, Queue
 
 import numpy as np
 import torch
@@ -37,7 +25,7 @@ import fastnmm
 
 from config import Config
 from model import ActorCritic
-from utils import get_legal_mask, ExperienceBatch, relativize_obs
+from utils import ExperienceBatch
 from minimax import evaluate_vs_minimax_cpp, format_minimax_results
 from worker import worker_process
 from curriculum import (
@@ -62,9 +50,6 @@ class PPOTrainer:
 
         self.obs_size = game.observation_tensor_size()
         self.num_actions = game.num_distinct_actions()
-
-        # Store obs shape so the model can encode observations correctly
-        config.obs_shape = list(game.observation_tensor_shape())
 
         # Initialize model
         self.model = ActorCritic(self.obs_size, self.num_actions, config).to(self.device)
@@ -105,8 +90,13 @@ class PPOTrainer:
         # Mixed precision
         self.scaler = GradScaler('cuda') if config.use_mixed_precision and self.device.type == 'cuda' else None
 
-        # Curriculum manager
-        self.curriculum = CurriculumManager(save_dir=config.curriculum_dir)
+        # Curriculum manager. wr_sample_interval keeps the per-depth WR slope
+        # math aligned with the actual logging cadence.
+        self.curriculum = CurriculumManager(
+            save_dir=config.curriculum_dir,
+            wr_sample_interval=config.log_interval,
+            graduation_min_episodes=config.graduation_min_episodes,
+        )
         self.curriculum.on_phase_change_callbacks.append(self._on_phase_change)
         self.curriculum.on_clone_update_callbacks.append(self._on_clone_update)
 
@@ -116,9 +106,7 @@ class PPOTrainer:
         self.response_queues: List[Queue] = []
         self.experience_queue: Queue = None
         self.control_queues: List[Queue] = []
-        self.ready_events: List[Event] = []
-        self.pause_events: List[Event] = []
-        self.resume_events: List[Event] = []
+        self.ready_events: List = []
 
         # Statistics
         self.episode_count = 0
@@ -126,8 +114,6 @@ class PPOTrainer:
         self.update_count_at_phase_start = 0  # for updates_in_phase logging
         self.total_steps = 0
         self.ema_return = None
-        self.best_win_rate = 0.0
-        self.recent_returns = deque(maxlen=5000)
 
         # Cache for the progressive minimax eval. Refreshed only at phase
         # graduations (see `_on_phase_change`) and once at training start
@@ -174,7 +160,6 @@ class PPOTrainer:
     def _heartbeat(self, stage: str):
         """Touch the heartbeat file with the current stage and PID."""
         try:
-            import json
             payload = {
                 "ts": time.time(),
                 "pid": os.getpid(),
@@ -257,16 +242,22 @@ class PPOTrainer:
         """
         if self.curriculum.get_config().opponent_type != 'mixed':
             return
-        distribution = self.curriculum.get_opponent_distribution()
-        msg = {
+        self._broadcast_to_workers({
             'type': 'update_opponent_distribution',
-            'distribution': distribution,
-        }
-        for q in self.control_queues:
+            'distribution': self.curriculum.get_opponent_distribution(),
+        })
+
+    def _broadcast_to_workers(self, msg: Dict):
+        """Put `msg` on every worker's control queue.
+
+        Queue failures are logged but non-fatal: a worker that missed a
+        broadcast gets refreshed on the next log tick's rebroadcast.
+        """
+        for i, q in enumerate(self.control_queues):
             try:
                 q.put(msg)
-            except:
-                pass
+            except Exception as e:
+                logger.warning("control-queue put to worker %d failed: %r", i, e)
 
     def _update_clone_model(self):
         """Update the clone model with current model weights."""
@@ -284,7 +275,7 @@ class PPOTrainer:
         """Callback when the clone should be updated.
 
         Trigger: wr_vs_self over the rolling 500-game self-play window
-        crosses `selfplay_winrate_threshold` (default 80%), checked at
+        crosses MIXED_CONFIG['selfplay_winrate_threshold'], checked at
         each log tick.
         """
         self._update_clone_model()
@@ -297,16 +288,10 @@ class PPOTrainer:
             return
 
         clone_state = self.clone_model.state_dict()
-        msg = {
+        self._broadcast_to_workers({
             'type': 'update_clone',
             'clone_state_dict': {k: v.cpu() for k, v in clone_state.items()},
-        }
-
-        for q in self.control_queues:
-            try:
-                q.put(msg)
-            except:
-                pass
+        })
 
     def _broadcast_game_settings(self):
         """Send game settings (stone distribution + AI-disadvantage flag) to workers.
@@ -316,19 +301,11 @@ class PPOTrainer:
         player (the one producing gradients) always receives the smaller count,
         training it to win from a disadvantaged position.
         """
-        stone_distribution = self.curriculum.get_stone_distribution_for_phase()
-        ai_disadvantage = self.curriculum.get_ai_disadvantage()
-        msg = {
+        self._broadcast_to_workers({
             'type': 'update_game_settings',
-            'stone_distribution': stone_distribution,
-            'ai_disadvantage': ai_disadvantage,
-        }
-
-        for q in self.control_queues:
-            try:
-                q.put(msg)
-            except:
-                pass
+            'stone_distribution': self.curriculum.get_stone_distribution_for_phase(),
+            'ai_disadvantage': self.curriculum.get_ai_disadvantage(),
+        })
 
     def _broadcast_curriculum_update(self):
         """Send curriculum update to all workers."""
@@ -338,7 +315,6 @@ class PPOTrainer:
         msg = {
             'type': 'update_curriculum',
             'opponent_type': config.opponent_type,
-            'minimax_depth': 1,  # Will be managed per-round
             'reward_config': reward_config,
         }
 
@@ -346,11 +322,7 @@ class PPOTrainer:
         if config.opponent_type == 'mixed':
             msg['opponent_distribution'] = self.curriculum.get_opponent_distribution()
 
-        for q in self.control_queues:
-            try:
-                q.put(msg)
-            except:
-                pass
+        self._broadcast_to_workers(msg)
 
     def _maybe_broadcast_phase11_subphase_change(self):
         """Detect a Phase 11 sub-phase flip and rebroadcast game settings.
@@ -395,15 +367,10 @@ class PPOTrainer:
         cannot accidentally trigger env recreation in workers — the worker
         handler updates the reward_calculator and nothing else.
         """
-        msg = {
+        self._broadcast_to_workers({
             'type': 'update_reward_config',
             'reward_config': self.curriculum.get_reward_config(),
-        }
-        for q in self.control_queues:
-            try:
-                q.put(msg)
-            except:
-                pass
+        })
 
     def get_entropy_coef(self) -> float:
         """Get current entropy coefficient with gradual decay."""
@@ -418,7 +385,6 @@ class PPOTrainer:
             'initial_stone_distribution': self.curriculum.get_stone_distribution_for_phase(),
             'initial_ai_disadvantage': self.curriculum.get_ai_disadvantage(),
             'initial_opponent_type': curr_cfg.opponent_type,
-            'initial_minimax_depth': 1,
             'initial_reward_config': self.curriculum.get_reward_config(),
             'initial_opponent_distribution': (
                 self.curriculum.get_opponent_distribution()
@@ -440,15 +406,13 @@ class PPOTrainer:
             response_q = mp.Queue()
             control_q = mp.Queue()
             ready_evt = mp.Event()
-            pause_evt = mp.Event()
-            resume_evt = mp.Event()
 
             p = Process(
                 target=worker_process,
                 args=(
                     i, self.config, self.obs_size, self.num_actions,
                     self.request_queue, response_q, self.experience_queue,
-                    control_q, ready_evt, pause_evt, resume_evt,
+                    control_q, ready_evt,
                     shared_state
                 ),
                 daemon=True
@@ -459,8 +423,6 @@ class PPOTrainer:
             self.response_queues.append(response_q)
             self.control_queues.append(control_q)
             self.ready_events.append(ready_evt)
-            self.pause_events.append(pause_evt)
-            self.resume_events.append(resume_evt)
 
         for evt in self.ready_events:
             evt.wait(timeout=30)
@@ -482,42 +444,12 @@ class PPOTrainer:
 
     def stop_workers(self):
         """Stop all worker processes."""
-        for q in self.control_queues:
-            try:
-                q.put({'type': 'stop'})
-            except:
-                pass
+        self._broadcast_to_workers({'type': 'stop'})
 
         for p in self.workers:
             p.join(timeout=2)
             if p.is_alive():
                 p.terminate()
-
-    def pause_workers(self):
-        """Pause all workers for PPO update."""
-        for evt in self.pause_events:
-            evt.set()
-        time.sleep(0.1)
-
-        while True:
-            try:
-                self.request_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        for resp_q in self.response_queues:
-            while True:
-                try:
-                    resp_q.get_nowait()
-                except queue.Empty:
-                    break
-
-    def resume_workers(self):
-        """Resume all workers after PPO update."""
-        for evt in self.pause_events:
-            evt.clear()
-        for evt in self.resume_events:
-            evt.set()
 
     def process_inference_requests(self, timeout: float = 0.01) -> int:
         """Process batched inference requests from workers."""
@@ -596,12 +528,11 @@ class PPOTrainer:
                 while True:
                     batch = self.experience_queue.get_nowait()
                     all_returns.append(batch.game_result)
-                    self.recent_returns.append(batch.game_result)
 
                     # Update curriculum with game result (always — for stats/logging)
                     minimax_depth = getattr(batch, 'minimax_depth', 0)
                     self.curriculum.add_game_result(
-                        batch.game_result,
+                        batch.outcome,
                         opponent_type=batch.opponent_type,
                         minimax_depth=minimax_depth
                     )
@@ -689,7 +620,7 @@ class PPOTrainer:
                     logits, values = self.model(all_nodes[idx], all_globals[idx])
 
                     masked_logits = logits.float()
-                    masked_logits[all_masks[idx] == 0] = -1e4
+                    masked_logits[all_masks[idx] == 0] = -1e9
 
                     log_probs = F.log_softmax(masked_logits, dim=-1)
                     new_logprobs = log_probs.gather(-1, all_actions[idx].unsqueeze(-1)).squeeze(-1)
@@ -761,59 +692,6 @@ class PPOTrainer:
         metrics['grad_norm'] = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
 
         return metrics
-
-    def evaluate_vs_random(self, num_games: int = 200) -> float:
-        """Evaluate model against random opponent."""
-        game = fastnmm.load_game("nine_mens_morris")
-        dist = self.curriculum.get_stone_distribution_for_phase()
-        counts = [c for c, _ in dist]
-        weights = [w for _, w in dist]
-        wins, draws = 0, 0
-
-        self.model.eval()
-        with torch.no_grad():
-            for i in range(num_games):
-                a = random.choices(counts, weights=weights)[0]
-                b = random.choices(counts, weights=weights)[0]
-                state = game.new_initial_state(starting_stones=(a, b))
-
-                # Skip if engine returns an already-terminal state for these stones
-                if state.is_terminal():
-                    continue
-
-                our_player = i % 2
-                steps = 0
-
-                while not state.is_terminal() and steps < self.config.max_game_steps:
-                    pid = state.current_player()
-
-                    if pid == our_player:
-                        obs_arr = relativize_obs(state, pid)
-                        obs = torch.from_numpy(obs_arr).to(self.device).unsqueeze(0)
-                        mask = torch.from_numpy(
-                            get_legal_mask(state, self.num_actions)
-                        ).to(self.device).unsqueeze(0)
-
-                        with autocast('cuda', enabled=self.config.use_mixed_precision):
-                            logits, _ = self.model(obs)
-
-                        masked = logits.squeeze(0).float()
-                        masked[mask.squeeze(0) == 0] = -1e4
-                        action = masked.argmax().item()
-                    else:
-                        action = random.choice(state.legal_actions())
-
-                    state.apply_action(action)
-                    steps += 1
-
-                if state.is_terminal():
-                    r = state.returns()
-                    if r[our_player] > r[1 - our_player]:
-                        wins += 1
-                    elif r[our_player] == r[1 - our_player]:
-                        draws += 1
-
-        return (wins + 0.5 * draws) / num_games
 
     def evaluate_vs_minimax_progressive(self) -> Tuple[int, str]:
         """Test AI against progressively harder minimax bots.
@@ -900,20 +778,23 @@ class PPOTrainer:
 
         # Progressive minimax eval runs ONLY at phase graduations (and once
         # at startup) -- see `_on_phase_change` and `train()`. Here we just
-        # read the cached result so the CSV column stays populated.
-        if self._last_minimax_eval is not None:
-            max_depth_beaten, minimax_str = self._last_minimax_eval
-        else:
-            max_depth_beaten, minimax_str = 0, "(no eval yet)"
+        # read the cached depth so the CSV column stays populated (the
+        # per-depth string was already printed live during the eval).
+        max_depth_beaten = (
+            self._last_minimax_eval[0] if self._last_minimax_eval is not None else 0
+        )
 
-        # Minimax evaluation results
+        # Minimax evaluation results. The "(no-train)" / "*" notes reflect the
+        # ACTUAL dampened flags used to drop games from PPO, so the log can
+        # never disagree with what training does.
         active_max = opp_wr['active_mm_max_depth']
+        ms = self.curriculum.mixed_state
 
         def _d_str(d: int) -> str:
             key = f'wr_vs_mm_d{d}'
             if active_max >= d:
                 wr = opp_wr.get(key, 0.0)
-                note = "*" if wr >= self.config.minimax_train_cutoff else ""
+                note = "*" if ms.minimax_depth_dominated.get(d, False) else ""
                 return f" D{d}:{wr:.0%}{note}"
             return f" D{d}:locked"
 
@@ -923,8 +804,7 @@ class PPOTrainer:
         # callback, so we do not re-print the final accumulated line here.
         if config.opponent_type == 'mixed':
             wr_random = opp_wr['wr_vs_random']
-            rnd_train_note = " (no-train)" if wr_random >= self.config.random_train_cutoff else ""
-            ms = self.curriculum.mixed_state
+            rnd_train_note = " (no-train)" if ms.random_dominated else ""
             self_paused = ms.total_episodes < ms.selfplay_train_cooldown_until
             self_note = f" (no-train, {ms.selfplay_train_cooldown_until - ms.total_episodes:,}ep left)" if self_paused else ""
             print(f"  WR(500):{depth_str} [MaxD:{active_max}] "
@@ -981,7 +861,6 @@ class PPOTrainer:
             if write_header:
                 self.log_writer.writeheader()
 
-        ms = self.curriculum.mixed_state
         is_mixed = (config.opponent_type == 'mixed')
 
         def _slope_angle(d: int) -> float:
@@ -1118,7 +997,6 @@ class PPOTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
             'ema_return': self.ema_return,
-            'best_win_rate': self.best_win_rate,
             'curriculum_phase': int(self.curriculum.current_phase),
             'curriculum_state': curriculum_state,
             'lr_scheduler_state': self.lr_scheduler.get_state_dict(),
@@ -1158,7 +1036,6 @@ class PPOTrainer:
         # will report correctly from the next phase graduation onward.
         self.update_count_at_phase_start = ckpt.get('update_count_at_phase_start', self.update_count)
         self.ema_return = ckpt.get('ema_return')
-        self.best_win_rate = ckpt.get('best_win_rate', 0.0)
 
         # Load LR scheduler state. Falls back gracefully if the checkpoint
         # was produced by an older single-cosine scheduler.

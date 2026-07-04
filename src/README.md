@@ -56,8 +56,9 @@ Within "mixed" the sampling distribution is computed by
   sampling pins at 1% and self-play experiences stop feeding PPO for
   `selfplay_train_pause_episodes` episodes (default 500k).
 - **Self-play clone update**: when `wr_vs_self` over the rolling 500-game
-  self-play window crosses 80% at a log tick, the clone is replaced with
-  the current model and the self-play window resets.
+  self-play window crosses `selfplay_winrate_threshold` (default 92%) at a
+  log tick, the clone is replaced with the current model and the self-play
+  window resets.
 
 ### Reward shaping
 
@@ -84,8 +85,8 @@ proportional to how quickly the game ended.
 - **Phases 2–9**: trend-based **per-depth plateau detection**. For every
   unlocked minimax depth, the slope of WR-vs-depth (over a 1M-episode
   horizon) must be below `trend_max_angle_degrees` (default **2°**). All
-  unlocked depths must plateau simultaneously, and there is a `min_episodes`
-  floor of 1.5M episodes per phase.
+  unlocked depths must plateau simultaneously, and there is a
+  `graduation_min_episodes` floor (config, default 2.5M episodes) per phase.
 - **Phase 10**: ends after `PHASE_10_POST_SHAPING_EPISODES` (default 5M)
   shaping-free episodes — duration is the shaping overlap plus the
   shaping-free tail.
@@ -170,22 +171,22 @@ pip install -e ../fastnmm
 
 ```bash
 # Standard training (use --help for the full option list)
-python main.py train --workers 22 --envs 48
+python main.py train --workers 16 --envs 48
 
 # Resume from the latest checkpoint
-python main.py resume --workers 22 --envs 48
+python main.py resume --workers 16 --envs 48
 
 # Resume from a specific checkpoint
 python main.py resume --checkpoint checkpoints/<file>.pt
 
 # Skip to a specific phase (1-11) from a fresh model
-python main.py train --workers 22 --envs 48 --phase 5
+python main.py train --workers 16 --envs 48 --phase 5
 
 # Jump straight into the infinite final phase (stop with Ctrl-C)
-python main.py train --workers 22 --envs 48 --phase 11
+python main.py train --workers 16 --envs 48 --phase 11
 
 # Load model weights from a checkpoint but reset training state to ep 0 / Phase 1
-python main.py train --workers 22 --envs 48 --use-last-checkpoint
+python main.py train --workers 16 --envs 48 --use-last-checkpoint
 
 # Play / watch a trained model
 python main.py play
@@ -211,7 +212,7 @@ python main.py info
 | `logging_setup.py` | Process-wide logger configuration. |
 | `system_monitor.py` | Heartbeat-watching sidecar (detects "main thread stuck in C++" stalls). |
 | `model_loader.py` | Helper for loading model checkpoints in eval/play contexts. |
-| `board_utils.py` | Board printing / pretty-printing helpers. |
+| `board_utils.py` | Shared board geometry, action encoding and observation parsing for the webui / claude_plays entry points. |
 
 ## Monitoring
 

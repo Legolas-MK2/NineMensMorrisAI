@@ -12,6 +12,16 @@ from typing import Dict, Any, Sequence
 
 import numpy as np
 
+# Canonical geometry lives in utils.py (single source of truth, shared with
+# the training pipeline); this module only re-shapes it for the web/agent
+# entry points. MILLS is re-exported for those entry points.
+from utils import MILLS, BOARD_POS_TO_GRID
+
+__all__ = [
+    "MILLS", "POINT_TO_COORD", "POSITION_NAMES",
+    "parse_board_positions", "decode_action",
+]
+
 
 # 24 board positions → (row, col) on the 7×7 observation grid.
 #     0-----------1-----------2
@@ -27,16 +37,7 @@ import numpy as np
 #     |    18----19----20     |
 #     |           |           |
 #    21----------22----------23
-POINT_TO_COORD: Dict[int, tuple] = {
-    0: (0, 0),  1: (0, 3),  2: (0, 6),
-    3: (1, 1),  4: (1, 3),  5: (1, 5),
-    6: (2, 2),  7: (2, 3),  8: (2, 4),
-    9: (3, 0), 10: (3, 1), 11: (3, 2),
-    12: (3, 4), 13: (3, 5), 14: (3, 6),
-    15: (4, 2), 16: (4, 3), 17: (4, 4),
-    18: (5, 1), 19: (5, 3), 20: (5, 5),
-    21: (6, 0), 22: (6, 3), 23: (6, 6),
-}
+POINT_TO_COORD: Dict[int, tuple] = dict(enumerate(BOARD_POS_TO_GRID))
 
 POSITION_NAMES: Dict[int, str] = {
      0: "outer top-left",   1: "outer top-mid",    2: "outer top-right",
@@ -48,13 +49,6 @@ POSITION_NAMES: Dict[int, str] = {
     18: "mid bot-left",    19: "mid bot-mid",     20: "mid bot-right",
     21: "outer bot-left",  22: "outer bot-mid",   23: "outer bot-right",
 }
-
-MILLS: tuple = (
-    (0, 1, 2),   (0, 9, 21),  (2, 14, 23), (21, 22, 23),
-    (3, 4, 5),   (3, 10, 18), (5, 13, 20), (18, 19, 20),
-    (6, 7, 8),   (6, 11, 15), (8, 12, 17), (15, 16, 17),
-    (1, 4, 7),   (9, 10, 11), (12, 13, 14),(16, 19, 22),
-)
 
 
 def parse_board_positions(state, obs_size: int, obs_shape: Sequence[int]) -> Dict[int, int]:
@@ -90,13 +84,3 @@ def decode_action(action: int, is_capture_phase: bool = False) -> Dict[str, Any]
         return {"type": kind, "position": int(action)}
     offset = action - 24
     return {"type": "move", "from": int(offset // 24), "to": int(offset % 24)}
-
-
-def encode_action(action_info: Dict[str, Any]) -> int:
-    """Inverse of decode_action — collapses {"type": ..., ...} → action ID."""
-    t = action_info["type"]
-    if t == "place" or t == "capture":
-        return int(action_info["position"])
-    if t == "move":
-        return 24 + int(action_info["from"]) * 24 + int(action_info["to"])
-    raise ValueError(f"unknown action type: {t!r}")

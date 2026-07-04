@@ -5,7 +5,6 @@ Game helpers, reward calculation, and experience data structures
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-import random
 import numpy as np
 
 # Optional C++ fast path for AI/PPO reward feature extraction.
@@ -148,8 +147,9 @@ def relativize_obs(state, player: int) -> np.ndarray:
     Swap channels 0/1 when `player == 1` so the network always sees the same
     [self, opponent, ...] layout.
 
-    Kept for the eval/play paths that still read the flat (5,7,7) form and
-    for legacy code; the training pipeline now uses `build_token_obs`.
+    Legacy flat-obs helper: no production path uses it anymore (training,
+    eval and play all use `build_token_obs`). Kept because the symmetry
+    test suite validates `permute_obs` against it.
     """
     obs = state.observation_tensor_numpy(player)  # shape (5, 7, 7)
     if player == 1:
@@ -158,8 +158,9 @@ def relativize_obs(state, player: int) -> np.ndarray:
     return obs.reshape(-1)
 
 
-# Number of global features produced by `build_token_obs`. Kept in sync with
-# the layout below; `Config.global_feat_dim` is set from this.
+# Token-obs dimensions produced by `build_token_obs`. Must stay in sync with
+# the corresponding Config fields (global_feat_dim / node_feat_dim /
+# num_positions), which the model reads independently. Used by the tests.
 GLOBAL_FEAT_DIM: int = 11
 NODE_FEAT_DIM: int = 3
 NUM_POSITIONS: int = 24
@@ -439,9 +440,17 @@ class RewardCalculator:
     """
     Calculates rewards based on curriculum phase settings.
 
-    Shaping uses Potential-Based Reward Shaping (PBRS):
+    Shaping is PBRS-style:
         r_shape = γ·Φ(s') − Φ(s) + step_penalty
-    This preserves the optimal policy regardless of shaping magnitude.
+
+    Caveat: this is NOT strictly potential-based in the formal sense. Φ is
+    evaluated only around the AI's own action (the opponent's intervening
+    move changes the state between decisions, so the telescoping sum does
+    not cancel exactly), and the worker additionally applies a direct
+    `enemy_mill_penalty` on piece loss. Treat it as a heuristic dense
+    signal whose scale decays to 0 over training (see the curriculum's
+    shaping multiplier) — the final policy is trained on sparse terminal
+    rewards only.
     """
 
     def __init__(self, reward_config: Dict[str, float]):
@@ -569,5 +578,6 @@ class ExperienceBatch:
     game_steps: int = 0     # Number of steps in the game
     opponent_type: str = 'unknown'  # Track opponent type ('random', 'minimax', 'self')
     minimax_depth: int = 0  # Depth if opponent is minimax
+    outcome: str = 'draw'   # Explicit result for this batch's player: 'win'/'loss'/'draw'
 
 

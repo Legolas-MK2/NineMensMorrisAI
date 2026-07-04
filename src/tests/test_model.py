@@ -9,7 +9,6 @@ _SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-import numpy as np
 import pytest
 import torch
 
@@ -30,7 +29,6 @@ def _make_model(policy_head: str = "pointer", seed: int = 0) -> ActorCritic:
     torch.manual_seed(seed)
     cfg = Config()
     cfg.policy_head = policy_head
-    cfg.obs_shape = [5, 7, 7]
     cfg.use_mixed_precision = False
     return ActorCritic(245, N_ACTIONS, cfg)
 

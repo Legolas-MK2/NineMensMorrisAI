@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastnmm"
-version = "0.1.0"
+version = "0.2.0"
 description = "Extremely fast Nine Men's Morris engine with OpenSpiel-compatible interface."
 readme = "README.md"
 requires-python = ">=3.8"

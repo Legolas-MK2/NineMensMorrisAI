@@ -5,10 +5,9 @@ Reads CSV training logs and displays all important metrics visually.
 
 import os
 import csv
-import json
 import logging
 from pathlib import Path
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, jsonify, request
 
 logging.basicConfig(
     level=os.environ.get("NMM_LOG_LEVEL", "INFO").upper(),
@@ -19,7 +18,8 @@ logger = logging.getLogger("training_dashboard")
 
 app = Flask(__name__)
 
-LOGS_DIR = Path(__file__).parent / "src" / "logs"
+# This script lives in tools/; training logs live in <repo>/src/logs.
+LOGS_DIR = Path(__file__).resolve().parent.parent / "src" / "logs"
 
 # ─────────────────────────────────────────────
 # Data helpers

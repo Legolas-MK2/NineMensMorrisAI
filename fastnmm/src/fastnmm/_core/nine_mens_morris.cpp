@@ -883,48 +883,96 @@ int CountAIMobility(const State& s, int player) {
 }
 }  // namespace
 
+// Fast path: hardcoded const weights. Lets the compiler fold every
+// weight into an immediate, which the alpha-beta hot loop relies on.
+// Used by MinimaxSearch (free function) and by MinimaxEngine when no
+// custom weights have been installed via SetWeights().
 int Evaluate(const State& s) {
     if (s.IsTerminal()) {
         const int w = s.Winner();
-        if (w == 2) return 0;  // draw
-        return kWinScore;  // unused from search; see MinimaxSearch.
+        if (w == 2) return 0;
+        return kWinScore;
     }
     const int cp  = s.CurrentPlayer();
     const int opp = 1 - cp;
 
     const int own_material = s.MenOnBoard(cp)  + s.MenToDeploy(cp);
     const int opp_material = s.MenOnBoard(opp) + s.MenToDeploy(opp);
-
-    const int own_mills = MillCount(s, cp);
-    const int opp_mills = MillCount(s, opp);
-
-    const int own_open = CountOpenMills(s, cp);
-    const int opp_open = CountOpenMills(s, opp);
-
-    const int own_run = CountRunningMills(s, cp);
-    const int opp_run = CountRunningMills(s, opp);
-
-    const int own_mblk = CountMillBlocks(s, cp);
-    const int opp_mblk = CountMillBlocks(s, opp);
-
-    const int own_blocked = CountBlockedPieces(s, cp);
-    const int opp_blocked = CountBlockedPieces(s, opp);
-
-    const int own_mob = ApproxMobility(s, cp);
-    const int opp_mob = ApproxMobility(s, opp);
+    const int own_mills    = MillCount(s, cp);
+    const int opp_mills    = MillCount(s, opp);
+    const int own_open     = CountOpenMills(s, cp);
+    const int opp_open     = CountOpenMills(s, opp);
+    const int own_run      = CountRunningMills(s, cp);
+    const int opp_run      = CountRunningMills(s, opp);
+    const int own_mblk     = CountMillBlocks(s, cp);
+    const int opp_mblk     = CountMillBlocks(s, opp);
+    const int own_blocked  = CountBlockedPieces(s, cp);
+    const int opp_blocked  = CountBlockedPieces(s, opp);
+    const int own_mob      = ApproxMobility(s, cp);
+    const int opp_mob      = ApproxMobility(s, opp);
 
     const bool endgame = IsFlying(s, cp) || IsFlying(s, opp);
 
-    // Phase-dependent weights. In the flying endgame, mill threats
-    // dominate and adjacency-based mobility is meaningless.
     const int W_MAT  = endgame ? 14 :  8;
     const int W_MILL = endgame ? 22 : 18;
     const int W_OPEN = endgame ? 22 : 14;
-    const int W_RUN  = 30;     // running mill (every-turn capture pattern)
-    const int W_DBL  = 28;     // each additional simultaneous threat
-    const int W_MBLK = 10;     // mill block (own stone interrupting opp mill)
+    const int W_RUN  = 30;
+    const int W_DBL  = 28;
+    const int W_MBLK = 10;
     const int W_BLK  = endgame ?  0 : 10;
     const int W_MOB  = endgame ?  0 :  1;
+
+    const int own_eff = own_open + own_run;
+    const int opp_eff = opp_open + opp_run;
+    const int own_double = (own_eff >= 2) ? (own_eff - 1) * W_DBL : 0;
+    const int opp_double = (opp_eff >= 2) ? (opp_eff - 1) * W_DBL : 0;
+
+    return W_MAT  * (own_material - opp_material)
+         + W_MILL * (own_mills    - opp_mills)
+         + W_OPEN * (own_open     - opp_open)
+         + W_RUN  * (own_run      - opp_run)
+         +          (own_double   - opp_double)
+         + W_MBLK * (own_mblk     - opp_mblk)
+         - W_BLK  * (own_blocked  - opp_blocked)
+         + W_MOB  * (own_mob      - opp_mob);
+}
+
+// Tunable variant. Used only when MinimaxEngine.SetWeights() has been
+// called -- pays a few extra memory loads per leaf vs the const path.
+int Evaluate(const State& s, const EvalWeights& weights) {
+    if (s.IsTerminal()) {
+        const int w = s.Winner();
+        if (w == 2) return 0;
+        return kWinScore;
+    }
+    const int cp  = s.CurrentPlayer();
+    const int opp = 1 - cp;
+
+    const int own_material = s.MenOnBoard(cp)  + s.MenToDeploy(cp);
+    const int opp_material = s.MenOnBoard(opp) + s.MenToDeploy(opp);
+    const int own_mills    = MillCount(s, cp);
+    const int opp_mills    = MillCount(s, opp);
+    const int own_open     = CountOpenMills(s, cp);
+    const int opp_open     = CountOpenMills(s, opp);
+    const int own_run      = CountRunningMills(s, cp);
+    const int opp_run      = CountRunningMills(s, opp);
+    const int own_mblk     = CountMillBlocks(s, cp);
+    const int opp_mblk     = CountMillBlocks(s, opp);
+    const int own_blocked  = CountBlockedPieces(s, cp);
+    const int opp_blocked  = CountBlockedPieces(s, opp);
+    const int own_mob      = ApproxMobility(s, cp);
+    const int opp_mob      = ApproxMobility(s, opp);
+
+    const bool endgame = IsFlying(s, cp) || IsFlying(s, opp);
+
+    const int W_MAT  = endgame ? weights.w_material_end : weights.w_material_mid;
+    const int W_MILL = endgame ? weights.w_mill_end     : weights.w_mill_mid;
+    const int W_OPEN = endgame ? weights.w_open_end     : weights.w_open_mid;
+    const int W_RUN  = weights.w_running;
+    const int W_DBL  = weights.w_double;
+    const int W_MBLK = weights.w_mill_block;
+    const int W_BLK  = endgame ? 0 : weights.w_blocked_mid;
+    const int W_MOB  = endgame ? 0 : weights.w_mobility_mid;
 
     // Running mills also count toward the simultaneous-threat tally so
     // a "mill + running mill" position trips the double-mill bonus.
@@ -1103,37 +1151,11 @@ int Negamax(const State& s, int depth, int alpha, int beta,
     ++nodes_visited;
 
     if (s.IsTerminal()) {
-        const int w = s.Winner();
-        if (w == 2) return 0;
-        // The player to move *would have been* some player; but terminal
-        // means the game has ended. To give the loser a negative score,
-        // we check the last player to move. Simpler: rely on EndGame having
-        // set Returns properly -- +1 to winner, -1 to loser. Since we need
-        // a score from the perspective of the state's "to-move" player,
-        // and there's no to-move player, we use the sign convention from
-        // the *negamax caller's* perspective. The caller recurses with the
-        // convention `score = -Negamax(child)`, so by the time we hit a
-        // terminal, the caller expects the score from THEIR perspective.
-        // We use the fact that the last move was made by the OPPOSITE of
-        // the frozen `current_player_`. In our engine, on terminal we set
-        // current_player_ to kTerminalPlayer so we can't rely on it.
-        //
-        // Workaround: encode terminal score using s.Winner() and the
-        // depth-adjusted magnitude, then let the caller negate as usual.
-        // Convention: returns are "for player 0". Transform to "for the
-        // caller's parent's current player":
-        //
-        // In practice: the simplest robust thing is to ensure we never
-        // recurse into terminal nodes without immediately resolving them
-        // with the right sign. See the caller: after ApplyAction, if the
-        // child is terminal, we evaluate in the child's frame.
-        //
-        // Here: we return +kWinScore if Returns()[0] > 0, -kWinScore if
-        // < 0 -- but we still need the caller's perspective. Let's use
-        // a marker: +kWinScore means "the side that just moved won".
-        // That's what the caller expects after negation.
-        if (w == 0) return +kWinScore;  // White won
-        return +kWinScore;              // Black won -- also "mover won"
+        if (s.Winner() == 2) return 0;  // Draw.
+        // The side that just moved always won (a move can only end the
+        // game in the mover's favor), so +kWinScore means "mover won";
+        // the caller's negation converts this to its own perspective.
+        return +kWinScore;
     }
 
     if (depth == 0) {
@@ -1336,12 +1358,13 @@ uint64_t ZobristKey(const State& s) {
 // MinimaxEngine: TT-backed alpha-beta.
 //
 // Two modes:
-//   - strict (parity tests): bit-exact match to MinimaxSearch. TT probe
+//   - strict (default): bit-exact match to MinimaxSearch. TT probe
 //     requires cached_depth == requested_depth.
-//   - relaxed (default, training): mate-distance scoring (chess-engine
-//     convention) + cached_depth >= requested_depth probe. Massive
-//     cross-search hit rates; non-mate move selection identical to
-//     strict; mate-distance tie-breaking can differ.
+//   - relaxed (opt-in): mate-distance scoring (chess-engine convention)
+//     + cached_depth >= requested_depth probe. Non-mate move selection
+//     identical to strict; mate-distance tie-breaking can differ. In
+//     normal forward minimax the hit rate matches strict (see the header
+//     comment on the constructor).
 // =========================================================================
 namespace {
 
@@ -1526,7 +1549,9 @@ int MinimaxEngine::NegamaxStrict(const State& s, int depth, int alpha, int beta,
         if (w == 2) return 0;
         return +kWinScore;
     }
-    if (depth == 0) return Evaluate(s);
+    if (depth == 0) {
+        return use_custom_weights_ ? Evaluate(s, weights_) : Evaluate(s);
+    }
 
     const int alpha_orig = alpha;
 
@@ -1611,7 +1636,9 @@ int MinimaxEngine::NegamaxRelaxed(const State& s, int depth, int alpha, int beta
         // branch is just defensive.)
         return +kRelaxedMate;
     }
-    if (depth == 0) return Evaluate(s);
+    if (depth == 0) {
+        return use_custom_weights_ ? Evaluate(s, weights_) : Evaluate(s);
+    }
 
     const int alpha_orig = alpha;
 
@@ -1744,7 +1771,15 @@ SearchResult MinimaxEngine::Search(const State& s, int depth) {
 }
 
 int MinimaxEngine::Eval(const State& s) const {
-    return Evaluate(s);
+    return use_custom_weights_ ? Evaluate(s, weights_) : Evaluate(s);
+}
+
+void MinimaxEngine::SetWeights(const EvalWeights& w) {
+    weights_ = w;
+    use_custom_weights_ = true;
+    // Cached scores were computed under the old weights, so they must
+    // not be reused. Wipe the table outright (also resets stats).
+    TtClear();
 }
 
 // =========================================================================

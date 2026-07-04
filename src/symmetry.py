@@ -29,7 +29,7 @@ appears at position sigma[p]. This matches the action permutation
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List
 import numpy as np
 
 from utils import ADJACENCY, MILLS, BOARD_POS_TO_GRID

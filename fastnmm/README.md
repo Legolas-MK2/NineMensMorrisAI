@@ -17,7 +17,8 @@ Python interface, built for AI training.
   - `play_match` / `play_matches` runners. Any object with a
     `step(state) -> int` method works as a bot, so you can mix your own
     agents with the built-ins.
-- **Tested**: 150 pytest tests across four test files.
+- **Tested**: pytest suite across five test files (API surface, game flow,
+  OpenSpiel parity, training extensions, TT engine / play_until_player).
 
 ## Install
 
@@ -192,6 +193,8 @@ python -m pytest tests/
 - `tests/test_training.py` — custom starting stones, bot behaviour,
   `play_match` / `play_matches`, bot reproducibility, minimax beats
   random.
+- `tests/test_engine_and_play_until.py` — `MinimaxEngine` (TT-backed)
+  parity with `minimax_search`, Zobrist keys, and `play_until_player`.
 
 ## Benchmark
 

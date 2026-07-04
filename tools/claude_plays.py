@@ -6,8 +6,8 @@ The server maintains game state between requests. After each agent move the
 opponent responds immediately; the response contains everything needed to choose
 the next move.
 
-Usage:
-    python claude_plays.py [--port 5001] [--host 0.0.0.0]
+Usage (from the repo root):
+    python tools/claude_plays.py [--port 5001] [--host 0.0.0.0]
 
 Workflow:
     1. GET  /api/models              → list trained models
@@ -22,7 +22,6 @@ All endpoints return JSON. No background threads. No Anthropic SDK required here
 import os
 import sys
 import re
-import json
 import random
 import argparse
 from pathlib import Path
@@ -31,21 +30,20 @@ from typing import Optional, Dict, List, Tuple, Any
 os.environ.setdefault('OMP_NUM_THREADS', '4')
 os.environ.setdefault('MKL_NUM_THREADS', '4')
 
-import numpy as np
 import torch
 from flask import Flask, jsonify, request, render_template_string
 
-SRC_DIR = Path(__file__).parent / "src"
-sys.path.insert(0, str(SRC_DIR))
+# Repo root (this script lives in tools/); make src/ importable.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 import fastnmm
 
-from model import ActorCritic
 from config import Config
 from utils import get_legal_mask, build_token_obs
 from minimax import MinimaxBot
 from board_utils import (
-    POINT_TO_COORD, POSITION_NAMES, MILLS,
+    POSITION_NAMES, MILLS,
     parse_board_positions as _parse_board_positions,
     decode_action as _decode_action,
 )
@@ -227,14 +225,14 @@ def build_state_response(state, agent_player: int,
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_available_models() -> List[Dict[str, str]]:
-    return discover_models(Path(__file__).parent, max_bytes=Config().max_model_file_bytes)
+    return discover_models(_REPO_ROOT, max_bytes=Config().max_model_file_bytes)
 
 
 _model_cache: Dict[str, Any] = {}
 
 def load_model(path: str):
     return load_actor_critic(
-        path, OBS_SIZE, NUM_ACTIONS, OBS_SHAPE, DEVICE, cache=_model_cache,
+        path, OBS_SIZE, NUM_ACTIONS, DEVICE, cache=_model_cache,
     )
 
 
@@ -248,7 +246,7 @@ def get_opponent_move(state, opponent_type: str,
     if opponent_type == "minimax":
         if depth not in _minimax_bots:
             _minimax_bots[depth] = MinimaxBot(max_depth=depth)
-        return _minimax_bots[depth].get_action(state, use_iterative=True)
+        return _minimax_bots[depth].get_action(state)
     if opponent_type == "ppo" and model_path:
         model = load_model(model_path)
         node_feats, global_feats = build_token_obs(state, opponent_player)

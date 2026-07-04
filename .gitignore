@@ -10,6 +10,13 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.pytest_cache/
+
+# Build artifacts (fastnmm C++ extension)
+build/
+*.so
+*.o
+*.egg-info/
 
 # Logs
 logs/

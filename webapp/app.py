@@ -26,7 +26,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 from flask import Flask, g, jsonify, render_template, request, send_from_directory
 
@@ -38,7 +37,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 import fastnmm  # noqa: E402
 
-from board_utils import POINT_TO_COORD, decode_action, parse_board_positions as _parse_board_positions  # noqa: E402
+from board_utils import decode_action, parse_board_positions as _parse_board_positions  # noqa: E402
 from config import Config  # noqa: E402
 from minimax import MinimaxBot  # noqa: E402
 from model import ActorCritic  # noqa: E402
@@ -58,7 +57,7 @@ OBS_SHAPE = list(GAME.observation_tensor_shape())
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 MODELS_DIR = _THIS_DIR / "models"
-MAX_MODEL_BYTES = 200 * 1024 * 1024
+MAX_MODEL_BYTES = Config.max_model_file_bytes
 
 # Model cache is shared across sessions — models are immutable after load(),
 # inference is read-only, and PyTorch handles concurrent forward() calls fine.
@@ -162,6 +161,16 @@ def list_models() -> List[Dict[str, str]]:
     return out
 
 
+def is_allowed_model_path(path: str) -> bool:
+    """Only allow models that live inside MODELS_DIR. The checkpoint loader
+    uses torch.load(weights_only=False), which executes pickled code, so a
+    client-supplied path outside our directory is arbitrary code execution."""
+    try:
+        return Path(path).resolve().is_relative_to(MODELS_DIR.resolve())
+    except (OSError, ValueError):
+        return False
+
+
 def load_model(path: str) -> ActorCritic:
     # Fast path: serve a cached model without taking the lock — dict reads
     # are atomic under the GIL and the cached object is immutable after load.
@@ -173,7 +182,6 @@ def load_model(path: str) -> ActorCritic:
         if cached is not None:
             return cached
         cfg = Config()
-        cfg.obs_shape = list(OBS_SHAPE)
         model = ActorCritic(OBS_SIZE, NUM_ACTIONS, cfg).to(DEVICE)
         ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
         state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
@@ -307,10 +315,13 @@ def api_new_game():
             if gs.player_types[player] == "ai":
                 model_path = config.get(f"player{player}_model", "")
                 if model_path:
+                    if not is_allowed_model_path(model_path):
+                        return jsonify({"success": False, "error": "Invalid model path"}), 400
                     try:
                         gs.player_models[player] = load_model(model_path)
                     except Exception as exc:  # noqa: BLE001
                         app.logger.warning("model load failed: %s", exc)
+                        return jsonify({"success": False, "error": f"Model load failed: {exc}"}), 400
 
         return jsonify({"success": True, "state": board_snapshot(ctx)})
 
@@ -369,6 +380,8 @@ def api_ai_move():
             if model is None:
                 model_path = data.get("model_path", "")
                 if model_path:
+                    if not is_allowed_model_path(model_path):
+                        return jsonify({"success": False, "error": "Invalid model path"}), 400
                     try:
                         model = load_model(model_path)
                         gs.player_models[current_player] = model
@@ -383,7 +396,7 @@ def api_ai_move():
         else:
             action = random_action(gs.state)
 
-        if action is None or action not in gs.state.legal_actions():
+        if action not in gs.state.legal_actions():
             return jsonify({"success": False, "error": "Could not produce a legal move"}), 500
 
         snap_before = board_snapshot(ctx)
@@ -408,15 +421,6 @@ def api_state():
         return jsonify(board_snapshot(ctx))
 
 
-@app.route("/api/board_layout")
-def api_board_layout():
-    """Returns the canonical 24-point layout so the client never has to
-    duplicate the board geometry."""
-    return jsonify({
-        "points": [{"id": pos, "row": r, "col": c} for pos, (r, c) in POINT_TO_COORD.items()],
-    })
-
-
 def _print_banner(host: str, port: int) -> None:
     try:
         local_ip = socket.gethostbyname(socket.gethostname())
@@ -437,7 +441,7 @@ def _print_banner(host: str, port: int) -> None:
 
 if __name__ == "__main__":
     host = os.environ.get("NMM_APP_HOST", "0.0.0.0")
-    port = 7861 #int(os.environ.get("NMM_APP_PORT", "7861"))
+    port = int(os.environ.get("NMM_APP_PORT", "7861"))
     _print_banner(host, port)
     # threaded=True so concurrent users don't queue behind each other.
     # Each session has its own lock; different sessions parallelize.

@@ -100,6 +100,29 @@ class RandomBot(Bot):
 _DEFAULT_TT_BYTES = 256 * 1024 * 1024  # 256 MiB
 
 
+_WEIGHT_FIELDS = (
+    "w_material_mid", "w_material_end",
+    "w_mill_mid", "w_mill_end",
+    "w_open_mid", "w_open_end",
+    "w_running", "w_double",
+    "w_mill_block",
+    "w_blocked_mid", "w_mobility_mid",
+)
+
+
+def _snapshot_weights(w) -> dict:
+    return {name: int(getattr(w, name)) for name in _WEIGHT_FIELDS}
+
+
+class _FauxSearchResult:
+    __slots__ = ("action", "score", "nodes_visited")
+
+    def __init__(self, action: int, score: int, nodes_visited: int) -> None:
+        self.action = int(action)
+        self.score = int(score)
+        self.nodes_visited = int(nodes_visited)
+
+
 class MinimaxBot(Bot):
     """Alpha-beta negamax with a material/mobility/mill heuristic.
 
@@ -130,7 +153,8 @@ class MinimaxBot(Bot):
         mate-distance scoring (kept as an opt-in; gives the same hit
         rate as strict in normal forward minimax).
     tiebreak_seed:
-        Reserved for future use; kept for API compatibility.
+        Seeds the bot's RNG, used by the `root_epsilon` tiebreak sampling
+        and `reroll_weights` jitter. ``None`` = unseeded.
     """
 
     def __init__(
@@ -140,20 +164,108 @@ class MinimaxBot(Bot):
         tt_bytes: int = _DEFAULT_TT_BYTES,
         strict_parity: bool = True,
         tiebreak_seed: Optional[int] = None,
+        weight_jitter: float = 0.0,
+        root_epsilon: int = 0,
     ):
         if depth < 1:
             raise ValueError("depth must be >= 1")
+        if weight_jitter < 0.0:
+            raise ValueError("weight_jitter must be >= 0")
+        if root_epsilon < 0:
+            raise ValueError("root_epsilon must be >= 0")
         self.player_id = int(player_id)
         self.depth = int(depth)
         self._tiebreak_seed = tiebreak_seed
         self._rng = random.Random(tiebreak_seed)
         self.engine = _core.MinimaxEngine(int(tt_bytes), bool(strict_parity))
         self.last_search: Optional["_core.SearchResult"] = None
+        self.weight_jitter = float(weight_jitter)
+        self.root_epsilon = int(root_epsilon)
+        # Snapshot the engine's default weights so resamples always
+        # apply jitter to the same baseline (rather than drifting from
+        # the previous jittered set).
+        self._base_weights = _snapshot_weights(self.engine.weights)
+        if self.weight_jitter > 0.0:
+            self.reroll_weights(self.weight_jitter)
+
+    def reroll_weights(self, jitter: Optional[float] = None) -> None:
+        """Resample evaluation weights from the baseline with
+        symmetric multiplicative jitter and push them to the engine.
+        Clears the TT (cached scores were computed under the old
+        weights). Call this on a log cadence -- not per game -- so the
+        TT clear cost is amortised over many searches.
+        """
+        j = self.weight_jitter if jitter is None else float(jitter)
+        if j <= 0.0:
+            return
+        w = _core.EvalWeights()
+        lo = 1.0 - j
+        hi = 1.0 + j
+        for name, base in self._base_weights.items():
+            jittered = int(round(base * self._rng.uniform(lo, hi)))
+            if base > 0 and jittered < 1:
+                jittered = 1
+            setattr(w, name, jittered)
+        self.engine.set_weights(w)
 
     def step(self, state: "_core.State") -> int:
+        if self.root_epsilon > 0:
+            return self._step_with_root_tiebreak(state)
         result = self.engine.search(state, self.depth)
         self.last_search = result
         return result.action
+
+    def _step_with_root_tiebreak(self, state: "_core.State") -> int:
+        """Score every root child, then sample uniformly from moves
+        within `root_epsilon` of the best score.
+
+        Terminal children are scored using the same convention as the
+        C++ engine (winner POV ± kWinScore with a depth tie-break) so
+        the choice agrees with `engine.search()` in clear-cut spots.
+        """
+        legal = state.legal_actions()
+        if not legal:
+            self.last_search = None
+            return -1
+        if len(legal) == 1:
+            result = self.engine.search(state, self.depth)
+            self.last_search = result
+            return result.action
+
+        cur_player = int(state.current_player())
+        depth = self.depth
+        best_score = -10**9
+        scored: list = []
+        total_nodes = 0
+        for a in legal:
+            child = state.clone()
+            child.apply_action(a)
+            if child.is_terminal():
+                r = child.returns()
+                if r[cur_player] > r[1 - cur_player]:
+                    s = 100_000 - (100 - depth)
+                elif r[cur_player] < r[1 - cur_player]:
+                    s = -100_000 + (100 - depth)
+                else:
+                    s = 0
+                scored.append((a, s))
+            else:
+                res = self.engine.search(child, depth - 1)
+                s = int(res.score)
+                if child.current_player() != cur_player:
+                    s = -s
+                total_nodes += int(res.nodes_visited)
+                scored.append((a, s))
+            if s > best_score:
+                best_score = s
+
+        within = [a for a, s in scored if s >= best_score - self.root_epsilon]
+        action = self._rng.choice(within)
+
+        # Synthesize a last_search record so callers that peek at
+        # nodes_visited keep working.
+        self.last_search = _FauxSearchResult(action, best_score, total_nodes)
+        return action
 
     def evaluate(self, state: "_core.State") -> int:
         """Run a search and return its score from the state-player's view."""
@@ -161,7 +273,10 @@ class MinimaxBot(Bot):
 
     def restart(self) -> None:
         # Bump generation so old entries become preferred for replacement,
-        # but keep useful sub-trees that may still apply.
+        # but keep useful sub-trees that may still apply. Weights are
+        # NOT resampled here -- callers invoke `reroll_weights` on a
+        # slower cadence (e.g. once per log cycle) to avoid the
+        # per-game TT clear cost.
         self.engine.new_game()
         self._rng = random.Random(self._tiebreak_seed)
         self.last_search = None

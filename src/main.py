@@ -9,7 +9,6 @@ import sys
 import glob
 import argparse
 import time
-import random
 import multiprocessing as mp
 
 import torch
@@ -57,9 +56,6 @@ def play_interactive(config: Config = None):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     game = get_game()
-
-    # Store obs shape so the model can encode observations correctly
-    config.obs_shape = list(game.observation_tensor_shape())
 
     # Load model
     model = ActorCritic(
@@ -251,8 +247,6 @@ def show_curriculum_info():
               f"(live mult decays globally over training)")
         print(f"  Win Threshold:   {cfg.win_rate_threshold:.0%}")
         print(f"  Min Games:       {cfg.min_games_for_graduation}")
-        if cfg.max_episodes > 0:
-            print(f"  Max Episodes:    {cfg.max_episodes:,}")
         if phase == Phase.PHASE_11:
             print(f"  Duration:        infinite (alternating sub-phases; stop with Ctrl-C)")
             print(f"  Stone dist shown above is for the CURRENT sub-phase; "
@@ -293,20 +287,17 @@ Examples:
         help='Mode: train, play, resume, or info'
     )
     parser.add_argument(
-        '--episodes', type=int,
-        help='Maximum total episodes'
-    )
-    parser.add_argument(
         '--checkpoint', type=str,
         help='Checkpoint path for resume'
     )
+    # Defaults come from Config so there is a single source of truth.
     parser.add_argument(
-        '--workers', type=int, default=22,
-        help='Number of worker processes (default: 22)'
+        '--workers', type=int, default=None,
+        help=f'Number of worker processes (default: {Config.num_workers})'
     )
     parser.add_argument(
-        '--envs', type=int, default=48,
-        help='Environments per worker (default: 48)'
+        '--envs', type=int, default=None,
+        help=f'Environments per worker (default: {Config.envs_per_worker})'
     )
     parser.add_argument(
         '--phase', type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
@@ -328,10 +319,10 @@ Examples:
     
     if args.mode == 'train':
         config = Config()
-        if args.episodes:
-            config.total_episodes = args.episodes
-        config.num_workers = args.workers
-        config.envs_per_worker = args.envs
+        if args.workers is not None:
+            config.num_workers = args.workers
+        if args.envs is not None:
+            config.envs_per_worker = args.envs
 
         trainer = PPOTrainer(config)
 
@@ -358,10 +349,10 @@ Examples:
         
     elif args.mode == 'resume':
         config = Config()
-        if args.episodes:
-            config.total_episodes = args.episodes
-        config.num_workers = args.workers
-        config.envs_per_worker = args.envs
+        if args.workers is not None:
+            config.num_workers = args.workers
+        if args.envs is not None:
+            config.envs_per_worker = args.envs
 
         trainer = PPOTrainer(config, resume_mode=True)
 
@@ -413,9 +404,8 @@ if __name__ == "__main__":
         print("  python main.py info               # Show phase details")
         print()
         print("Options:")
-        print("  --workers N         Number of worker processes (default: 22)")
-        print("  --envs N            Environments per worker (default: 48)")
-        print("  --episodes N        Maximum total episodes")
+        print(f"  --workers N         Number of worker processes (default: {Config.num_workers})")
+        print(f"  --envs N            Environments per worker (default: {Config.envs_per_worker})")
         print("  --phase N           Start from curriculum phase N (1-11; 11 is infinite)")
         print()
         print("Examples:")

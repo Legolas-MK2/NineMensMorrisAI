@@ -10,17 +10,19 @@ os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
-from dataclasses import dataclass, field
-from typing import Optional, List
+from dataclasses import dataclass
 import torch
 
 
 @dataclass
 class Config:
-    """Training configuration - curriculum-aware."""
-    
+    """Training configuration - curriculum-aware.
+
+    Note: there is deliberately no total-episode cap — training runs until
+    the operator stops the (infinite) final curriculum phase.
+    """
+
     # Training scale
-    total_episodes: int = 500_000_000  # Max episodes (curriculum may finish earlier)
     episodes_per_update: int = 8192
     ppo_epochs: int = 3
     mini_batch_size: int = 8192
@@ -33,7 +35,13 @@ class Config:
     # Total concurrent minimax searches = num_workers * minimax_threads_per_worker.
     minimax_threads_per_worker: int = 2
 
-    worker_nice: int = 10  # niceness offset; 0 = same priority as parent
+    # Niceness offset applied in each worker process (0 = same priority
+    # as parent). The trainer's main process serves batched GPU inference
+    # for all workers during collection; the workers' minimax threads
+    # oversubscribe the CPU (num_workers * minimax_threads_per_worker),
+    # so without this offset they can starve the inference loop and stall
+    # the whole pipeline. Keep > 0 unless workers no longer saturate cores.
+    worker_nice: int = 10
 
     # Minimax transposition-table size, per (worker, depth) bot.
     # The natural per-search hit rate in this game is ~16-30% (bounded
@@ -42,15 +50,20 @@ class Config:
     #   64 MiB: 19.8% hits, 11k collisions / 1.7M nodes (0.7%)
     #   256 MiB - 2 GiB: 19.9% hits, identical wall-clock.
     # We default to 128 MiB (safely past the knee, low waste).
-    # Worst-case process budget = num_workers * max_active_depths *
-    # tt_bytes => 22 * 7 * 128 MiB = ~19.7 GiB. Bigger sizes give
+    # Worst-case process budget = num_workers * max_training_depths *
+    # tt_bytes => 16 * 5 * 128 MiB = ~10 GiB (D5 is the training cap;
+    # bots are created lazily per sampled depth). Bigger sizes give
     # essentially zero training speedup, so don't push higher unless
     # you observe high collision rates.
     minimax_tt_bytes_per_bot: int = 128 * 1024 * 1024
 
-    # Observation shape from fastnmm (set at runtime, e.g. [5, 7, 7] for nine_mens_morris)
-    # Channel 0 = player 0 pieces, Channel 1 = player 1 pieces, rest = game state
-    obs_shape: Optional[List[int]] = None
+    # Multiplicative jitter applied to the minimax evaluation weights
+    # once per log cycle (per worker) so the bot doesn't always pick the
+    # same forced line from the same position. 0.0 = deterministic
+    # weights (matches the historical hardcoded values). Each weight is
+    # resampled as base * Uniform(1 - j, 1 + j) and the transposition
+    # table is cleared on each reroll.
+    minimax_weight_jitter: float = 0.15
 
     # Board-symmetry data augmentation. The 24-point board graph has an order-16
     # automorphism group (D4 of the 7x7 grid x inner/outer-ring swap); applying a
@@ -82,12 +95,7 @@ class Config:
     # over board tokens before the value MLP.
     value_pool: str = 'global+mean'
     dropout: float = 0.0
-    # Legacy fields kept so older Config instances still construct cleanly.
-    # The relational model ignores them entirely.
-    hidden_dim: int = 128
-    num_res_blocks: int = 8
-    num_attention_heads: int = 16
-    
+
     # PPO hyperparameters
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -97,7 +105,7 @@ class Config:
     # Entropy - gradual decay with floor to prevent policy collapse
     entropy_coef_start: float = 0.1
     entropy_coef_end: float = 0.02  # Increased floor from 0.01 to prevent overfitting
-    entropy_decay_episodes: int = 5_000_000  # Match random_train (was 2M, too fast)
+    entropy_decay_episodes: int = 5_000_000  # was 2M — decayed too fast
     
     # Value function
     value_coef: float = 0.5
@@ -119,18 +127,12 @@ class Config:
     advantage_clip: float = 3.0
     ratio_clip: float = 2.0
     log_prob_clip: float = 10.0
-    
-    # Return normalization
-    normalize_returns: bool = False
-    return_norm_clip: float = 5.0
-    
+
     # Logging cadence. Progressive minimax eval is NOT rerun every log tick —
     # it only runs at training startup and on phase graduation (see
     # PPOTrainer._on_phase_change); each log tick reuses the cached result.
     log_interval: int = 25_000
     save_interval: int = 100_000
-    eval_interval: int = 50_000
-    eval_games: int = 200
 
     # Progressive minimax eval runs once at training start (seeds the
     # cache for the first log lines) and again on every phase graduation.
@@ -152,10 +154,11 @@ class Config:
     # fresh cycle from the bumped lr.
     lr_clone_bump_factor: float = 1.3
 
-    # Phase graduation thresholds (Phase 2-10, mixed opponents).
-    # Both conditions must hold simultaneously to graduate.
+    # Phase 2-9 plateau graduation: minimum episodes-in-phase before the
+    # per-depth WR plateau check may graduate the phase. Passed to
+    # CurriculumManager by the trainer (trend criteria live in
+    # curriculum.GRADUATION_CONFIG).
     graduation_min_episodes: int = 2_500_000
-    graduation_min_samples_per_depth: int = 20
 
     # Directories
     model_dir: str = "models"
@@ -163,10 +166,10 @@ class Config:
     checkpoint_dir: str = "checkpoints"
     curriculum_dir: str = "curriculum"
 
-    # Once WR vs random/minimax-Dn exceeds these, those games are dropped
-    # from PPO training (still played + counted for stats / depth-unlock).
-    random_train_cutoff: float = 0.90
-    minimax_train_cutoff: float = 0.90
+    # Dropping dominated opponents from PPO training is governed by the
+    # hysteresis thresholds in curriculum.MIXED_CONFIG
+    # ('minimax_depth_dominate_threshold' / '..._recover') — one mechanism
+    # for sampling, training AND the log's "(no-train)" notes.
 
     # Self-play PPO pause: when wr_vs_self exceeds this threshold at a log
     # tick, self-play experiences stop feeding PPO for `selfplay_train_pause_episodes`

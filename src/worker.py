@@ -11,10 +11,10 @@ os.environ['MKL_NUM_THREADS'] = '1'
 import time
 import random
 import queue
+import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 import numpy as np
 import torch
-import torch.nn.functional as F
 from multiprocessing import Queue, Event
 from typing import Dict, Any, Optional, Tuple
 
@@ -22,7 +22,7 @@ from config import Config
 from model import ActorCritic
 from utils import (
     get_legal_mask, count_pieces_from_state, extract_state_features,
-    compute_gae, ExperienceBatch, RewardCalculator, relativize_obs,
+    compute_gae, ExperienceBatch, RewardCalculator,
     build_token_obs,
 )
 from symmetry import (
@@ -33,7 +33,9 @@ from symmetry import (
 import fastnmm
 from fastnmm import MinimaxBot
 
-_DEFAULT_TT_BYTES_PER_BOT = 128 * 1024 * 1024  # matches Config default
+# Single source of truth is the Config dataclass default (plain int, so the
+# class attribute is readable without instantiating).
+_DEFAULT_TT_BYTES_PER_BOT = Config.minimax_tt_bytes_per_bot
 
 
 class _RandomizedMinimaxBot:
@@ -42,6 +44,13 @@ class _RandomizedMinimaxBot:
     Wraps the C++ bot so we can keep the curriculum's "30% random override"
     behaviour without modifying fastnmm. The wrapped bot owns a persistent
     per-process TT.
+
+    Thread safety: the same pooled bot is shared by every env playing the
+    same depth, and searches run on the worker's minimax thread pool while
+    `reroll_weights` fires from the rollout thread. The C++ bot shares one
+    TT and is not safe for concurrent calls, so both entry points are
+    serialized behind a per-bot lock (different depths = different bots,
+    those still run in parallel).
     """
 
     def __init__(self, depth: int, random_move_prob: float = 0.0,
@@ -52,14 +61,17 @@ class _RandomizedMinimaxBot:
         self._bot = MinimaxBot(
             player_id=player_id, depth=self.depth, tt_bytes=int(tt_bytes),
         )
+        self._lock = threading.Lock()
 
     def step(self, state) -> int:
         if self.random_move_prob > 0.0 and random.random() < self.random_move_prob:
             return random.choice(state.legal_actions())
-        return self._bot.step(state)
+        with self._lock:
+            return self._bot.step(state)
 
-    # Legacy alias used elsewhere in the codebase.
-    get_action = step
+    def reroll_weights(self, jitter: float) -> None:
+        with self._lock:
+            self._bot.reroll_weights(jitter)
 
 
 class MinimaxBotPool:
@@ -79,6 +91,16 @@ class MinimaxBotPool:
                 tt_bytes=self._tt_bytes,
             )
         return self._bots[depth]
+
+    def reroll_weights(self, jitter: float) -> None:
+        """Reroll evaluation weights on every pooled bot. Called on a
+        log cadence by the worker rollout loop so the bots stop playing
+        an identical tactic across long training runs.
+        """
+        if jitter <= 0.0:
+            return
+        for bot in self._bots.values():
+            bot.reroll_weights(jitter)
 
 
 class EnvState:
@@ -108,7 +130,6 @@ class EnvState:
         self.ai_player = ai_player if ai_player is not None else random.randint(0, 1)
         self.minimax_bot = None
         self.minimax_depth = 0
-        self.clone_player = 1 - self.ai_player
 
         # Async minimax state
         self.pending_minimax: Optional[Future] = None
@@ -180,8 +201,6 @@ def worker_process(
     experience_queue: Queue,
     control_queue: Queue,
     ready_event: Event,
-    pause_event: Event,
-    resume_event: Event,
     shared_state: Dict[str, Any],
 ):
     """
@@ -206,7 +225,6 @@ def worker_process(
     # even before first control-queue updates are processed.
     initial_stone_distribution_raw = shared_state.get('initial_stone_distribution')
     initial_opponent_type = str(shared_state.get('initial_opponent_type', 'random'))
-    initial_minimax_depth = int(shared_state.get('initial_minimax_depth', 1))
     initial_opponent_distribution_raw = shared_state.get('initial_opponent_distribution')
     initial_reward_config_raw = shared_state.get('initial_reward_config')
 
@@ -249,7 +267,6 @@ def worker_process(
 
     # Current curriculum settings
     current_opponent_type = initial_opponent_type
-    current_minimax_depth = initial_minimax_depth
     if isinstance(initial_reward_config_raw, dict):
         current_reward_config = dict(initial_reward_config_raw)
     else:
@@ -282,6 +299,19 @@ def worker_process(
     ready_event.set()
     running = True
     request_counter = 0
+
+    # Per-worker minimax weight-jitter scheduler. The trainer logs
+    # progress every `config.log_interval` episodes; we reroll the
+    # minimax eval weights on roughly the same cadence so each log
+    # window sees a slightly different bot tactic instead of always
+    # the same forcing line. Divide by num_envs because every env on
+    # this worker contributes to the trainer's global episode count.
+    minimax_weight_jitter = float(
+        getattr(config, "minimax_weight_jitter", 0.15)
+    )
+    log_interval = int(getattr(config, "log_interval", 25_000))
+    reroll_interval = max(1, log_interval // max(1, num_envs))
+    episodes_since_reroll = 0
 
     def sample_starting_stones() -> Tuple[int, int]:
         """Draw two independent per-player stone counts from the current
@@ -353,8 +383,6 @@ def worker_process(
 
     def setup_new_game(env: EnvState):
         """Set up a new game with current curriculum settings."""
-        nonlocal game
-
         env.game = game
         if current_ai_disadvantage:
             # Pre-determine which player side the AI will occupy so we can
@@ -372,7 +400,8 @@ def worker_process(
             opp_type, depth = select_mixed_opponent()
             env.setup_opponent(opp_type, depth, bot_pool=bot_pool)
         else:
-            env.setup_opponent(current_opponent_type, current_minimax_depth, bot_pool=bot_pool)
+            # Defensive non-mixed fallback (every phase is 'mixed' today).
+            env.setup_opponent(current_opponent_type, bot_pool=bot_pool)
 
         env.reward_calculator.update_config(current_reward_config)
 
@@ -443,11 +472,22 @@ def worker_process(
         for player in [0, 1]:
             if env.experiences[player]:
                 if state.is_terminal():
+                    game_returns = state.returns()
                     final_reward = env.reward_calculator.calculate_terminal_reward(
-                        state.returns(), player, env.step_count, config.max_game_steps
+                        game_returns, player, env.step_count, config.max_game_steps
                     )
+                    # Explicit outcome from the engine's terminal returns —
+                    # the curriculum must never infer win/loss from reward
+                    # magnitudes (those change with the reward config).
+                    if game_returns[player] > game_returns[1 - player]:
+                        outcome = 'win'
+                    elif game_returns[player] < game_returns[1 - player]:
+                        outcome = 'loss'
+                    else:
+                        outcome = 'draw'
                 else:
                     final_reward = env.reward_calculator.calculate_timeout_penalty()
+                    outcome = 'draw'  # timeout counts as a draw
 
                 env.experiences[player][-1]['reward'] += final_reward
                 env.experiences[player][-1]['done'] = 1.0
@@ -475,23 +515,12 @@ def worker_process(
                     game_result=final_reward,
                     game_steps=env.step_count,
                     opponent_type=env.opponent_type,
-                    minimax_depth=env.minimax_depth
+                    minimax_depth=env.minimax_depth,
+                    outcome=outcome,
                 )
                 experience_queue.put(batch)
 
     while running:
-        # Check for pause signal
-        if pause_event.is_set():
-            resume_event.wait()
-            resume_event.clear()
-            while True:
-                try:
-                    response_queue.get_nowait()
-                except queue.Empty:
-                    break
-            request_counter += 1000
-            continue
-
         # Check and drain all pending control messages to avoid stale settings.
         recreate_after_control = False
         while True:
@@ -509,7 +538,6 @@ def worker_process(
                 old_dist = current_opponent_distribution
 
                 current_opponent_type = msg.get('opponent_type', current_opponent_type)
-                current_minimax_depth = msg.get('minimax_depth', current_minimax_depth)
                 if 'reward_config' in msg:
                     current_reward_config = msg['reward_config']
                     reward_calculator.update_config(current_reward_config)
@@ -587,6 +615,11 @@ def worker_process(
             if state.is_terminal() or env.step_count >= config.max_game_steps:
                 finalize_game(env)
                 setup_new_game(env)
+                episodes_since_reroll += 1
+                if (minimax_weight_jitter > 0.0
+                        and episodes_since_reroll >= reroll_interval):
+                    bot_pool.reroll_weights(minimax_weight_jitter)
+                    episodes_since_reroll = 0
                 continue
 
             current_player = state.current_player()
@@ -666,8 +699,6 @@ def worker_process(
                     break
                 attempts += 1
             except queue.Empty:
-                if pause_event.is_set():
-                    break
                 attempts += 1
 
         if response is None:

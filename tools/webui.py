@@ -15,18 +15,17 @@ import sys
 import random
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any
 
-import numpy as np
 import torch
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template, jsonify, request
 
-# Add model directory to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+# Repo root (this script lives in tools/); make src/ importable.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 import fastnmm
 
-from model import ActorCritic
 from config import Config
 from utils import get_legal_mask, build_token_obs
 from minimax import MinimaxBot
@@ -34,7 +33,6 @@ from board_utils import (
     POINT_TO_COORD,
     parse_board_positions as _parse_board_positions,
     decode_action,
-    encode_action,
 )
 from model_loader import discover_models, load_actor_critic
 
@@ -62,10 +60,6 @@ class GameState:
     player_types: Dict[int, str] = None  # 0: player0 type, 1: player1 type
     player_models: Dict[int, Any] = None  # Loaded AI models
     player_minimax_depth: Dict[int, int] = None  # Minimax depth per player
-    selected_position: Optional[int] = None  # For human moves
-    last_move_probs: Optional[Dict[int, float]] = None  # AI move probabilities
-    game_phase: str = "placement"  # placement, movement, capture
-    waiting_for_capture: bool = False
 
     def __post_init__(self):
         if self.player_types is None:
@@ -80,9 +74,6 @@ class GameState:
 game_state = GameState()
 
 
-_REPO_ROOT = Path(__file__).parent
-
-
 def get_available_models() -> List[Dict[str, str]]:
     """Scan canonical directories for available trained models."""
     return discover_models(_REPO_ROOT, max_bytes=Config().max_model_file_bytes)
@@ -91,7 +82,7 @@ def get_available_models() -> List[Dict[str, str]]:
 def load_model(model_info: Dict[str, str]) -> Any:
     """Load a model from disk. Returns (model, 'src')."""
     model = load_actor_critic(
-        model_info["path"], OBS_SIZE, NUM_ACTIONS, OBS_SHAPE, DEVICE,
+        model_info["path"], OBS_SIZE, NUM_ACTIONS, DEVICE,
     )
     return model, 'src'
 
@@ -209,27 +200,19 @@ def get_minimax_move(state, depth: int) -> int:
     global _minimax_bot
 
     if _minimax_bot is None or _minimax_bot.max_depth != depth:
-        # Create new bot with the requested depth
-        # Using moderate TT size for webui (512MB)
-        _minimax_bot = MinimaxBot(
-            max_depth=depth
-        )
-    else:
-        # Update depth if needed
-        _minimax_bot.max_depth = depth
+        # New bot at the requested depth (fastnmm default TT size, 256 MiB).
+        _minimax_bot = MinimaxBot(max_depth=depth)
 
     return _minimax_bot.get_action(state)
-
-
-_TEMPLATE_PATH = Path(__file__).parent / 'templates' / 'webui.html'
-HTML_TEMPLATE = _TEMPLATE_PATH.read_text(encoding='utf-8')
 
 
 # API Routes
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    # Served from tools/templates/webui.html (Flask's default template
+    # folder next to this module).
+    return render_template('webui.html')
 
 
 @app.route('/api/models')
@@ -254,20 +237,9 @@ def api_new_game():
     ss1 = int(config.get('starting_stones_p1', 9) or 9)
     ss0 = max(1, min(9, ss0))
     ss1 = max(1, min(9, ss1))
+    # Players place their (possibly reduced) stone counts themselves —
+    # same as training, no random pre-placement.
     game_state.state = GAME.new_initial_state(starting_stones=(ss0, ss1))
-
-    # Pre-place stones on the board via random placement moves when fewer
-    # than 9 stones are set (skips placement phase for those stones).
-    # Default 9/9 = normal placement game, no pre-placement.
-    if ss0 < 9 or ss1 < 9:
-        state = game_state.state
-        for _ in range(ss0 + ss1):
-            if state.is_terminal():
-                break
-            legal = state.legal_actions()
-            if not legal:
-                break
-            state.apply_action(random.choice(legal))
 
     # Configure players
     game_state.player_types[0] = config.get('player0_type', 'human')
@@ -287,7 +259,11 @@ def api_new_game():
                         try:
                             game_state.player_models[player] = load_model(m)
                         except Exception as e:
-                            print(f"Error loading model: {e}")
+                            app.logger.warning("model load failed for %s: %r", model_path, e)
+                            return jsonify({
+                                'success': False,
+                                'error': f'Model load failed: {e}',
+                            }), 500
                         break
 
     # Get board state
@@ -302,8 +278,6 @@ def api_new_game():
 
 @app.route('/api/move', methods=['POST'])
 def api_move():
-    global game_state
-
     if game_state.state is None or game_state.state.is_terminal():
         return jsonify({'success': False, 'error': 'Game not active'})
 
@@ -348,8 +322,6 @@ def api_move():
 
 @app.route('/api/ai_move', methods=['POST'])
 def api_ai_move():
-    global game_state
-
     if game_state.state is None or game_state.state.is_terminal():
         return jsonify({'success': False, 'error': 'Game not active'})
 
@@ -449,4 +421,6 @@ if __name__ == '__main__':
     print(f"Open http://{local_ip}:{port} in your browser")
     print("=" * 60)
 
-    app.run(host=host, port=port, debug=True, use_reloader=False)
+    # debug MUST stay off even on this private testbed: the Werkzeug debugger
+    # is remote code execution for anyone who can reach the port.
+    app.run(host=host, port=port, debug=False, use_reloader=False)

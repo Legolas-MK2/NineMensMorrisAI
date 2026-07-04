@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NMM Evaluation Dashboard</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+         background:#1e1e1e; color:#ddd; margin:0; padding:24px; }
+  h1 { margin:0 0 8px 0; font-size:20px; }
+  .sub { color:#888; margin-bottom:24px; font-size:13px; }
+  .layout { display:grid; grid-template-columns: 540px 1fr; gap:32px; }
+  .board-wrap { background:#252526; border-radius:8px; padding:20px; }
+  svg { background:#2d2d30; border-radius:6px; display:block; }
+  .controls { margin-top:16px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .controls label { font-size:13px; color:#aaa; }
+  select, button, input { background:#3c3c3c; color:#ddd; border:1px solid #555;
+                          padding:6px 10px; border-radius:4px; font-size:13px; }
+  button { cursor:pointer; }
+  button:hover { background:#4c4c4c; }
+  button.active { background:#0e639c; border-color:#1177bb; }
+  .panel { background:#252526; border-radius:8px; padding:20px; }
+  .total { font-size:32px; font-weight:bold; margin-bottom:8px; }
+  .total.pos { color:#4ec9b0; }
+  .total.neg { color:#f48771; }
+  .total.zero { color:#888; }
+  .phase { color:#aaa; font-size:13px; margin-bottom:16px; }
+  table { width:100%; border-collapse: collapse; font-size:13px; }
+  th, td { padding:8px 6px; text-align:right; border-bottom:1px solid #333; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:#888; font-weight:normal; font-size:12px; text-transform:uppercase; }
+  td.score.pos { color:#4ec9b0; }
+  td.score.neg { color:#f48771; }
+  td.score.zero { color:#555; }
+  .desc-row td { color:#888; font-size:11px; padding-top:0; padding-bottom:12px; }
+  .legend { font-size:12px; color:#888; margin-top:12px; line-height:1.6; }
+  .preset-row { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .preset-row button { font-size:12px; padding:4px 8px; }
+  .hint { font-size:12px; color:#888; margin-top:6px; }
+  .legend-dot { display:inline-block; width:10px; height:10px; border-radius:50%;
+                margin-right:4px; vertical-align:middle; }
+</style>
+</head>
+<body>
+<h1>Nine Men's Morris — Evaluation Dashboard</h1>
+<div class="sub">
+  Click a square to cycle through empty → white → black. Adjust phase and
+  current player to inspect how the heuristic weights each component.
+</div>
+
+<div class="layout">
+  <div class="board-wrap">
+    <svg id="board" viewBox="0 0 540 540" width="540" height="540"></svg>
+
+    <div class="controls">
+      <label>Brush:</label>
+      <button id="brush-white" class="brush active" data-v="0">White</button>
+      <button id="brush-black" class="brush" data-v="1">Black</button>
+      <button id="brush-erase" class="brush" data-v="-1">Erase</button>
+
+      <label style="margin-left:12px;">To move:</label>
+      <select id="current-player">
+        <option value="0">White</option>
+        <option value="1">Black</option>
+      </select>
+    </div>
+
+    <div class="controls">
+      <label>White unplaced:</label>
+      <input id="unplaced-white" type="number" min="0" max="9" value="9" style="width:60px;">
+      <label>Black unplaced:</label>
+      <input id="unplaced-black" type="number" min="0" max="9" value="9" style="width:60px;">
+      <button id="reset">Reset</button>
+    </div>
+
+    <div class="preset-row" id="presets"></div>
+    <div class="hint">
+      Set unplaced to 0 and reduce a side to 3 stones to enter flying phase.
+    </div>
+  </div>
+
+  <div class="panel">
+    <div>Total evaluation (from current player's view)</div>
+    <div id="total" class="total zero">0</div>
+    <div id="phase" class="phase"></div>
+
+    <table>
+      <thead>
+        <tr><th>Component</th><th>own−opp</th><th>weight</th><th>score</th></tr>
+      </thead>
+      <tbody id="components"></tbody>
+    </table>
+
+    <div class="legend">
+      <div><span class="legend-dot" style="background:#dddddd"></span>White piece</div>
+      <div><span class="legend-dot" style="background:#222222;border:1px solid #777"></span>Black piece</div>
+      <div><span class="legend-dot" style="background:#4ec9b0"></span>Open mill threat (own)</div>
+      <div><span class="legend-dot" style="background:#f48771"></span>Open mill threat (opponent)</div>
+    </div>
+    <div class="legend" style="margin-top:12px;">
+      Score is reported from the side-to-move's perspective: positive = good for them.
+      In the flying endgame, mobility/blocked weights drop to 0 and mill threats are amplified.
+    </div>
+  </div>
+</div>
+
+<script>
+const POINTS = {{ points|tojson }};
+const ADJ    = {{ adjacency|tojson }};
+const PRESETS = {{ presets|tojson }};
+
+const SIZE = 540;
+const MARGIN = 40;
+const CELL = (SIZE - 2 * MARGIN) / 6;
+
+let board = Array(24).fill(-1);
+let currentPlayer = 0;
+let unplaced = [9, 9];
+let brush = 0;
+let highlight = { ownOpen: [], oppOpen: [] };
+
+function pxOf(idx) {
+  const [r, c] = POINTS[idx];
+  return [MARGIN + c * CELL, MARGIN + r * CELL];
+}
+
+function buildBoard() {
+  const svg = document.getElementById("board");
+  svg.innerHTML = "";
+
+  // Edges (each adjacency pair drawn once).
+  const drawn = new Set();
+  for (let i = 0; i < 24; i++) {
+    for (const j of ADJ[i]) {
+      const key = i < j ? i + "_" + j : j + "_" + i;
+      if (drawn.has(key)) continue;
+      drawn.add(key);
+      const [x1, y1] = pxOf(i);
+      const [x2, y2] = pxOf(j);
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      line.setAttribute("x1", x1); line.setAttribute("y1", y1);
+      line.setAttribute("x2", x2); line.setAttribute("y2", y2);
+      line.setAttribute("stroke", "#666");
+      line.setAttribute("stroke-width", "2");
+      svg.appendChild(line);
+    }
+  }
+
+  // Highlight rings for mill threats (drawn beneath stones).
+  function ring(idx, color) {
+    const [x, y] = pxOf(idx);
+    const r = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    r.setAttribute("cx", x); r.setAttribute("cy", y);
+    r.setAttribute("r", 24);
+    r.setAttribute("fill", "none");
+    r.setAttribute("stroke", color);
+    r.setAttribute("stroke-width", "3");
+    r.setAttribute("stroke-dasharray", "4 3");
+    svg.appendChild(r);
+  }
+  highlight.ownOpen.forEach(i => ring(i, "#4ec9b0"));
+  highlight.oppOpen.forEach(i => ring(i, "#f48771"));
+
+  // Stones / click targets.
+  for (let i = 0; i < 24; i++) {
+    const [x, y] = pxOf(i);
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    g.style.cursor = "pointer";
+    g.addEventListener("click", () => onClick(i));
+
+    const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    c.setAttribute("cx", x); c.setAttribute("cy", y);
+    c.setAttribute("r", 18);
+    if (board[i] === 0) {
+      c.setAttribute("fill", "#dddddd");
+      c.setAttribute("stroke", "#000"); c.setAttribute("stroke-width", "1");
+    } else if (board[i] === 1) {
+      c.setAttribute("fill", "#222222");
+      c.setAttribute("stroke", "#888"); c.setAttribute("stroke-width", "1");
+    } else {
+      c.setAttribute("fill", "#3a3a3a");
+      c.setAttribute("stroke", "#555");
+      c.setAttribute("stroke-width", "1");
+    }
+    g.appendChild(c);
+
+    const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    t.setAttribute("x", x); t.setAttribute("y", y + 4);
+    t.setAttribute("text-anchor", "middle");
+    t.setAttribute("font-size", "10");
+    t.setAttribute("fill", board[i] === -1 ? "#888" : (board[i] === 0 ? "#222" : "#ddd"));
+    t.style.pointerEvents = "none";
+    t.textContent = i;
+    g.appendChild(t);
+
+    svg.appendChild(g);
+  }
+}
+
+function onClick(idx) {
+  board[idx] = brush;
+  refresh();
+}
+
+async function refresh() {
+  const resp = await fetch("/api/evaluate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      board: board,
+      current_player: currentPlayer,
+      unplaced: unplaced,
+    }),
+  });
+  const data = await resp.json();
+  render(data);
+}
+
+function render(data) {
+  const totalEl = document.getElementById("total");
+  totalEl.textContent = (data.total >= 0 ? "+" : "") + data.total;
+  totalEl.className = "total " +
+      (data.total > 0 ? "pos" : data.total < 0 ? "neg" : "zero");
+
+  const cpName = data.current_player === 0 ? "White" : "Black";
+  const oppName = data.current_player === 0 ? "Black" : "White";
+  document.getElementById("phase").textContent =
+      `To move: ${cpName} (${data.phase.current}) — opponent ${oppName} (${data.phase.opponent})` +
+      (data.endgame ? " — endgame weights active" : "");
+
+  const tbody = document.getElementById("components");
+  tbody.innerHTML = "";
+  for (const c of data.components) {
+    const tr = document.createElement("tr");
+    const cls = c.score > 0 ? "pos" : c.score < 0 ? "neg" : "zero";
+    tr.innerHTML = `
+      <td>${c.name}</td>
+      <td>${c.diff >= 0 ? '+' + c.diff : c.diff}</td>
+      <td>${c.weight}</td>
+      <td class="score ${cls}">${c.score >= 0 ? '+' + c.score : c.score}</td>
+    `;
+    tbody.appendChild(tr);
+    const dr = document.createElement("tr");
+    dr.className = "desc-row";
+    dr.innerHTML = `<td colspan="4">${c.desc}</td>`;
+    tbody.appendChild(dr);
+  }
+
+  // Compute highlight positions: open mill empty slots.
+  const MILLS = {{ mills|tojson }};
+  highlight = { ownOpen: [], oppOpen: [] };
+  for (const m of MILLS) {
+    const cp = data.current_player, opp = 1 - cp;
+    const cntCp  = m.filter(p => board[p] === cp).length;
+    const cntOpp = m.filter(p => board[p] === opp).length;
+    const empty  = m.find(p => board[p] === -1);
+    if (empty === undefined) continue;
+    if (cntCp === 2 && cntOpp === 0) highlight.ownOpen.push(empty);
+    else if (cntOpp === 2 && cntCp === 0) highlight.oppOpen.push(empty);
+  }
+  buildBoard();
+}
+
+// Wire up controls.
+document.querySelectorAll(".brush").forEach(b => {
+  b.addEventListener("click", () => {
+    document.querySelectorAll(".brush").forEach(x => x.classList.remove("active"));
+    b.classList.add("active");
+    brush = parseInt(b.dataset.v, 10);
+  });
+});
+
+document.getElementById("current-player").addEventListener("change", e => {
+  currentPlayer = parseInt(e.target.value, 10);
+  refresh();
+});
+document.getElementById("unplaced-white").addEventListener("input", e => {
+  unplaced[0] = Math.max(0, Math.min(9, parseInt(e.target.value || "0", 10)));
+  refresh();
+});
+document.getElementById("unplaced-black").addEventListener("input", e => {
+  unplaced[1] = Math.max(0, Math.min(9, parseInt(e.target.value || "0", 10)));
+  refresh();
+});
+document.getElementById("reset").addEventListener("click", () => {
+  loadPreset("empty");
+});
+
+// Preset buttons.
+const presetRow = document.getElementById("presets");
+for (const [k, v] of Object.entries(PRESETS)) {
+  const b = document.createElement("button");
+  b.textContent = v.label;
+  b.addEventListener("click", () => loadPreset(k));
+  presetRow.appendChild(b);
+}
+
+function loadPreset(name) {
+  const p = PRESETS[name];
+  board = p.board.slice();
+  unplaced = p.unplaced.slice();
+  currentPlayer = p.cp;
+  document.getElementById("current-player").value = String(currentPlayer);
+  document.getElementById("unplaced-white").value = unplaced[0];
+  document.getElementById("unplaced-black").value = unplaced[1];
+  refresh();
+}
+
+// Initial render.
+buildBoard();
+refresh();
+</script>
+</body>
+</html>
