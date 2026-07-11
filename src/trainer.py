@@ -131,6 +131,7 @@ class PPOTrainer:
         self._last_phase11_subphase: Optional[str] = None
 
         self.start_time = None
+        self._last_log_time: Optional[float] = None
 
         # Clone model for self-play
         self.clone_model = None
@@ -275,8 +276,9 @@ class PPOTrainer:
         """Callback when the clone should be updated.
 
         Trigger: wr_vs_self over the rolling 500-game self-play window
-        crosses MIXED_CONFIG['selfplay_winrate_threshold'], checked at
-        each log tick.
+        crosses the dynamic threshold (mixed_state.selfplay_winrate_threshold,
+        self-tuning around MIXED_CONFIG['selfplay_clone_target_episodes']),
+        checked at each log tick.
         """
         self._update_clone_model()
         # Bump LR slightly to help adapt to the harder snapshot, then restart cycle.
@@ -748,8 +750,13 @@ class PPOTrainer:
         win_rate = curr_stats.get_win_rate()
         draw_rate = curr_stats.get_draw_rate()
 
-        elapsed = time.time() - self.start_time
-        eps_per_sec = (self.episode_count - self.start_episode_count) / elapsed if elapsed > 0 else 0
+        now = time.time()
+        if self._last_log_time is None:
+            eps_per_sec = 0.0
+        else:
+            dt = now - self._last_log_time
+            eps_per_sec = 25000.0 / dt if dt > 0 else 0.0
+        self._last_log_time = now
 
         curriculum_status = self.curriculum.get_status_string()
         config = self.curriculum.get_config()
@@ -807,8 +814,12 @@ class PPOTrainer:
             rnd_train_note = " (no-train)" if ms.random_dominated else ""
             self_paused = ms.total_episodes < ms.selfplay_train_cooldown_until
             self_note = f" (no-train, {ms.selfplay_train_cooldown_until - ms.total_episodes:,}ep left)" if self_paused else ""
+            # `clone@` is the dynamic clone-update threshold (see
+            # MIXED_CONFIG['selfplay_winrate_threshold'] mechanism docs).
             print(f"  WR(500):{depth_str} [MaxD:{active_max}] "
-                  f"Rnd:{wr_random:.0%}{rnd_train_note} Self:{opp_wr['wr_vs_self']:.0%}{self_note}")
+                  f"Rnd:{wr_random:.0%}{rnd_train_note} "
+                  f"Self:{opp_wr['wr_vs_self']:.0%}{self_note} "
+                  f"[clone@{ms.selfplay_winrate_threshold:.1%}]")
         else:
             # Defensive fallback for any future non-mixed phase.
             print(f"  WR({len(curr_stats.recent_results)}): Rnd:{win_rate:.0%}")
@@ -1098,7 +1109,10 @@ class PPOTrainer:
         print(f"                  self-play weighted ×{MIXED_CONFIG['selfplay_weight']:.0f}. Dampened slots pinned at {MIXED_CONFIG['dampen_cap']:.0%}.")
         print(f"  Minimax depths unlock progressively (D1 → D{MIXED_CONFIG['minimax_max_depth']}) by win rate; "
               f"D6/D7 stay eval-only.")
-        print(f"  Self-play: Clone update at {MIXED_CONFIG['selfplay_winrate_threshold']*100:.0f}% WR over the rolling 500-game self-play window (checked at log tick).")
+        print(f"  Self-play: Clone update at a dynamic WR threshold over the rolling 500-game self-play window")
+        print(f"             (currently {self.curriculum.mixed_state.selfplay_winrate_threshold*100:.1f}%; targets 1 clone per "
+              f"{MIXED_CONFIG['selfplay_clone_target_episodes']:,} eps — fast clone jumps to wr_vs_self (min +{MIXED_CONFIG['selfplay_threshold_up_step']*100:.1f}%), "
+              f"stalled: -0.2% -> -0.4% -> -0.6% … every log tick; resets on clone; no floor, ceiling 100%).")
         print(f"  Graduation (Phase 2-9): trend-based plateau detection < "
               f"{GRADUATION_CONFIG['trend_max_angle_degrees']:.1f}° over a 1M-episode horizon "
               f"for every unlocked depth.")
@@ -1158,13 +1172,16 @@ class PPOTrainer:
                     # Order matters:
                     #  1. sample per-depth WR so logging sees the freshest tick
                     #  2. log progress (uses pre-update state)
-                    #  3. clone update (reuses the wr_vs_self we just logged)
+                    #  3. threshold stall decay, THEN clone update against the
+                    #     freshly adjusted threshold (reuses the wr_vs_self we
+                    #     just logged)
                     #  4. depth unlock (may broadcast and save a checkpoint)
                     #  5. weight rebroadcast (after dominated-state refresh)
                     #  6. graduation check (terminal signal for the phase)
                     self._heartbeat("log_progress")
                     self.curriculum.sample_minimax_winrate()
                     self.log_progress(returns, metrics)
+                    self.curriculum.update_selfplay_threshold()
                     if self.curriculum.should_update_clone():
                         self.curriculum.do_clone_update()
                     if self.curriculum.check_and_unlock_minimax_depth():

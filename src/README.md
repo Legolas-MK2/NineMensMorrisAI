@@ -56,9 +56,15 @@ Within "mixed" the sampling distribution is computed by
   sampling pins at 1% and self-play experiences stop feeding PPO for
   `selfplay_train_pause_episodes` episodes (default 500k).
 - **Self-play clone update**: when `wr_vs_self` over the rolling 500-game
-  self-play window crosses `selfplay_winrate_threshold` (default 92%) at a
-  log tick, the clone is replaced with the current model and the self-play
-  window resets.
+  self-play window crosses the **dynamic** `selfplay_winrate_threshold`
+  (initial 92%) at a log tick, the clone is replaced with the current model
+  and the self-play window resets. The threshold self-tunes around a target
+  cadence of one clone per `selfplay_clone_target_episodes` (300k) episodes:
+  a fast clone jumps to the larger of (old + 0.5%) and the current
+  `wr_vs_self`, so the bar never lags far behind the model's strength;
+  once the 300k-episode stall interval is exceeded it is lowered at every
+  log tick with progressive step size (0.2 % → 0.4 % → 0.6 % → …). The
+  step counter resets on clone. Ceiling is 100% and there is no floor.
 
 ### Reward shaping
 
@@ -254,4 +260,5 @@ to detect main-thread stalls.
    early the policy is collapsing — raise the entropy floor.
 5. **Resuming.** `python main.py resume` reloads model + optimizer + LR
    scheduler + curriculum state (per-depth WR windows, dominated flags,
-   clone generation, etc.) and continues from the recorded episode count.
+   clone generation, dynamic clone threshold, etc.) and continues from the
+   recorded episode count.

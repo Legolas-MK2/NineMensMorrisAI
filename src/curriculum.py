@@ -111,9 +111,21 @@ class PhaseConfig:
 # `compute_opponent_distribution` for the full algorithm.
 MIXED_CONFIG = {
     # Self-play: clone update when WR over the rolling 500-game self-play
-    # window (same window that's logged as wr_vs_self) crosses this
+    # window (same window that's logged as wr_vs_self) crosses the *dynamic*
     # threshold. Checked at log tick (every log_interval episodes).
+    #
+    # The threshold is self-tuning around a target clone cadence
+    # (`selfplay_clone_target_episodes`): on a fast clone it jumps to the
+    # larger of (old + `selfplay_threshold_up_step`) and the current
+    # wr_vs_self, so the bar never lags far behind the model's actual
+    # strength; once the target interval passes WITHOUT a clone the
+    # threshold is lowered at every subsequent log tick with progressive
+    # step size (n * down_step: 0.2 % → 0.4 % → 0.6 % → …). The decay
+    # counter resets on clone. Ceiling at 1.0, no floor.
     'selfplay_winrate_threshold': 0.92,
+    'selfplay_clone_target_episodes': 300_000,
+    'selfplay_threshold_up_step': 0.005,
+    'selfplay_threshold_down_step': 0.002,
 
     # Minimax depth range — gradual unlock from D1 up to D5 based on win rate.
     # D6 and D7 are intentionally NOT used as training opponents (too slow /
@@ -433,6 +445,15 @@ class MixedTrainingState:
     clone_generation: int = 0
     last_clone_episode: int = 0  # total_episodes when clone was last updated
 
+    # Dynamic clone-update threshold (see MIXED_CONFIG for the mechanism).
+    # On fast clone: jumps to max(old + up_step, wr_vs_self). Stalled:
+    # progressive per-tick decay. Persisted so resumes keep the tuned value.
+    selfplay_winrate_threshold: float = MIXED_CONFIG['selfplay_winrate_threshold']
+    # Number of consecutive stall decays applied since the last clone.
+    # Drives progressive decay: the n-th decay subtracts
+    # n * `selfplay_threshold_down_step`. Reset to 0 on clone.
+    selfplay_stall_decays: int = 0
+
     # Self-play PPO pause: while total_episodes < this, self-play batches are
     # dropped from PPO training (games still play, results still tracked).
     # Set at log tick when wr_vs_self exceeds the configured threshold.
@@ -495,19 +516,77 @@ class MixedTrainingState:
         Uses the same rolling `results_vs_self` window (last 500 self-play
         games) that gets reported as `wr_vs_self` in the CSV/log — no extra
         bookkeeping. Requires the window to be full so the WR signal is
-        stable.
+        stable. Compares against the dynamic `selfplay_winrate_threshold`
+        field, not the MIXED_CONFIG constant (which is only the initial
+        value).
         """
         if len(self.results_vs_self) < self.results_vs_self.maxlen:
             return False
-        return self.get_win_rate_vs_opponent('self') >= MIXED_CONFIG['selfplay_winrate_threshold']
+        return self.get_win_rate_vs_opponent('self') >= self.selfplay_winrate_threshold
 
     def on_clone_updated(self):
         """Called when clone is updated."""
+        # Threshold self-tuning, raise direction: when a clone fires
+        # faster than the target cadence the bar is too easy — raise it.
+        # Jump to at least the current wr_vs_self (which triggered the
+        # clone) so the threshold doesn't lag far behind the model's
+        # actual strength by only stepping up 0.5 % at a time.
+        # Must run before last_clone_episode is stamped below.
+        elapsed = self.total_episodes - self.last_clone_episode
+        if elapsed < MIXED_CONFIG['selfplay_clone_target_episodes']:
+            old = self.selfplay_winrate_threshold
+            wr_self = self.get_win_rate_vs_opponent('self')
+            self.selfplay_winrate_threshold = min(
+                1.0,
+                max(old + MIXED_CONFIG['selfplay_threshold_up_step'], wr_self),
+            )
+            logger.info(
+                "Self-play threshold raised %.1f%% -> %.1f%% "
+                "(wr_vs_self=%.1f%%, clone after %d eps < %d target)",
+                old * 100, self.selfplay_winrate_threshold * 100,
+                wr_self * 100,
+                elapsed, MIXED_CONFIG['selfplay_clone_target_episodes'],
+            )
+        # Reset the progressive decay counter on clone so the next stall
+        # period starts fresh at 0.2 % again.
+        self.selfplay_stall_decays = 0
+
         # Reset the self-play window so the next 500 games reflect the new
         # (harder) clone, not the previous one.
         self.results_vs_self.clear()
         self.clone_generation += 1
         self.last_clone_episode = self.total_episodes
+
+    def maybe_relax_selfplay_threshold(self) -> bool:
+        """Threshold self-tuning, decay direction. Poll at the log tick.
+
+        Once the stall interval (target episodes without a clone) is
+        exceeded, the threshold decays at every subsequent log tick with
+        progressive step size: the n-th decay subtracts
+        n * `selfplay_threshold_down_step` (0.2 % → 0.4 % → 0.6 % → …),
+        exponentially accelerating recovery when the threshold drifts far
+        above the actual wr_vs_self. The counter resets on clone, so the
+        next stall period starts again at 0.2 %.
+
+        Has no floor, so a stalled model always becomes cloneable again
+        eventually. Returns True when the threshold changed.
+        """
+        anchor = self.last_clone_episode
+        since = self.total_episodes - anchor
+        target = MIXED_CONFIG['selfplay_clone_target_episodes']
+        if since < target:
+            return False
+        self.selfplay_stall_decays += 1
+        step = self.selfplay_stall_decays * MIXED_CONFIG['selfplay_threshold_down_step']
+        old = self.selfplay_winrate_threshold
+        self.selfplay_winrate_threshold = old - step
+        logger.info(
+            "Self-play threshold lowered %.1f%% -> %.1f%% "
+            "(-%.1f%%, decay #%d; %d eps stalled since last clone)",
+            old * 100, self.selfplay_winrate_threshold * 100,
+            step * 100, self.selfplay_stall_decays, since,
+        )
+        return True
 
     def get_combined_minimax_win_rate_up_to(self, max_depth: int) -> float:
         """Get combined win rate vs minimax D1 through max_depth (last 500 games each)."""
@@ -1006,17 +1085,32 @@ class CurriculumManager:
             self.mixed_state.games_vs_minimax += 1
 
     def should_update_clone(self) -> bool:
-        """Check if clone should be updated."""
+        """Check if clone should be updated (dynamic WR threshold)."""
         config = self.get_config()
         if config.opponent_type != 'mixed':
             return False
         return self.mixed_state.should_update_clone()
 
+    def update_selfplay_threshold(self):
+        """Apply the stall decay of the dynamic clone threshold.
+
+        Call at the log tick, before should_update_clone(). The raise
+        direction lives in on_clone_updated() and needs no polling.
+        Persists state when the threshold changed.
+        """
+        if self.get_config().opponent_type != 'mixed':
+            return
+        if self.mixed_state.maybe_relax_selfplay_threshold():
+            self.save_state()
+
     def do_clone_update(self):
         """Called when clone is updated."""
         self.mixed_state.on_clone_updated()
         gen = self.mixed_state.clone_generation
-        logger.info("Clone updated to generation %d", gen)
+        logger.info(
+            "Clone updated to generation %d (threshold now %.1f%%)",
+            gen, self.mixed_state.selfplay_winrate_threshold * 100,
+        )
 
         for callback in self.on_clone_update_callbacks:
             callback()
@@ -1353,6 +1447,7 @@ class CurriculumManager:
             'wr_vs_mm_d7': ms.get_win_rate_vs_opponent('minimax', 7),
             'wr_vs_random': ms.get_win_rate_vs_opponent('random'),
             'wr_vs_self': ms.get_win_rate_vs_opponent('self'),
+            'selfplay_threshold': ms.selfplay_winrate_threshold,
             'active_mm_max_depth': ms.active_minimax_max_depth,
         }
 
@@ -1376,6 +1471,8 @@ class CurriculumManager:
                 'total_episodes': self.mixed_state.total_episodes,
                 'clone_generation': self.mixed_state.clone_generation,
                 'last_clone_episode': self.mixed_state.last_clone_episode,
+                'selfplay_winrate_threshold': self.mixed_state.selfplay_winrate_threshold,
+                'selfplay_stall_decays': self.mixed_state.selfplay_stall_decays,
                 'selfplay_train_cooldown_until': self.mixed_state.selfplay_train_cooldown_until,
                 'games_vs_random': self.mixed_state.games_vs_random,
                 'games_vs_minimax': self.mixed_state.games_vs_minimax,
@@ -1433,6 +1530,13 @@ class CurriculumManager:
                     total_episodes=ms.get('total_episodes', 0),
                     clone_generation=ms.get('clone_generation', 0),
                     last_clone_episode=ms.get('last_clone_episode', 0),
+                    # Older state files predate the dynamic threshold: fall
+                    # back to the configured initial value.
+                    selfplay_winrate_threshold=ms.get(
+                        'selfplay_winrate_threshold',
+                        MIXED_CONFIG['selfplay_winrate_threshold'],
+                    ),
+                    selfplay_stall_decays=ms.get('selfplay_stall_decays', 0),
                     selfplay_train_cooldown_until=ms.get('selfplay_train_cooldown_until', 0),
                     games_vs_random=ms.get('games_vs_random', 0),
                     games_vs_minimax=ms.get('games_vs_minimax', 0),
